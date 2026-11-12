@@ -1,0 +1,106 @@
+# antbot — default configuration (xyz:ANT HIP-3 premium mean-reversion).
+#
+# Every threshold of the strategy lives here. Values come from the research
+# (writeup_v2_fr.md §2, sizing_fr.md §2/§4/§7, backtest.py S2_ANT):
+#   * entry |premium| >= 50 bps, fade it (premium > 0 -> short, < 0 -> long)
+#   * hold up to 8h (base rule "8h_fixed"), maker-only entries
+#   * starting notional 2.5k USD, hard cap 10k USD, 1x isolated
+#   * kill: hit rate < 80 %, |premium| durably > 150 bps, spec change
+#
+# Amounts are in USD, durations in seconds, rates as fractions (0.0001 = 1 bp)
+# unless the key name ends in `_bps`.
+
+# paper (default, live mainnet market data + simulated fills, no key, never
+# calls /exchange) | testnet | mainnet (requires `--mainnet` AND
+# ANTBOT_CONFIRM_MAINNET=yes-i-understand).
+mode = "paper"
+
+[market]
+# HIP-3 builder-deployed perp dex and coin name as used by the info API.
+dex = "xyz"
+coin = "xyz:ANT"
+# Baseline spec snapshot. A live value differing from these triggers the
+# spec-change kill rule (see [risk].kill_on_spec_change).
+expected_funding_multiplier = 0.005   # perpDexs.assetToFundingMultiplier
+expected_growth_mode = "enabled"      # meta.universe[].growthMode
+expected_deployer_fee_scale = 1.0     # meta.universe[].deployerFeeScale
+expected_sz_decimals = 2              # meta.universe[].szDecimals
+expected_max_leverage = 10            # meta.universe[].maxLeverage
+
+[network]
+mainnet_info_url = "https://api.hyperliquid.xyz/info"
+mainnet_exchange_url = "https://api.hyperliquid.xyz/exchange"
+mainnet_ws_url = "wss://api.hyperliquid.xyz/ws"
+testnet_info_url = "https://api.hyperliquid-testnet.xyz/info"
+testnet_exchange_url = "https://api.hyperliquid-testnet.xyz/exchange"
+testnet_ws_url = "wss://api.hyperliquid-testnet.xyz/ws"
+http_timeout_secs = 10
+
+[strategy]
+# Premium definition (backtest.py / HL funding docs):
+#   premium = 0.5 * (impact_bid_px + impact_ask_px) / oracle_px - 1
+# "impact" uses activeAssetCtx.impactPxs (same as fundingHistory.premium),
+# "book_mid" uses the l2Book best bid/ask mid as a fallback.
+premium_source = "impact"             # impact | book_mid
+entry_threshold_bps = 50.0            # enter when |premium| >= this
+# Early exit once |premium| has converged to <= this (backtest base rule is
+# 8h_fixed; set early_exit_on_converge = false to reproduce it exactly).
+exit_converge_bps = 10.0
+early_exit_on_converge = true
+max_hold_secs = 28800                 # 8h hard deadline
+cooldown_after_exit_secs = 3600       # backtest: next signal from exit hour + 1h
+# Entry: maker-only ALO (post-only) limit orders.
+entry_timeout_secs = 900              # give up an unfilled entry after 15 min
+requote_interval_secs = 20            # min delay between reprices of a resting ALO
+requote_drift_bps = 5.0               # reprice only if our px is this far from target
+# Exit: maker first, then IOC taker fallback inside the last window before the
+# deadline (or immediately on kill / converge if maker exit does not fill).
+taker_fallback_window_secs = 900      # last 15 min before max_hold
+exit_maker_timeout_secs = 600         # converge-exit: go taker after 10 min resting
+taker_max_slippage_bps = 50.0         # IOC limit px = best +/- this
+
+[sizing]
+notional_usd = 2500.0                 # starting notional per position
+max_notional_usd = 10000.0            # cap (cannot exceed the built-in 10k hard cap)
+leverage = 1                          # 1x default, 2x maximum allowed
+margin_mode = "isolated"              # only "isolated" is accepted
+
+[risk]
+# Rolling hit rate over the last N closed trades. A "hit" is a trade whose
+# |premium| moved toward 0 between entry and exit (writeup "taux vers 0"),
+# or "pnl_positive" for net-PnL > 0.
+hit_rate_window = 20
+hit_rate_min = 0.80
+hit_definition = "premium_toward_zero" # premium_toward_zero | pnl_positive
+# |premium| above this for longer than the duration -> kill (regime change).
+persistent_premium_bps = 150.0
+persistent_premium_secs = 7200
+kill_on_spec_change = true
+daily_loss_limit_usd = 150.0          # realized + unrealized, UTC day
+max_drawdown_usd = 300.0              # from peak equity
+flatten_on_kill = true                # close the position (maker->taker) on kill
+
+[fees]
+# Tier 0, HIP-3 deployerFeeScale 1.0 with growth mode enabled (sizing_fr.md §2):
+# maker 0.003 %, taker 0.009 %. Standard (growth off) would be 0.030 / 0.090 %.
+maker_rate = 0.00003
+taker_rate = 0.00009
+
+[timing]
+rest_fallback_poll_secs = 5           # metaAndAssetCtxs poll when WS is stale
+ws_stale_secs = 15                    # no WS market data for this long -> stale
+ws_ping_secs = 50
+ws_reconnect_initial_ms = 500
+ws_reconnect_max_ms = 30000
+meta_poll_secs = 60                   # spec-change detection
+signal_sample_secs = 60               # premium sample row in signals.csv
+state_persist_secs = 30
+heartbeat_secs = 300
+# REST token bucket (HL budget: 1200 weight/min per IP; info calls weigh 2-20).
+rest_bucket_capacity = 100.0
+rest_refill_per_sec = 10.0
+
+[monitor]
+data_dir = "data"
+log_json = false
+telegram_enabled = true               # still requires TELEGRAM_BOT_TOKEN/CHAT_ID
