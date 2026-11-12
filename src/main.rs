@@ -49,6 +49,22 @@ enum Command {
         #[arg(long)]
         input: Option<PathBuf>,
     },
+    /// Read-only market probe: resolve the asset (perpDexs + meta) and stream
+    /// book / oracle / premium for a while. Never needs a key, never trades.
+    Probe {
+        /// Duration in seconds.
+        #[arg(long, default_value_t = 20)]
+        secs: u64,
+        /// Print interval in milliseconds.
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+        /// Use the testnet info/ws endpoints instead of mainnet.
+        #[arg(long)]
+        testnet: bool,
+        /// Disable the websocket and exercise the REST fallback only.
+        #[arg(long)]
+        rest_only: bool,
+    },
     /// Load + validate the config and the mode guard, then print a summary.
     CheckConfig {
         #[command(flatten)]
@@ -75,6 +91,12 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::CheckConfig { mode } => check_config(&cfg, &cli.config, &mode),
         Command::Run { mode, data_dir } => run(cfg, &mode, data_dir).await,
+        Command::Probe {
+            secs,
+            interval_ms,
+            testnet,
+            rest_only,
+        } => probe(&cfg, secs, interval_ms, testnet, rest_only).await,
         Command::Replay { input } => {
             anyhow::bail!(
                 "replay is not implemented yet (input: {:?}) — TODO(step5)",
@@ -166,4 +188,102 @@ async fn run(mut cfg: Config, args: &ModeArgs, data_dir: Option<PathBuf>) -> any
         anyhow::bail!("mainnet trading is not available in this build");
     }
     anyhow::bail!("run loop not implemented yet — TODO(step5)")
+}
+
+/// Read-only market probe (info + ws only).
+async fn probe(
+    cfg: &Config,
+    secs: u64,
+    interval_ms: u64,
+    testnet: bool,
+    rest_only: bool,
+) -> anyhow::Result<()> {
+    use antbot::config::PremiumSource;
+    use antbot::hl::{assets, info::InfoClient, market::now_ms, ws};
+    use std::time::Duration;
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "warn,antbot=info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    // Paper endpoints = mainnet info/ws with no exchange URL.
+    let ep = cfg.endpoints(if testnet { Mode::Testnet } else { Mode::Paper });
+    let info = InfoClient::from_config(cfg, &ep.info_url)?;
+    let (dex, coin) = (&cfg.market.dex, &cfg.market.coin);
+
+    println!("info: {}  ws: {}", ep.info_url, ep.ws_url);
+    let spec = assets::resolve_live(&info, dex, coin).await?;
+    println!(
+        "asset: {coin} dex={dex} perp_dex_index={} index_in_meta={} asset_id={}",
+        spec.dex_index, spec.index_in_meta, spec.asset_id
+    );
+    println!(
+        "  szDecimals={} maxPxDecimals={} maxLeverage={} onlyIsolated={} marginMode={:?} marginTableId={:?}",
+        spec.sz_decimals, spec.max_price_decimals, spec.max_leverage, spec.only_isolated,
+        spec.margin_mode, spec.margin_table_id
+    );
+    println!(
+        "  growthMode={:?} deployerFeeScale={:?} lastFeeScaleChange={:?} fundingMultiplier={:?} fundingInterestRate={:?} oiCap={:?} oracleUpdater={:?} delisted={}",
+        spec.growth_mode, spec.deployer_fee_scale, spec.last_fee_scale_change_time,
+        spec.funding_multiplier, spec.funding_interest_rate, spec.streaming_oi_cap,
+        spec.oracle_updater, spec.is_delisted
+    );
+    let mism = spec.check_expected(&cfg.market);
+    if mism.is_empty() {
+        println!("  spec matches config baseline");
+    } else {
+        println!("  SPEC MISMATCH vs config: {}", mism.join("; "));
+    }
+
+    let mut fc = ws::FeedConfig::from_config(cfg, &ep.ws_url, None);
+    fc.ws_enabled = !rest_only;
+    let feed = ws::MarketFeed::spawn(fc, info);
+    let stale_ms = cfg.timing.ws_stale_secs * 1000;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let mut tick = tokio::time::interval(Duration::from_millis(interval_ms.max(100)));
+    println!(
+        "{:>13} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8} {:>8} {:>11} {:>7} {:>8} {:>9} {:>3}",
+        "time_ms", "bid", "ask", "imp_bid", "imp_ask", "oracle", "mark", "spr_bps",
+        "prem_imp", "prem_mid", "prem_api", "funding", "ctx_age", "book_age", "src", "ws"
+    );
+    let f = |v: Option<f64>, p: usize| v.map_or("-".to_string(), |x| format!("{x:.p$}"));
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = tokio::signal::ctrl_c() => break,
+        }
+        let s = feed.snapshot();
+        let now = now_ms();
+        println!(
+            "{:>13} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8} {:>8} {:>11} {:>7} {:>8} {:>9} {:>3}",
+            now,
+            f(s.best_bid.map(|l| l.px), 4),
+            f(s.best_ask.map(|l| l.px), 4),
+            f(s.impact_bid_px, 4),
+            f(s.impact_ask_px, 4),
+            f(s.oracle_px, 4),
+            f(s.mark_px, 4),
+            f(s.spread_bps(), 2),
+            f(s.premium(PremiumSource::Impact).map(|p| p * 1e4), 2),
+            f(s.premium(PremiumSource::BookMid).map(|p| p * 1e4), 2),
+            f(s.api_premium.map(|p| p * 1e4), 2),
+            f(s.funding, 10),
+            s.ctx_age_ms(now).map_or("-".into(), |a| a.to_string()),
+            s.book_age_ms(now).map_or("-".into(), |a| a.to_string()),
+            format!("{}/{}", s.book_source, s.ctx_source),
+            if s.ws_stale(now, stale_ms) { "N" } else { "Y" },
+        );
+    }
+    let s = feed.snapshot();
+    println!(
+        "done: ws_connects={} rest_polls={} updates={}",
+        s.ws_connects, s.rest_polls, s.seq
+    );
+    feed.shutdown().await;
+    Ok(())
 }
