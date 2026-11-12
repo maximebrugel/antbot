@@ -43,8 +43,10 @@ http_timeout_secs = 10
 # "book_mid" uses the l2Book best bid/ask mid as a fallback.
 premium_source = "impact"             # impact | book_mid
 entry_threshold_bps = 50.0            # enter when |premium| >= this
-# Early exit once |premium| has converged to <= this (backtest base rule is
-# 8h_fixed; set early_exit_on_converge = false to reproduce it exactly).
+# Early exit once the premium has converged to <= this on the side we faded
+# (|premium| <= exit_converge_bps, or crossed to the other side). The backtest
+# base rule is 8h_fixed: set early_exit_on_converge = false to reproduce it
+# exactly (tests/strategy_backtest.rs replays its 24 trades).
 exit_converge_bps = 10.0
 early_exit_on_converge = true
 max_hold_secs = 28800                 # 8h hard deadline
@@ -58,6 +60,19 @@ requote_drift_bps = 5.0               # reprice only if our px is this far from 
 taker_fallback_window_secs = 900      # last 15 min before max_hold
 exit_maker_timeout_secs = 600         # converge-exit: go taker after 10 min resting
 taker_max_slippage_bps = 50.0         # IOC limit px = best +/- this
+# Rolling mean of the premium (one sample per 5 s slot) used by the signal,
+# the convergence exit and the persistent-premium kill rule. 0 = instantaneous
+# ctx premium. fundingHistory.premium (backtest signal) is an hourly figure;
+# a larger window smooths spikes from the thin book at the cost of lag.
+premium_avg_secs = 0
+# After an entry is abandoned with nothing filled (timeout, signal gone,
+# rejected), wait this long before a new entry.
+entry_retry_cooldown_secs = 60
+# Order pacing (protects the per-address action budget): minimum gap between
+# two new orders, and cap on new orders + cancels in any rolling minute
+# (cancels are never blocked, only counted).
+min_order_interval_ms = 1000
+max_order_actions_per_min = 30
 
 [sizing]
 notional_usd = 2500.0                 # starting notional per position
@@ -79,6 +94,11 @@ kill_on_spec_change = true
 daily_loss_limit_usd = 150.0          # realized + unrealized, UTC day
 max_drawdown_usd = 300.0              # from peak equity
 flatten_on_kill = true                # close the position (maker->taker) on kill
+# Maker phase of a kill flatten before falling back to IOC (0 = taker at once).
+# Without flatten, a kill cancels orders and leaves the position untouched.
+kill_flatten_maker_secs = 120
+# The kill state is persisted in <data_dir>/risk_state.json and needs a manual
+# `antbot reset-kill --confirm` to resume trading.
 
 [fees]
 # Tier 0, HIP-3 deployerFeeScale 1.0 with growth mode enabled (sizing_fr.md §2):

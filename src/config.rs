@@ -139,6 +139,10 @@ pub struct StrategyConfig {
     pub taker_fallback_window_secs: u64,
     pub exit_maker_timeout_secs: u64,
     pub taker_max_slippage_bps: f64,
+    pub premium_avg_secs: u64,
+    pub entry_retry_cooldown_secs: u64,
+    pub min_order_interval_ms: u64,
+    pub max_order_actions_per_min: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,6 +166,7 @@ pub struct RiskConfig {
     pub daily_loss_limit_usd: f64,
     pub max_drawdown_usd: f64,
     pub flatten_on_kill: bool,
+    pub kill_flatten_maker_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -254,6 +259,10 @@ impl Default for StrategyConfig {
             taker_fallback_window_secs: 900,
             exit_maker_timeout_secs: 600,
             taker_max_slippage_bps: 50.0,
+            premium_avg_secs: 0,
+            entry_retry_cooldown_secs: 60,
+            min_order_interval_ms: 1000,
+            max_order_actions_per_min: 30,
         }
     }
 }
@@ -281,6 +290,7 @@ impl Default for RiskConfig {
             daily_loss_limit_usd: 150.0,
             max_drawdown_usd: 300.0,
             flatten_on_kill: true,
+            kill_flatten_maker_secs: 120,
         }
     }
 }
@@ -467,6 +477,15 @@ impl Config {
         if !finite_pos(s.taker_max_slippage_bps) || s.taker_max_slippage_bps > 500.0 {
             e.push("strategy.taker_max_slippage_bps must be in (0, 500]".into());
         }
+        if s.premium_avg_secs > 4 * 3600 {
+            e.push("strategy.premium_avg_secs must be <= 14400 (4h)".into());
+        }
+        if s.min_order_interval_ms > 60_000 {
+            e.push("strategy.min_order_interval_ms must be <= 60000".into());
+        }
+        if s.max_order_actions_per_min == 0 || s.max_order_actions_per_min > 600 {
+            e.push("strategy.max_order_actions_per_min must be in 1..=600".into());
+        }
 
         // sizing
         let z = &self.sizing;
@@ -530,6 +549,9 @@ impl Config {
         }
         if !finite_pos(r.max_drawdown_usd) {
             e.push("risk.max_drawdown_usd must be > 0".into());
+        }
+        if r.kill_flatten_maker_secs >= s.max_hold_secs {
+            e.push("risk.kill_flatten_maker_secs must be < strategy.max_hold_secs".into());
         }
 
         // fees
@@ -834,6 +856,17 @@ mod tests {
         c.timing.meta_poll_secs = 0;
         let msgs = invalid_msgs(&c);
         assert_eq!(msgs.len(), 5, "{msgs:?}");
+    }
+
+    #[test]
+    fn order_pacing_and_kill_flatten_checked() {
+        let mut c = Config::default();
+        c.strategy.max_order_actions_per_min = 0;
+        c.strategy.min_order_interval_ms = 120_000;
+        c.strategy.premium_avg_secs = 5 * 3600;
+        c.risk.kill_flatten_maker_secs = c.strategy.max_hold_secs;
+        let msgs = invalid_msgs(&c);
+        assert_eq!(msgs.len(), 4, "{msgs:?}");
     }
 
     #[test]

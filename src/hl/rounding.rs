@@ -45,7 +45,7 @@ impl RoundDir {
     }
 }
 
-#[derive(Debug, thiserror::Error, PartialEq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq)]
 pub enum RoundingError {
     #[error("price must be finite and > 0, got {0}")]
     BadPrice(f64),

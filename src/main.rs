@@ -70,6 +70,23 @@ enum Command {
         #[command(flatten)]
         mode: ModeArgs,
     },
+    /// Show the persisted kill-switch state (<data_dir>/risk_state.json).
+    KillStatus {
+        /// Override monitor.data_dir.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Clear a persisted kill so the bot may trade again (manual reset).
+    /// Also clears the hit-rate window, drawdown peak, daily start and spec
+    /// baseline so the same rule does not fire again at once. Stop the bot first.
+    ResetKill {
+        /// Override monitor.data_dir.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Required: confirms the operator reviewed the kill reason.
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[tokio::main]
@@ -97,6 +114,8 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             testnet,
             rest_only,
         } => probe(&cfg, secs, interval_ms, testnet, rest_only).await,
+        Command::KillStatus { data_dir } => kill_status(&cfg, data_dir),
+        Command::ResetKill { data_dir, confirm } => reset_kill(&cfg, data_dir, confirm),
         Command::Replay { input } => {
             anyhow::bail!(
                 "replay is not implemented yet (input: {:?}) — TODO(step5)",
@@ -104,6 +123,65 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             )
         }
     }
+}
+
+fn risk_path(cfg: &Config, data_dir: Option<PathBuf>) -> PathBuf {
+    let dir = data_dir.unwrap_or_else(|| cfg.monitor.data_dir.clone());
+    antbot::risk::kill::risk_state_path(&dir)
+}
+
+fn kill_status(cfg: &Config, data_dir: Option<PathBuf>) -> anyhow::Result<()> {
+    let path = risk_path(cfg, data_dir);
+    let Some(st) = antbot::risk::RiskState::load(&path)? else {
+        println!(
+            "no risk state at {} (never run): not killed",
+            path.display()
+        );
+        return Ok(());
+    };
+    match &st.kill {
+        None => println!("not killed ({})", path.display()),
+        Some(k) => {
+            println!("KILLED at {} ms: {}", k.at_ms, k.message);
+            for (t, r) in &k.later {
+                println!("  later trigger at {t} ms: {}", r.describe());
+            }
+        }
+    }
+    let hits = st.outcomes.iter().filter(|h| **h).count();
+    println!(
+        "hit window: {hits}/{} | trades closed: {} | equity: {:?} (peak {:?}, day start {:?})",
+        st.outcomes.len(),
+        st.trades_closed,
+        st.last_equity_usd,
+        st.peak_equity_usd,
+        st.day_start_equity_usd
+    );
+    Ok(())
+}
+
+fn reset_kill(cfg: &Config, data_dir: Option<PathBuf>, confirm: bool) -> anyhow::Result<()> {
+    let path = risk_path(cfg, data_dir);
+    let Some(mut st) = antbot::risk::RiskState::load(&path)? else {
+        println!("no risk state at {}: nothing to reset", path.display());
+        return Ok(());
+    };
+    let Some(k) = st.kill.as_ref() else {
+        println!("not killed: nothing to reset");
+        return Ok(());
+    };
+    if !confirm {
+        anyhow::bail!(
+            "kill active ({}). Re-run with --confirm to clear it",
+            k.message
+        );
+    }
+    let cleared = antbot::risk::kill::reset_state(&mut st);
+    st.save(&path)?;
+    if let Some(k) = cleared {
+        println!("kill cleared: {}", k.message);
+    }
+    Ok(())
 }
 
 fn resolve(cfg: &Config, args: &ModeArgs) -> anyhow::Result<(Mode, Option<mode::Credentials>)> {
