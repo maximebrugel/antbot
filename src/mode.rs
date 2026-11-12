@@ -38,6 +38,32 @@ pub enum ModeError {
     MalformedAddress,
 }
 
+/// Proof that the mainnet guard (`--mainnet` flag AND
+/// `ANTBOT_CONFIRM_MAINNET=yes-i-understand`) was satisfied.
+///
+/// The private field means it can only be obtained from [`confirm_mainnet`];
+/// the exchange client refuses any mainnet URL without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainnetConfirmed {
+    _private: (),
+}
+
+/// Check the mainnet guard and return the confirmation token.
+pub fn confirm_mainnet(
+    mainnet_flag: bool,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<MainnetConfirmed, ModeError> {
+    let env_ok = env(ENV_CONFIRM_MAINNET).as_deref() == Some(CONFIRM_MAINNET_VALUE);
+    if mainnet_flag && env_ok {
+        Ok(MainnetConfirmed { _private: () })
+    } else {
+        Err(ModeError::MainnetNotConfirmed {
+            flag: mainnet_flag,
+            env_ok,
+        })
+    }
+}
+
 /// Resolve the effective mode from the config value, an optional CLI override,
 /// the `--mainnet` flag and the confirmation env var.
 pub fn resolve_mode(
@@ -48,17 +74,7 @@ pub fn resolve_mode(
 ) -> Result<Mode, ModeError> {
     let mode = cli_mode.unwrap_or(config_mode);
     match mode {
-        Mode::Mainnet => {
-            let env_ok = env(ENV_CONFIRM_MAINNET).as_deref() == Some(CONFIRM_MAINNET_VALUE);
-            if mainnet_flag && env_ok {
-                Ok(Mode::Mainnet)
-            } else {
-                Err(ModeError::MainnetNotConfirmed {
-                    flag: mainnet_flag,
-                    env_ok,
-                })
-            }
-        }
+        Mode::Mainnet => confirm_mainnet(mainnet_flag, env).map(|_| Mode::Mainnet),
         other if mainnet_flag => Err(ModeError::StrayMainnetFlag(other)),
         other => Ok(other),
     }
@@ -254,6 +270,14 @@ mod tests {
             resolve_mode(Mode::Paper, Some(Mode::Mainnet), true, env),
             Ok(Mode::Mainnet)
         );
+    }
+
+    #[test]
+    fn mainnet_token_requires_flag_and_env() {
+        let env = env_of(&[(ENV_CONFIRM_MAINNET, CONFIRM_MAINNET_VALUE)]);
+        assert!(confirm_mainnet(true, &env).is_ok());
+        assert!(confirm_mainnet(false, &env).is_err());
+        assert!(confirm_mainnet(true, no_env).is_err());
     }
 
     #[test]

@@ -133,13 +133,30 @@ fn check_config(cfg: &Config, path: &std::path::Path, args: &ModeArgs) -> anyhow
         "key:           {}",
         match (&creds, requires_key(m)) {
             (_, false) => "not required".to_string(),
-            (Some(c), true) => format!(
-                "loaded (account: {})",
-                c.account_address.as_deref().unwrap_or("derived from key")
-            ),
+            (Some(c), true) => match antbot::hl::signing::Wallet::from_hex(&c.private_key) {
+                Ok(w) => format!(
+                    "loaded (signer {}, account {})",
+                    w.address(),
+                    c.account_address
+                        .as_deref()
+                        .unwrap_or("= signer (no HL_ACCOUNT_ADDRESS)")
+                ),
+                Err(e) => format!("INVALID ({e})"),
+            },
             (None, true) => "MISSING".to_string(),
         }
     );
+    if m != Mode::Paper {
+        // Guard check only: no request is made.
+        let token = mode::confirm_mainnet(args.mainnet, process_env).ok();
+        println!(
+            "exchange guard: {}",
+            match antbot::hl::exchange::ExchangeClient::check_guard(m, &ep, token) {
+                Ok((url, mainnet)) => format!("ok ({url}, signing for mainnet: {mainnet})"),
+                Err(e) => format!("REFUSED: {e}"),
+            }
+        );
+    }
     let s = &cfg.strategy;
     println!(
         "entry:         |premium| >= {} bps ({:?}), exit <= {} bps (early exit {}), max hold {}s",
