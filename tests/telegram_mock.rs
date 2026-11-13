@@ -1,0 +1,237 @@
+//! Telegram alerter against a loopback mock Bot API (`api_base` override to
+//! http://127.0.0.1). Nothing leaves the machine and no real token is used.
+//! Checks the request shape, merging of queued alerts, `retry_after` on
+//! 429, no retry on 4xx, pacing, queue overflow accounting and flush.
+
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use antbot::monitor::telegram::{AlertSettings, Alerter, TelegramConfig};
+use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+const TOKEN: &str = "123456:TEST-not-a-real-token";
+
+#[derive(Debug, Clone)]
+struct Req {
+    path: String,
+    body: Value,
+    at: Instant,
+}
+
+type Seen = Arc<Mutex<Vec<Req>>>;
+
+const OK: (&str, &str) = ("200 OK", r#"{"ok":true,"result":{"message_id":1}}"#);
+
+/// Answers each POST with the next canned (status, body), then 200 OK.
+async fn spawn_mock(replies: Vec<(&'static str, &'static str)>) -> (String, Seen) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    let seen: Seen = Arc::default();
+    let s2 = seen.clone();
+    let replies = Arc::new(Mutex::new(replies.into_iter()));
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = l.accept().await.unwrap();
+            let seen = s2.clone();
+            let replies = replies.clone();
+            tokio::spawn(async move {
+                loop {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 8192];
+                    let (path, body) = loop {
+                        let n = match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&tmp[..n]);
+                        let s = String::from_utf8_lossy(&buf).to_string();
+                        if let Some(h) = s.find("\r\n\r\n") {
+                            let len = s[..h]
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= h + 4 + len {
+                                let path = s
+                                    .lines()
+                                    .next()
+                                    .unwrap()
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .unwrap()
+                                    .to_string();
+                                break (path, buf[h + 4..h + 4 + len].to_vec());
+                            }
+                        }
+                    };
+                    seen.lock().unwrap().push(Req {
+                        path,
+                        body: serde_json::from_slice(&body).unwrap(),
+                        at: Instant::now(),
+                    });
+                    let (status, payload) = replies.lock().unwrap().next().unwrap_or(OK);
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    if sock.write_all(resp.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (base, seen)
+}
+
+fn cfg(base: &str) -> TelegramConfig {
+    TelegramConfig {
+        token: TOKEN.into(),
+        chat_id: "-100777".into(),
+        api_base: base.into(),
+    }
+}
+
+fn settings() -> AlertSettings {
+    AlertSettings {
+        prefix: "[antbot paper xyz:ANT]".into(),
+        queue_capacity: 64,
+        max_per_min: 20,
+        min_interval: Duration::from_millis(10),
+        http_timeout: Duration::from_secs(5),
+        retry_backoff: Duration::from_millis(50),
+    }
+}
+
+fn texts(seen: &Seen) -> Vec<String> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.body["text"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivers_in_order_with_prefix_and_chat_id() {
+    let (base, seen) = spawn_mock(vec![]).await;
+    let (a, stats) = Alerter::spawn(cfg(&base), settings());
+    assert!(a.is_enabled());
+    a.send("🟢 ENTRY SHORT xyz:ANT");
+    a.send("✅ EXIT SHORT xyz:ANT (converged)");
+    a.send("🛑 antbot stopping (SIGTERM)");
+    assert!(a.flush(Duration::from_secs(10)).await);
+
+    let reqs = seen.lock().unwrap().clone();
+    assert!(!reqs.is_empty() && reqs.len() <= 3, "{reqs:?}");
+    for r in &reqs {
+        assert_eq!(r.path, format!("/bot{TOKEN}/sendMessage"));
+        assert_eq!(r.body["chat_id"], "-100777");
+        assert_eq!(r.body["disable_web_page_preview"], true);
+        assert!(r.body.get("parse_mode").is_none());
+        assert!(r.body["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("[antbot paper xyz:ANT]\n"));
+    }
+    // Every alert delivered once, in order (merged or not).
+    let all = texts(&seen).join("\n\n");
+    let i1 = all.find("ENTRY SHORT").unwrap();
+    let i2 = all.find("EXIT SHORT").unwrap();
+    let i3 = all.find("antbot stopping").unwrap();
+    assert!(i1 < i2 && i2 < i3);
+    assert_eq!(all.matches("ENTRY SHORT").count(), 1);
+    assert_eq!(stats.sent.load(Ordering::Relaxed) as usize, reqs.len());
+    assert_eq!(stats.failed.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn honours_retry_after_on_429() {
+    let (base, seen) = spawn_mock(vec![(
+        "429 Too Many Requests",
+        r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 1","parameters":{"retry_after":1}}"#,
+    )])
+    .await;
+    let (a, stats) = Alerter::spawn(cfg(&base), settings());
+    a.send("⛔ KILL SWITCH: test");
+    assert!(a.flush(Duration::from_secs(10)).await);
+    let reqs = seen.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].body, reqs[1].body);
+    let gap = reqs[1].at.duration_since(reqs[0].at);
+    assert!(gap >= Duration::from_millis(950), "retried after {gap:?}");
+    assert_eq!(stats.sent.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retries_5xx_but_not_4xx() {
+    let (base, seen) = spawn_mock(vec![
+        ("502 Bad Gateway", "oops"),
+        OK,
+        (
+            "400 Bad Request",
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}"#,
+        ),
+    ])
+    .await;
+    let (a, stats) = Alerter::spawn(cfg(&base), settings());
+    a.send("first");
+    assert!(a.flush(Duration::from_secs(10)).await);
+    a.send("second");
+    assert!(a.flush(Duration::from_secs(10)).await);
+    // first: 502 then OK; second: 400, given up without retry.
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    assert_eq!(stats.sent.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.failed.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paces_messages_with_min_interval() {
+    let (base, seen) = spawn_mock(vec![]).await;
+    let mut s = settings();
+    s.min_interval = Duration::from_millis(300);
+    let (a, _) = Alerter::spawn(cfg(&base), s);
+    a.send("one");
+    assert!(a.flush(Duration::from_secs(10)).await);
+    a.send("two");
+    assert!(a.flush(Duration::from_secs(10)).await);
+    let reqs = seen.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2);
+    let gap = reqs[1].at.duration_since(reqs[0].at);
+    assert!(gap >= Duration::from_millis(280), "gap {gap:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_queue_drops_without_blocking_and_reports_it() {
+    let (base, seen) = spawn_mock(vec![]).await;
+    let mut s = settings();
+    s.queue_capacity = 1;
+    s.min_interval = Duration::from_millis(200);
+    let (a, _) = Alerter::spawn(cfg(&base), s);
+    let t0 = Instant::now();
+    for i in 0..50 {
+        a.send(format!("alert {i}"));
+    }
+    // send() never waits on the network or the pacing.
+    assert!(t0.elapsed() < Duration::from_millis(100));
+    assert!(a.flush(Duration::from_secs(10)).await);
+    a.send("after the burst");
+    assert!(a.flush(Duration::from_secs(10)).await);
+    let all = texts(&seen).join("\n");
+    assert!(all.contains("alerts dropped: queue full"), "{all}");
+    assert!(all.contains("after the burst"));
+    assert!(all.contains("alert 0"));
+}
+
+#[tokio::test]
+async fn disabled_alerter_is_a_noop() {
+    let a = Alerter::from_env(true, |_| None, AlertSettings::default());
+    assert!(!a.is_enabled());
+    a.send("nothing");
+    assert!(a.flush(Duration::from_millis(10)).await);
+}

@@ -9,6 +9,11 @@
 //! loop gracefully: the executor cancels its open orders (live) and both
 //! states are saved.
 //!
+//! Monitoring ([`crate::monitor`]): every order command and order feedback
+//! goes to `orders.csv`, closed trades to `trades.csv`, premium samples to
+//! `signals.csv`; entries, exits, kills, warnings / errors, startup /
+//! shutdown and the daily summary are sent to Telegram (when configured).
+//!
 //! Paper mode never builds an exchange client: the executor is chosen from
 //! the mode, and [`crate::hl::exchange::ExchangeClient::new`] refuses paper
 //! mode anyway.
@@ -32,6 +37,10 @@ use crate::hl::info::InfoClient;
 use crate::hl::market::{now_ms, MarketState};
 use crate::hl::ws::{FeedConfig, MarketFeed};
 use crate::mode::{Credentials, MainnetConfirmed};
+use crate::monitor::alerts::{self, DailySummary, DayTracker};
+use crate::monitor::csv::{Journal, SignalRow};
+use crate::monitor::telegram::{AlertSettings, Alerter};
+use crate::monitor::Monitor;
 use crate::risk::kill::risk_state_path;
 use crate::risk::{RiskManager, RiskParams, RiskState};
 use crate::runlock::{RunLock, LOCK_REFRESH_MS};
@@ -45,6 +54,8 @@ use crate::strategy::sizing::lot_epsilon;
 const MAX_PUMP_ROUNDS: usize = 32;
 /// Position mismatches tolerated (consecutive reconciliations) before halting.
 const MISMATCH_TOLERANCE: u32 = 2;
+/// How long shutdown waits for queued Telegram alerts.
+const ALERT_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Everything the loop needs besides the executor.
 struct Ctx {
@@ -55,8 +66,13 @@ struct Ctx {
     state_file: PathBuf,
     risk_file: PathBuf,
     sz_decimals: u32,
+    asset_id: u32,
     /// "Running" marker in the data dir (removed on drop).
     lock: RunLock,
+    /// CSV journals + alerts.
+    mon: Monitor,
+    /// The last state save failed (alert once per failure streak).
+    save_failed: bool,
 }
 
 /// Run the bot until SIGINT / SIGTERM.
@@ -65,6 +81,32 @@ pub async fn run(
     mode: Mode,
     creds: Option<Credentials>,
     mainnet: Option<MainnetConfirmed>,
+) -> anyhow::Result<()> {
+    let alerter = Alerter::from_env(
+        cfg.monitor.telegram_enabled,
+        |k| std::env::var(k).ok(),
+        AlertSettings {
+            prefix: format!("[antbot {mode} {}]", cfg.market.coin),
+            max_per_min: cfg.monitor.telegram_max_per_min,
+            ..AlertSettings::default()
+        },
+    );
+    let res = run_inner(cfg, mode, creds, mainnet, alerter.clone()).await;
+    if let Err(e) = &res {
+        let msg = format!("antbot stopped on error: {e:#}");
+        tracing::error!("{msg}");
+        alerter.send(alerts::error(&msg));
+    }
+    alerter.flush(ALERT_FLUSH_TIMEOUT).await;
+    res
+}
+
+async fn run_inner(
+    cfg: Config,
+    mode: Mode,
+    creds: Option<Credentials>,
+    mainnet: Option<MainnetConfirmed>,
+    alerter: Alerter,
 ) -> anyhow::Result<()> {
     let ep = cfg.endpoints(mode);
     let info = InfoClient::from_config(&cfg, &ep.info_url)?;
@@ -90,9 +132,16 @@ pub async fn run(
         coin: cfg.market.coin.clone(),
         state_file: state_path(&data_dir, mode),
         risk_file: risk_state_path(&data_dir),
+        mon: Monitor::new(
+            Journal::open(&data_dir, &mode.to_string()),
+            alerter,
+            &cfg.market.coin,
+        ),
         data_dir,
         sz_decimals: spec.sz_decimals,
+        asset_id: spec.asset_id,
         lock,
+        save_failed: false,
         cfg,
     };
 
@@ -145,6 +194,7 @@ pub async fn run(
     if let Some(k) = engine.risk.kill_record() {
         tracing::error!(kill = %k.message, "kill switch active (persisted): no new entries until `antbot reset-kill --confirm`");
     }
+
     // Baseline / spec check before anything trades.
     let now = now_ms();
     let first = engine.on_spec(now, Ok(&spec));
@@ -204,7 +254,8 @@ pub async fn run(
                 .context("startup reconciliation")?;
             let m = feed.snapshot();
             let mut cmds = first;
-            cmds.extend(apply_events(&mut engine, now_ms(), evs));
+            let mut ctx = ctx;
+            cmds.extend(apply_events(&mut engine, &mut ctx.mon, now_ms(), evs));
             let n = now_ms();
             cmds.extend(reconcile_position_at_startup(
                 &ctx,
@@ -246,14 +297,14 @@ fn reconcile_position_at_startup<A: crate::exec::live::LiveApi>(
             "venue position {} (~{notional:.0} USD) exceeds the {cap} USD cap: not adopting it — halting without trading",
             v.szi
         );
-        alert(&msg);
+        ctx.mon.alert(&msg);
         return engine.manual_kill_with(now, &msg, false);
     }
     if flat_ok && ctx.cfg.live.adopt_position && px > 0.0 {
         let side = if v.szi > 0.0 { Side::Long } else { Side::Short };
         match engine.strategy.adopt_position(side, v.szi.abs(), px, now) {
             Ok(()) => {
-                alert(&format!(
+                ctx.mon.alert(&format!(
                     "adopted existing {} position of {} @ {px} (managed with a fresh {} h clock)",
                     side.as_str(),
                     v.szi.abs(),
@@ -268,14 +319,23 @@ fn reconcile_position_at_startup<A: crate::exec::live::LiveApi>(
         "position mismatch at startup: bot {ours} vs exchange {} — halting without trading",
         v.szi
     );
-    alert(&msg);
+    ctx.mon.alert(&msg);
     engine.manual_kill_with(now, &msg, false)
 }
 
-/// Feed executor events to the engine; returns the resulting commands.
-fn apply_events(engine: &mut Engine, now: u64, evs: Vec<ExecEvent>) -> Vec<Command> {
+/// Feed executor events to the engine (order feedback is journaled);
+/// returns the resulting commands.
+fn apply_events(
+    engine: &mut Engine,
+    mon: &mut Monitor,
+    now: u64,
+    evs: Vec<ExecEvent>,
+) -> Vec<Command> {
     let mut cmds = Vec::new();
     for ev in evs {
+        if let ExecEvent::Order(u) = &ev {
+            mon.order_update(now, u);
+        }
         cmds.extend(engine.on_exec(now, ev));
     }
     cmds
@@ -288,6 +348,7 @@ fn apply_events(engine: &mut Engine, now: u64, evs: Vec<ExecEvent>) -> Vec<Comma
 async fn pump<E: Executor>(
     engine: &mut Engine,
     exec: &mut E,
+    mon: &mut Monitor,
     m: &MarketState,
     carry: &mut Vec<Command>,
     cmds: Vec<Command>,
@@ -299,8 +360,11 @@ async fn pump<E: Executor>(
             return;
         }
         let now = now_ms();
+        for c in &pending {
+            mon.command(now, c);
+        }
         let evs = exec.execute(now, std::mem::take(&mut pending), m).await;
-        pending = apply_events(engine, now, evs);
+        pending = apply_events(engine, mon, now, evs);
     }
     tracing::warn!(
         pending = pending.len(),
@@ -314,7 +378,12 @@ async fn pump<E: Executor>(
 /// dropped) is synthesised from what the executor knows, and a cancel the
 /// executor never received is sent again. Without this the strategy would
 /// wait forever and could neither exit nor flatten on a kill.
-pub fn heal_working<E: Executor>(engine: &mut Engine, exec: &E, now: u64) -> Vec<Command> {
+pub fn heal_working<E: Executor>(
+    engine: &mut Engine,
+    exec: &E,
+    mon: &mut Monitor,
+    now: u64,
+) -> Vec<Command> {
     let Some(w) = engine.strategy.working() else {
         return Vec::new();
     };
@@ -333,25 +402,21 @@ pub fn heal_working<E: Executor>(engine: &mut Engine, exec: &E, now: u64) -> Vec
             Some(0.0),
         ),
     };
-    alert(&format!(
+    mon.alert(&format!(
         "strategy order {tag} was waiting for a terminal state the executor already settled ({reason:?}): resynchronised"
     ));
-    engine.on_exec(
-        now,
-        ExecEvent::Order(OrderUpdate::Done {
-            tag,
-            reason,
-            filled_sz,
-        }),
-    )
+    let done = OrderUpdate::Done {
+        tag,
+        reason,
+        filled_sz,
+    };
+    mon.order_update(now, &done);
+    engine.on_exec(now, ExecEvent::Order(done))
 }
 
-/// Operator alert (Telegram is wired in the monitoring layer).
-fn alert(msg: &str) {
-    tracing::warn!(alert = true, "{msg}");
-}
-
-fn log_notices(engine: &mut Engine) -> bool {
+/// Log the engine's notices, journal closed trades and send the alerts.
+/// Returns whether the state should be saved now.
+fn log_notices(engine: &mut Engine, mon: &mut Monitor) -> bool {
     let mut persist = false;
     for n in engine.drain_notices() {
         match n {
@@ -379,9 +444,16 @@ fn log_notices(engine: &mut Engine) -> bool {
                 Event::PositionOpened {
                     side, size, avg_px, ..
                 } => {
-                    alert(&format!(
-                        "position opened: {} {size} @ {avg_px:.4}",
-                        side.as_str()
+                    let premium = engine.strategy.position().and_then(|p| p.entry_premium_bps);
+                    tracing::info!(
+                        side = side.as_str(),
+                        size,
+                        avg_px,
+                        entry_premium_bps = ?premium,
+                        "position opened"
+                    );
+                    mon.notify(alerts::position_opened(
+                        &mon.coin, side, size, avg_px, premium,
                     ));
                     persist = true;
                 }
@@ -403,15 +475,23 @@ fn log_notices(engine: &mut Engine) -> bool {
                         taker_at_ms,
                         "exit started"
                     );
+                    mon.notify(alerts::exit_started(&mon.coin, reason, premium_bps));
                 }
                 Event::TakerFallback { remaining } => {
                     tracing::warn!(remaining, "taker fallback (IOC)");
+                    mon.notify(alerts::taker_fallback(&mon.coin, remaining));
                 }
                 Event::OrderRejected { tag, reason } => {
                     tracing::info!(tag, ?reason, "order rejected");
                 }
                 Event::TradeClosed(t) => {
-                    alert(&format!(
+                    mon.trade(&t);
+                    mon.notify(alerts::trade_closed(&mon.coin, &t));
+                    tracing::info!(
+                        pnl_usd = t.pnl_usd,
+                        pnl_bps = t.pnl_bps,
+                        "{}",
+                        format_args!(
                         "trade closed: {} {} {:.4} -> {:.4}, pnl {:.2} USD ({:.1} bps), fees {:.4}, funding {:.4}, reason {}, premium {:?} -> {:?} bps",
                         t.side.as_str(),
                         t.size,
@@ -435,27 +515,35 @@ fn log_notices(engine: &mut Engine) -> bool {
                 Event::Warning(w) => tracing::warn!("{w}"),
             },
             Notice::Kill(_, k) => {
-                alert(&k.alert);
+                tracing::error!(
+                    alert = true,
+                    flatten = k.flatten,
+                    "KILL SWITCH: {}",
+                    k.alert
+                );
+                mon.notify(alerts::kill(&k.alert, k.flatten));
                 persist = true;
             }
             Notice::SpecChange {
                 changes, killed, ..
             } => {
-                alert(&format!(
-                    "market spec change{}: {}",
-                    if killed { " (KILL)" } else { "" },
+                tracing::warn!(
+                    alert = true,
+                    killed,
+                    "market spec change: {}",
                     changes.join("; ")
-                ));
+                );
+                mon.notify(alerts::spec_change(&changes, killed));
                 persist = true;
             }
-            Notice::Exec(_, msg) => alert(&msg),
+            Notice::Exec(_, msg) => mon.alert(&msg),
             Notice::Funding(t, usd) => tracing::info!(time_ms = t, usd, "funding settled"),
         }
     }
     persist
 }
 
-fn save_all<E: Executor>(ctx: &Ctx, engine: &Engine, exec: &E) {
+fn save_all<E: Executor>(ctx: &mut Ctx, engine: &Engine, exec: &E) {
     let st = BotState {
         version: STATE_VERSION,
         mode: ctx.mode,
@@ -466,11 +554,27 @@ fn save_all<E: Executor>(ctx: &Ctx, engine: &Engine, exec: &E) {
         executor: exec.save_state(),
         premium_samples: engine.premium_samples(),
     };
-    if let Err(e) = st.save(&ctx.state_file) {
-        tracing::error!(error = %format!("{e:#}"), "saving bot state failed");
-    }
-    if let Err(e) = engine.risk.state().save(&ctx.risk_file) {
-        tracing::error!(error = %format!("{e:#}"), "saving risk state failed");
+    let res = st
+        .save(&ctx.state_file)
+        .context("saving bot state")
+        .and_then(|_| {
+            engine
+                .risk
+                .state()
+                .save(&ctx.risk_file)
+                .context("saving risk state")
+        });
+    match res {
+        Ok(()) => {
+            if std::mem::take(&mut ctx.save_failed) {
+                tracing::info!("state saving works again");
+            }
+        }
+        Err(e) if !ctx.save_failed => {
+            ctx.save_failed = true;
+            ctx.mon.error(&format!("{e:#}"));
+        }
+        Err(e) => tracing::error!(error = %format!("{e:#}"), "state saving still failing"),
     }
 }
 
@@ -530,6 +634,31 @@ async fn shutdown_signal() -> &'static str {
     }
 }
 
+/// Summary of a finished UTC day (trades of that day, current account).
+fn send_daily_summary<E: Executor>(ctx: &Ctx, engine: &Engine, exec: &E, done: &DayTracker) {
+    let Some(d) = done.day else {
+        return;
+    };
+    let mut s = DailySummary::from_trades(d, &engine.ledger.trades);
+    s.realized_total_usd = engine.ledger.realized_pnl_usd;
+    s.equity_usd = engine.equity();
+    s.phase = engine.strategy.phase().kind().as_str().to_string();
+    s.position = exec.venue_position().unwrap_or(engine.strategy_position());
+    s.kill = engine.risk.kill_record().map(|k| k.message.clone());
+    s.premium_min_bps = done.min_bps;
+    s.premium_max_bps = done.max_bps;
+    s.premium_last_bps = done.last_bps;
+    tracing::info!(
+        day = %crate::monitor::fmt_utc_day(d),
+        trades = s.trades,
+        wins = s.wins,
+        pnl_usd = s.pnl_usd,
+        realized_total_usd = s.realized_total_usd,
+        "daily summary"
+    );
+    ctx.mon.notify(s.text(&ctx.mode.to_string(), &ctx.coin));
+}
+
 fn every(secs: u64) -> tokio::time::Interval {
     let mut t = tokio::time::interval(Duration::from_secs(secs.max(1)));
     t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -572,13 +701,13 @@ async fn main_loop<E: Executor>(
     let m0 = feed.snapshot();
     let mut cmds = initial_cmds;
     cmds.extend(engine.startup(now_ms()));
-    pump(&mut engine, &mut exec, &m0, &mut carry, cmds).await;
+    pump(&mut engine, &mut exec, &mut ctx.mon, &m0, &mut carry, cmds).await;
     // A working order persisted by the previous run that the executor does
     // not know (or already settled) must not block the strategy.
-    let cmds = heal_working(&mut engine, &exec, now_ms());
-    pump(&mut engine, &mut exec, &m0, &mut carry, cmds).await;
-    log_notices(&mut engine);
-    save_all(&ctx, &engine, &exec);
+    let cmds = heal_working(&mut engine, &exec, &mut ctx.mon, now_ms());
+    pump(&mut engine, &mut exec, &mut ctx.mon, &m0, &mut carry, cmds).await;
+    log_notices(&mut engine, &mut ctx.mon);
+    save_all(&mut ctx, &engine, &exec);
     tracing::info!(
         mode = %ctx.mode,
         executor = exec.kind(),
@@ -586,12 +715,22 @@ async fn main_loop<E: Executor>(
         phase = engine.strategy.phase().kind().as_str(),
         "main loop started"
     );
+    ctx.mon.notify(alerts::startup(
+        &ctx.mode.to_string(),
+        &ctx.coin,
+        ctx.asset_id,
+        ctx.cfg.effective_notional_usd(),
+        engine.strategy.phase().kind().as_str(),
+        engine.risk.kill_record().map(|k| k.message.as_str()),
+    ));
+    let mut day = DayTracker::new(now_ms());
 
     let reason = loop {
         tokio::select! {
             sig = &mut stop => break sig,
             r = feed.state.changed() => {
                 if r.is_err() {
+                    ctx.mon.error("market feed stopped unexpectedly");
                     break "market feed stopped";
                 }
                 let m = feed.state.borrow_and_update().clone();
@@ -599,34 +738,39 @@ async fn main_loop<E: Executor>(
                 if m.user_events_dropped > dropped_seen {
                     dropped_seen = m.user_events_dropped;
                     force_resync = true;
-                    alert("user events were dropped by the feed: forcing a fills / orders resync");
+                    ctx.mon.alert("user events were dropped by the feed: forcing a fills / orders resync");
                 }
-                let mut cmds = apply_events(&mut engine, now, exec.on_market(now, &m));
+                let mut cmds = apply_events(&mut engine, &mut ctx.mon, now, exec.on_market(now, &m));
                 cmds.extend(engine.on_market(now, &m, exec.available_margin_usd()));
-                pump(&mut engine, &mut exec, &m, &mut carry, cmds).await;
+                pump(&mut engine, &mut exec, &mut ctx.mon, &m, &mut carry, cmds).await;
             }
             Some(trades) = feed.trades.recv() => {
                 let now = now_ms();
                 let m = feed.snapshot();
-                let cmds = apply_events(&mut engine, now, exec.on_trades(now, &trades));
-                pump(&mut engine, &mut exec, &m, &mut carry, cmds).await;
+                let cmds = apply_events(&mut engine, &mut ctx.mon, now, exec.on_trades(now, &trades));
+                pump(&mut engine, &mut exec, &mut ctx.mon, &m, &mut carry, cmds).await;
             }
             Some(ev) = feed.user_events.recv() => {
                 let now = now_ms();
                 let m = feed.snapshot();
                 let evs = exec.on_user_event(now, ev).await;
-                let cmds = apply_events(&mut engine, now, evs);
-                pump(&mut engine, &mut exec, &m, &mut carry, cmds).await;
+                let cmds = apply_events(&mut engine, &mut ctx.mon, now, evs);
+                pump(&mut engine, &mut exec, &mut ctx.mon, &m, &mut carry, cmds).await;
             }
             _ = tick.tick() => {
                 // Time-based rules (timeouts, requotes, deadlines, staleness).
                 let now = now_ms();
                 let m = feed.snapshot();
                 let cmds = engine.on_market(now, &m, exec.available_margin_usd());
-                pump(&mut engine, &mut exec, &m, &mut carry, cmds).await;
+                pump(&mut engine, &mut exec, &mut ctx.mon, &m, &mut carry, cmds).await;
                 if carry.is_empty() {
-                    let cmds = heal_working(&mut engine, &exec, now_ms());
-                    pump(&mut engine, &mut exec, &m, &mut carry, cmds).await;
+                    let cmds = heal_working(&mut engine, &exec, &mut ctx.mon, now_ms());
+                    pump(&mut engine, &mut exec, &mut ctx.mon, &m, &mut carry, cmds).await;
+                }
+                if let Some(done) = day.roll(now) {
+                    if ctx.cfg.monitor.daily_summary {
+                        send_daily_summary(&ctx, &engine, &exec, &done);
+                    }
                 }
                 if now.saturating_sub(lock_refreshed_ms) >= LOCK_REFRESH_MS {
                     lock_refreshed_ms = now;
@@ -639,13 +783,13 @@ async fn main_loop<E: Executor>(
                 let now = now_ms();
                 let m = feed.snapshot();
                 let cmds = engine.on_spec(now, spec.as_ref().map_err(|e| e.clone()));
-                pump(&mut engine, &mut exec, &m, &mut carry, cmds).await;
+                pump(&mut engine, &mut exec, &mut ctx.mon, &m, &mut carry, cmds).await;
             }
             _ = reconcile.tick(), if is_live => {
                 let now = now_ms();
                 let m = feed.snapshot();
                 let evs = exec.reconcile(now, std::mem::take(&mut force_resync)).await;
-                let mut cmds = apply_events(&mut engine, now, evs);
+                let mut cmds = apply_events(&mut engine, &mut ctx.mon, now, evs);
                 // Position check (after the strategy has seen every fill).
                 if let Some(v) = exec.venue_position() {
                     let ours = engine.strategy_position();
@@ -661,12 +805,25 @@ async fn main_loop<E: Executor>(
                         mismatches = 0;
                     }
                 }
-                pump(&mut engine, &mut exec, &m, &mut carry, cmds).await;
+                pump(&mut engine, &mut exec, &mut ctx.mon, &m, &mut carry, cmds).await;
             }
-            _ = persist.tick() => save_all(&ctx, &engine, &exec),
+            _ = persist.tick() => save_all(&mut ctx, &engine, &exec),
             _ = sample.tick() => {
                 let m = feed.snapshot();
+                let now = now_ms();
                 let v = engine.last_view().copied();
+                let premium = v.and_then(|v| v.premium_bps);
+                day.sample(premium.or(engine.last_raw_premium_bps()));
+                ctx.mon.journal.signal(&SignalRow {
+                    premium_bps: premium,
+                    raw_premium_bps: engine.last_raw_premium_bps(),
+                    avg_ready: engine.premium_ready(),
+                    stale: v.is_none_or(|v| v.stale),
+                    state: engine.strategy.phase().kind().as_str().to_string(),
+                    position: engine.strategy_position(),
+                    killed: engine.risk.is_killed(),
+                    ..SignalRow::from_market(now, &m)
+                });
                 tracing::info!(
                     premium_bps = ?v.and_then(|v| v.premium_bps).map(|p| (p * 100.0).round() / 100.0),
                     raw_premium_bps = ?engine.last_raw_premium_bps().map(|p| (p * 100.0).round() / 100.0),
@@ -684,9 +841,17 @@ async fn main_loop<E: Executor>(
             _ = heartbeat.tick() => {
                 let m = feed.snapshot();
                 let now = now_ms();
+                let r2 = |x: f64| (x * 100.0).round() / 100.0;
+                let unrealized = match (engine.strategy.position(), engine.last_mark()) {
+                    (Some(p), Some(mk)) => p.unrealized_pnl(mk),
+                    _ => 0.0,
+                };
                 tracing::info!(
                     phase = engine.strategy.phase().kind().as_str(),
+                    premium_bps = ?engine.last_view().and_then(|v| v.premium_bps).map(r2),
+                    raw_premium_bps = ?engine.last_raw_premium_bps().map(r2),
                     position = engine.strategy_position(),
+                    unrealized_usd = r2(unrealized),
                     working_order = engine.strategy.working().map(|w| w.intent.tag),
                     equity_usd = (engine.equity() * 100.0).round() / 100.0,
                     realized_usd = (engine.ledger.realized_pnl_usd * 100.0).round() / 100.0,
@@ -701,12 +866,19 @@ async fn main_loop<E: Executor>(
                 );
             }
         }
-        if log_notices(&mut engine) {
-            save_all(&ctx, &engine, &exec);
+        if log_notices(&mut engine, &mut ctx.mon) {
+            save_all(&mut ctx, &engine, &exec);
         }
     };
 
     tracing::info!(%reason, "shutting down");
+    ctx.mon.notify(alerts::shutdown(
+        reason,
+        engine.strategy.phase().kind().as_str(),
+        engine.strategy_position(),
+        engine.ledger.realized_pnl_usd,
+        engine.ledger.trades.len(),
+    ));
     // From here on the strategy only records feedback: an order it decided
     // to send now could not be executed, and persisting it as "working"
     // would leave the next run waiting for it.
@@ -716,13 +888,13 @@ async fn main_loop<E: Executor>(
     }
     let m = feed.snapshot();
     let evs = exec.shutdown(now_ms(), &m).await;
-    let leftover = apply_events(&mut engine, now_ms(), evs);
+    let leftover = apply_events(&mut engine, &mut ctx.mon, now_ms(), evs);
     debug_assert!(
         leftover.is_empty(),
         "suspended strategy issued {leftover:?}"
     );
-    log_notices(&mut engine);
-    save_all(&ctx, &engine, &exec);
+    log_notices(&mut engine, &mut ctx.mon);
+    save_all(&mut ctx, &engine, &exec);
     feed.shutdown().await;
     tracing::info!(
         state = %ctx.state_file.display(),

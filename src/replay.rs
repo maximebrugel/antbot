@@ -683,7 +683,7 @@ pub fn report(
 }
 
 /// Days since 1970-01-01 -> (year, month, day) (H. Hinnant's algorithm).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -696,33 +696,14 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// Write the trades of a replay as CSV.
+/// Write the trades of a replay as CSV (same columns as the live
+/// `trades.csv`, mode `replay`).
 pub fn write_trades_csv(path: &Path, trades: &[TradeRecord]) -> anyhow::Result<()> {
-    use std::fmt::Write;
-    let mut s = String::from(
-        "opened_ms,closed_ms,side,size,entry_px,exit_px,entry_premium_bps,exit_premium_bps,fees_usd,funding_usd,gross_pnl_usd,pnl_usd,pnl_bps,exit_reason,exit_taker_sz\n",
-    );
+    use crate::monitor::csv::{line, TradeRow};
+    let mut s = format!("{}\n", TradeRow::HEADER);
     for t in trades {
-        let f = |v: Option<f64>| v.map_or(String::new(), |x| format!("{x:.4}"));
-        let _ = writeln!(
-            s,
-            "{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.4},{},{}",
-            t.opened_ms,
-            t.closed_ms,
-            t.side.as_str(),
-            t.size,
-            t.entry_px,
-            t.exit_px,
-            f(t.entry_premium_bps),
-            f(t.exit_premium_bps),
-            t.fees_usd,
-            t.funding_usd,
-            t.gross_pnl_usd,
-            t.pnl_usd,
-            t.pnl_bps,
-            t.exit_reason.as_str(),
-            t.exit_taker_sz
-        );
+        s.push_str(&line(&TradeRow { mode: "replay", t }.fields()));
+        s.push('\n');
     }
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;

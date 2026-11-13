@@ -756,7 +756,7 @@ mod shutdown_regression {
     }
 
     fn heal_working_cmds(e: &mut Engine, x: &LiveExecutor<Fake>, now: u64) -> Vec<Command> {
-        crate::runner::heal_working(e, x, now)
+        crate::runner::heal_working(e, x, &mut crate::monitor::Monitor::disabled(), now)
     }
 
     /// Cancel of a finished order repeats its terminal state.

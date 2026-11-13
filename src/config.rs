@@ -249,7 +249,13 @@ pub struct TimingConfig {
 pub struct MonitorConfig {
     pub data_dir: PathBuf,
     pub log_json: bool,
+    /// Daily log files kept in `<data_dir>/logs` (0 = keep all).
+    pub log_max_files: usize,
     pub telegram_enabled: bool,
+    /// Telegram messages per rolling minute (queued alerts are merged).
+    pub telegram_max_per_min: u32,
+    /// Send a summary of the previous UTC day after midnight UTC.
+    pub daily_summary: bool,
 }
 
 impl Default for Config {
@@ -381,7 +387,10 @@ impl Default for MonitorConfig {
         Self {
             data_dir: PathBuf::from("data"),
             log_json: false,
+            log_max_files: 30,
             telegram_enabled: true,
+            telegram_max_per_min: 20,
+            daily_summary: true,
         }
     }
 }
@@ -696,6 +705,9 @@ impl Config {
         // monitor
         if self.monitor.data_dir.as_os_str().is_empty() {
             e.push("monitor.data_dir must not be empty".into());
+        }
+        if !(1..=30).contains(&self.monitor.telegram_max_per_min) {
+            e.push("monitor.telegram_max_per_min must be in 1..=30 (Telegram limits)".into());
         }
 
         if e.is_empty() {

@@ -309,8 +309,12 @@ async fn run(mut cfg: Config, args: &ModeArgs, data_dir: Option<PathBuf>) -> any
         cfg.monitor.data_dir = d;
     }
     let (m, creds) = resolve(&cfg, args)?;
-    let _guard = logging::init(&cfg.monitor.data_dir, cfg.monitor.log_json)
-        .context("initialising logging")?;
+    let _guard = logging::init(
+        &cfg.monitor.data_dir,
+        cfg.monitor.log_json,
+        cfg.monitor.log_max_files,
+    )
+    .context("initialising logging")?;
     let ep = cfg.endpoints(m);
     tracing::info!(
         mode = %m,

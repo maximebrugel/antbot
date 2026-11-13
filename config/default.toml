@@ -117,15 +117,24 @@ ws_reconnect_max_ms = 30000
 meta_poll_secs = 60                   # spec-change detection
 signal_sample_secs = 60               # premium sample row in signals.csv
 state_persist_secs = 30
-heartbeat_secs = 300
+heartbeat_secs = 300                  # heartbeat log line (state, premium, PnL)
 # REST token bucket (HL budget: 1200 weight/min per IP; info calls weigh 2-20).
 rest_bucket_capacity = 100.0
 rest_refill_per_sec = 10.0
 
 [monitor]
+# Data dir: state files, signals.csv / orders.csv / trades.csv, logs/.
 data_dir = "data"
-log_json = false
-telegram_enabled = true               # still requires TELEGRAM_BOT_TOKEN/CHAT_ID
+# Logs go to stdout and to <data_dir>/logs/antbot.log.YYYY-MM-DD (daily
+# rotation). Level / filters from RUST_LOG (default "info").
+log_json = false                      # JSON lines instead of text (both outputs)
+log_max_files = 30                    # daily log files kept (0 = keep all)
+# Telegram alerts: entries, exits, kill switch, errors, startup / shutdown,
+# daily summary. Needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the env;
+# without them alerts are disabled with a log line.
+telegram_enabled = true
+telegram_max_per_min = 20             # rate limit (queued alerts are merged)
+daily_summary = true                  # summary of the previous UTC day after 00:00 UTC
 
 [paper]
 # Paper mode: live mainnet market data, simulated fills, never calls /exchange.
