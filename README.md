@@ -32,7 +32,7 @@ A premium mean-reversion bot for the HIP-3 perpetual **`xyz:ANT`** on Hyperliqui
 - **Places orders.** Entries are maker-only ALO (post-only) limit orders on isolated margin, 1x by default. Exits go maker first, with an IOC taker fallback near the deadline. Prices respect the tick and 5-significant-figure rules, and sizes respect `szDecimals`.
 - **Enforces kill rules:** hit rate, persistent premium, spec change, daily loss and max drawdown. A kill is persisted and needs a manual reset.
 - **Persists state** (position, PnL, trade history, kill state) in a data directory, so a restart resumes where it stopped.
-- **Records and alerts.** It writes structured logs, CSV journals (premium samples, orders, trades) and optional Telegram alerts.
+- **Records and alerts.** It writes structured logs, CSV journals (premium samples, orders, trades) and optional Telegram alerts, and answers read-only Telegram commands (`/pnl`, `/trades`, `/help`) from its private chat.
 - **Replays history.** `antbot replay` runs the same strategy and fill model over historical hourly data.
 
 ## Strategy
@@ -146,6 +146,7 @@ src/
     logging.rs       tracing to stdout + daily rolling file
     csv.rs           signals / orders / trades journals
     telegram.rs      rate-limited, non-blocking Telegram alerts
+    commands.rs      read-only Telegram commands (/pnl, /trades, /help)
     alerts.rs        alert texts, daily summary
 tests/               integration tests (fixtures from real API responses, signing vectors, mocks)
 ```
@@ -228,7 +229,7 @@ Passing `--mainnet` when the resolved mode is not mainnet is an error. The excha
 | `HL_ACCOUNT_ADDRESS` | testnet / mainnet | main account address (`0x` + 40 hex) when `HL_PRIVATE_KEY` is an API wallet. Positions, balances, open orders and fills are queried for this address. Empty = the address derived from the key |
 | `ANTBOT_CONFIRM_MAINNET` | mainnet | must equal `yes-i-understand` (plus the `--mainnet` flag). Leave empty |
 | `TELEGRAM_BOT_TOKEN` | all | Telegram bot token. Alerts are disabled if unset |
-| `TELEGRAM_CHAT_ID` | all | chat id that receives the alerts |
+| `TELEGRAM_CHAT_ID` | all | chat id that receives the alerts. Commands (`/pnl`, `/trades`, `/help`) are answered only when this is your own user id (private chat with the bot), see [Telegram commands](#telegram-commands) |
 | `TELEGRAM_API_BASE` | all | optional Bot API base URL (default `https://api.telegram.org`, used by tests) |
 | `RUST_LOG` | all | log filter (tracing `EnvFilter` syntax). Default and `.env.example`: `info`. `info,antbot=debug` adds the bot's debug lines. An invalid value falls back to `info` with a warning in the log |
 | `ANTBOT_CONFIG` | all | config file path (same as `-c`) |
@@ -373,6 +374,7 @@ These rates drive paper fills, replay and PnL accounting. The venue charges its 
 | `log_max_files` | `30` | daily log files kept (0 = keep all) |
 | `telegram_enabled` | `true` | Telegram alerts (still need the env vars) |
 | `telegram_max_per_min` | `20` | Telegram rate limit (1–30); queued alerts are merged |
+| `telegram_commands_enabled` | `true` | answer the read-only `/pnl`, `/trades`, `/help` commands. Active only with `telegram_enabled`, both env vars set, and `TELEGRAM_CHAT_ID` a private chat (your user id) |
 | `daily_summary` | `true` | send a summary of the previous UTC day after 00:00 UTC (also at the next start if it was missed) |
 
 ### `[paper]`
@@ -513,7 +515,7 @@ Everything is written to the data dir (`monitor.data_dir`, `--data-dir` or `ANTB
 1. In Telegram, talk to [@BotFather](https://t.me/BotFather), send `/newbot` and copy the **bot token**.
 2. Send any message to your new bot (or add it to a group and send a message there).
 3. Get the chat id: open `https://api.telegram.org/bot<TOKEN>/getUpdates` and read `result[].message.chat.id`. Group ids are negative.
-4. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` and restart.
+4. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` and restart. For the [commands](#telegram-commands), use your private chat with the bot: its chat id is your user id, a positive number.
 
 Without them, alerts are disabled with a single log line.
 
@@ -537,6 +539,48 @@ Sending never blocks the trading loop:
 - On queue overflow, alerts are dropped. Alerts that still fail after 3 attempts are given up. Both are counted at the top of the next message ("(N alerts dropped: queue full)", "(N earlier alerts could not be delivered)").
 - The sent and failed counts are logged at shutdown.
 - The token never appears in the logs.
+
+### Telegram commands
+
+The bot answers three **read-only** commands in its private chat:
+
+| command | reply |
+|---|---|
+| `/pnl` | phase, position (side, size, average entry price, time held), entry premium and current premium (signal and raw, in bps), a warning if the executor's account position (exchange in live modes, simulated account in paper) differs from the strategy's, realized PnL (total and today UTC with its trade count), unrealized PnL of the open position (net of its fees and funding so far), equity (realized + unrealized), fees paid, number of trades, and the kill switch (rule, time, message) if one is active |
+| `/trades` | the last 20 closed trades, newest first: exit time UTC, side, size, entry -> exit premium (bps), net PnL (USD), exit reason |
+| `/help` | the list of commands |
+
+- **Parsing.** Names are case-insensitive. The `/cmd@botname` form works, and trailing arguments are ignored. Any other command or text from the authorized chat gets the `/help` list.
+- **Format and size.** Replies are plain text, with no `parse_mode`, so nothing needs escaping. They stay under Telegram's 4096-character limit: if `/trades` ever exceeded it, the oldest lines would be dropped with a note.
+- **Data source.** The data comes from the same in-memory state the heartbeat reports.
+  - The main loop publishes a snapshot every second, and right after entries, closed trades and kills.
+  - Trade history is the ledger persisted in `state_<mode>.json`, so it survives restarts. It is the same history as `trades.csv`.
+- **Configuration.** `monitor.telegram_commands_enabled` is `true` by default. Commands are active only when Telegram is enabled and `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` are set. The startup log says either `telegram commands enabled` or `telegram commands disabled: <reason>`.
+
+**Authorization model.** An update is answered only when **all** of these hold:
+- it is a new `message`;
+- `message.chat.type == "private"`;
+- `message.chat.id == TELEGRAM_CHAT_ID`;
+- `message.from.id == TELEGRAM_CHAT_ID`;
+- the sender is not a bot.
+
+So `TELEGRAM_CHAT_ID` must be your Telegram **user id**: the chat id of your private chat with the bot, a positive number.
+- With a group or channel id (negative), alerts still work but commands are disabled. Use a private chat if you want both.
+- Everything else is ignored without a reply and logged at debug level at most: other users or chats, groups, supergroups, channels, edited messages, callback queries, messages without a sender, and non-text messages.
+- Messages sent while the bot was down are skipped, so a restart does not answer a backlog. At startup a `getUpdates` call with `offset=-1` forgets the pending updates, and any message dated before the start is ignored anyway.
+
+**Read-only guarantee.**
+- The command task only holds a copy of the state snapshot and an HTTP client. It has no handle on the engine, the executor or the kill switch.
+- No command can change state, place or cancel orders, reset a kill, or stop the bot.
+
+**Isolation from trading.**
+- Long polling (`getUpdates`, 25 s timeout) runs in its own task. The main loop never waits on it: publishing the snapshot is a non-blocking `watch` channel update, and no lock is held during network I/O.
+- Telegram failures are logged with the token redacted, then retried with exponential backoff from 1 s up to 60 s (a `retry_after` is honoured, also capped at 60 s). This covers network errors, HTTP 4xx / 5xx, a `409 Conflict` (another `getUpdates` consumer or a webhook on the same bot) and malformed answers.
+- Repeated poll failures log at most one WARN per minute; the others are at debug level.
+- A panic in the task is caught, logged, and the task restarts after 30 s. The update that caused it is not processed again.
+- The task stops cleanly at shutdown.
+- Replies are spaced at least 1.1 s apart. A reply rate-limited by Telegram (429) is retried once after its `retry_after`.
+- Only one process may poll a given bot token. If two instances share a bot, both get `409 Conflict` errors: disable commands on all but one (`telegram_commands_enabled = false`). Alerts are unaffected.
 
 ## Kill rules
 

@@ -134,6 +134,10 @@ log_max_files = 30                    # daily log files kept (0 = keep all)
 # without them alerts are disabled with a log line.
 telegram_enabled = true
 telegram_max_per_min = 20             # rate limit (queued alerts are merged)
+# Read-only commands /pnl, /trades, /help, answered only in the private chat
+# whose id is TELEGRAM_CHAT_ID (your user id; ignored for group ids). Needs
+# telegram_enabled and both env vars. Commands never change state or orders.
+telegram_commands_enabled = true
 daily_summary = true                  # summary of the previous UTC day after 00:00 UTC
 
 [paper]

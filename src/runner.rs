@@ -13,16 +13,20 @@
 //! goes to `orders.csv`, closed trades to `trades.csv`, premium samples to
 //! `signals.csv`; entries, exits, kills, warnings / errors, startup /
 //! shutdown and the daily summary are sent to Telegram (when configured).
+//! The read-only Telegram commands (`/pnl`, `/trades`, `/help`) run in their
+//! own task and only read a [`StatusSnapshot`] the loop publishes every
+//! second and after entries, closed trades and kills.
 //!
 //! Paper mode never builds an exchange client: the executor is chosen from
 //! the mode, and [`crate::hl::exchange::ExchangeClient::new`] refuses paper
 //! mode anyway.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::config::HARD_CAP_NOTIONAL_USD;
 use crate::config::{Config, Mode};
@@ -38,6 +42,7 @@ use crate::hl::market::{now_ms, MarketState};
 use crate::hl::ws::{FeedConfig, MarketFeed};
 use crate::mode::{Credentials, MainnetConfirmed};
 use crate::monitor::alerts::{self, DailySummary, DayTracker};
+use crate::monitor::commands::{CommandsHandle, StatusSnapshot};
 use crate::monitor::csv::{Journal, SignalRow};
 use crate::monitor::telegram::{AlertSettings, Alerter};
 use crate::monitor::Monitor;
@@ -56,6 +61,8 @@ const MAX_PUMP_ROUNDS: usize = 32;
 const MISMATCH_TOLERANCE: u32 = 2;
 /// How long shutdown waits for queued Telegram alerts.
 const ALERT_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long shutdown waits for the Telegram command task.
+const COMMANDS_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Everything the loop needs besides the executor.
 struct Ctx {
@@ -77,6 +84,9 @@ struct Ctx {
     day: DayTracker,
     /// Persisted tracker of a day whose summary is still due.
     missed_day: Option<DayTracker>,
+    /// Snapshot for the read-only Telegram commands (`None` when they are
+    /// disabled: nothing is built then).
+    status: Option<watch::Sender<Arc<StatusSnapshot>>>,
 }
 
 /// Run the bot until SIGINT / SIGTERM.
@@ -90,7 +100,7 @@ pub async fn run(
         cfg.monitor.telegram_enabled,
         |k| std::env::var(k).ok(),
         AlertSettings {
-            prefix: format!("[antbot {mode} {}]", cfg.market.coin),
+            prefix: msg_prefix(mode, &cfg.market.coin),
             max_per_min: cfg.monitor.telegram_max_per_min,
             ..AlertSettings::default()
         },
@@ -149,6 +159,7 @@ async fn run_inner(
         save_failed: false,
         day: DayTracker::new(now_ms()),
         missed_day: None,
+        status: None,
         cfg,
     };
 
@@ -683,6 +694,24 @@ fn send_daily_summary<E: Executor>(ctx: &Ctx, engine: &Engine, exec: &E, done: &
     ctx.mon.notify(s.text(&ctx.mode.to_string(), &ctx.coin));
 }
 
+/// Header of alerts and command replies.
+fn msg_prefix(mode: Mode, coin: &str) -> String {
+    format!("[antbot {mode} {coin}]")
+}
+
+/// Publish the state snapshot for the Telegram commands (non-blocking;
+/// no-op when commands are disabled).
+fn publish_status<E: Executor>(ctx: &Ctx, engine: &Engine, exec: &E) {
+    if let Some(tx) = &ctx.status {
+        tx.send_replace(Arc::new(StatusSnapshot::from_engine(
+            engine,
+            &msg_prefix(ctx.mode, &ctx.coin),
+            now_ms(),
+            exec.venue_position(),
+        )));
+    }
+}
+
 fn every(secs: u64) -> tokio::time::Interval {
     let mut t = tokio::time::interval(Duration::from_secs(secs.max(1)));
     t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -754,6 +783,22 @@ async fn main_loop<E: Executor>(
         }
         save_all(&mut ctx, &engine, &exec);
     }
+    // Read-only Telegram commands: a separate task that only reads the
+    // snapshot published below (stopped on drop if this function errors).
+    let commands = {
+        let (tx, rx) = watch::channel(Arc::new(StatusSnapshot::default()));
+        let h = CommandsHandle::from_env(
+            ctx.cfg.monitor.telegram_commands_enabled,
+            ctx.cfg.monitor.telegram_enabled,
+            |k| std::env::var(k).ok(),
+            rx,
+        );
+        if h.is_some() {
+            ctx.status = Some(tx);
+            publish_status(&ctx, &engine, &exec);
+        }
+        h
+    };
 
     let reason = loop {
         tokio::select! {
@@ -805,6 +850,7 @@ async fn main_loop<E: Executor>(
                     // same summary again.
                     save_all(&mut ctx, &engine, &exec);
                 }
+                publish_status(&ctx, &engine, &exec);
                 if now.saturating_sub(lock_refreshed_ms) >= LOCK_REFRESH_MS {
                     lock_refreshed_ms = now;
                     if let Err(e) = ctx.lock.refresh(now) {
@@ -901,10 +947,17 @@ async fn main_loop<E: Executor>(
         }
         if log_notices(&mut engine, &mut ctx.mon) {
             save_all(&mut ctx, &engine, &exec);
+            publish_status(&ctx, &engine, &exec);
         }
     };
 
     tracing::info!(%reason, "shutting down");
+    // Stop the command task now, but wait for it only after the orders
+    // are handled below.
+    if let Some(h) = &commands {
+        h.request_stop();
+    }
+    ctx.status = None;
     ctx.mon.notify(alerts::shutdown(
         reason,
         engine.strategy.phase().kind().as_str(),
@@ -929,6 +982,9 @@ async fn main_loop<E: Executor>(
     log_notices(&mut engine, &mut ctx.mon);
     save_all(&mut ctx, &engine, &exec);
     feed.shutdown().await;
+    if let Some(h) = commands {
+        h.shutdown(COMMANDS_STOP_TIMEOUT).await;
+    }
     tracing::info!(
         state = %ctx.state_file.display(),
         phase = engine.strategy.phase().kind().as_str(),

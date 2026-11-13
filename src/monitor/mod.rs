@@ -7,9 +7,12 @@
 //! * [`telegram`]: non-blocking, rate-limited alert queue (disabled with a
 //!   log line when `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` are unset);
 //! * [`alerts`]: the alert texts (pure functions, unit tested) and the
-//!   daily summary.
+//!   daily summary;
+//! * [`commands`]: read-only inbound Telegram commands (`/pnl`, `/trades`,
+//!   `/help`) answered from a state snapshot published by the main loop.
 
 pub mod alerts;
+pub mod commands;
 pub mod csv;
 pub mod logging;
 pub mod telegram;

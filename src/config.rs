@@ -254,6 +254,9 @@ pub struct MonitorConfig {
     pub telegram_enabled: bool,
     /// Telegram messages per rolling minute (queued alerts are merged).
     pub telegram_max_per_min: u32,
+    /// Answer the read-only `/pnl`, `/trades`, `/help` commands from the
+    /// configured private chat (needs `telegram_enabled` and the env vars).
+    pub telegram_commands_enabled: bool,
     /// Send a summary of the previous UTC day after midnight UTC.
     pub daily_summary: bool,
 }
@@ -390,6 +393,7 @@ impl Default for MonitorConfig {
             log_max_files: 30,
             telegram_enabled: true,
             telegram_max_per_min: 20,
+            telegram_commands_enabled: true,
             daily_summary: true,
         }
     }
