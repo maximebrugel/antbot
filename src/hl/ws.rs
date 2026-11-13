@@ -385,7 +385,13 @@ async fn rest_fallback_task(
             continue;
         }
         if !was_polling {
-            tracing::warn!("websocket stale, polling REST fallback");
+            // Before the first websocket market message this is the normal
+            // startup path, not a degradation: keep it out of WARN.
+            if state.borrow().last_ws_market_ms.is_none() {
+                tracing::info!("no websocket market data yet, polling REST fallback");
+            } else {
+                tracing::warn!("websocket stale, polling REST fallback");
+            }
             was_polling = true;
         }
         if let Err(e) = poll_rest_once(&cfg, &info, &state).await {

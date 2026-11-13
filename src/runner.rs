@@ -422,6 +422,18 @@ pub fn heal_working<E: Executor>(
     engine.on_exec(now, ExecEvent::Order(done))
 }
 
+/// Round for log output only (VWAP prices and notionals carry float noise
+/// such as `101.49999999999999`).
+fn round_to(v: f64, decimals: i32) -> f64 {
+    let k = 10f64.powi(decimals);
+    let r = (v * k).round() / k;
+    if r.is_finite() {
+        r
+    } else {
+        v
+    }
+}
+
 /// Log the engine's notices, journal closed trades and send the alerts.
 /// Returns whether the state should be saved now.
 fn log_notices(engine: &mut Engine, mon: &mut Monitor) -> bool {
@@ -438,10 +450,10 @@ fn log_notices(engine: &mut Engine, mon: &mut Monitor) -> bool {
                 } => {
                     tracing::info!(
                         side = side.as_str(),
-                        premium_bps,
-                        px,
-                        size,
-                        notional_usd,
+                        premium_bps = round_to(premium_bps, 2),
+                        px = round_to(px, 8),
+                        size = round_to(size, 8),
+                        notional_usd = round_to(notional_usd, 2),
                         "entry started (ALO)"
                     );
                 }
@@ -455,9 +467,9 @@ fn log_notices(engine: &mut Engine, mon: &mut Monitor) -> bool {
                     let premium = engine.strategy.position().and_then(|p| p.entry_premium_bps);
                     tracing::info!(
                         side = side.as_str(),
-                        size,
-                        avg_px,
-                        entry_premium_bps = ?premium,
+                        size = round_to(size, 8),
+                        avg_px = round_to(avg_px, 8),
+                        entry_premium_bps = ?premium.map(|p| round_to(p, 2)),
                         "position opened"
                     );
                     mon.notify(alerts::position_opened(
