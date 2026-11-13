@@ -9,7 +9,10 @@
 //! formula `round(float(f"{px:.5g}"), 6 - szDecimals)` (checked against
 //! SDK-generated values in `tests/signing_vectors.rs`). Maker orders should
 //! use `Down` for bids and `Up` for asks so rounding never makes them more
-//! aggressive than intended.
+//! aggressive than intended. `Down` / `Up` always snap to 5 significant
+//! figures, so prices >= 100,000 are rounded more coarsely than the exchange
+//! requires (integers are always valid there). This is intentional and
+//! conservative; it does not matter for xyz:ANT (about 100 USD).
 
 use super::signing::float_to_wire;
 

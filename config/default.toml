@@ -124,3 +124,22 @@ rest_refill_per_sec = 10.0
 data_dir = "data"
 log_json = false
 telegram_enabled = true               # still requires TELEGRAM_BOT_TOKEN/CHAT_ID
+
+[paper]
+# Paper mode: live mainnet market data, simulated fills, never calls /exchange.
+initial_balance_usd = 10000.0         # simulated account, for available margin
+# A resting ALO fills when the opposite best price reaches it (book touch or
+# cross) or a public trade prints at / through it. fill_on_touch = false only
+# counts trades strictly through our price (pessimistic queue position).
+fill_on_touch = true
+
+[live]
+# Testnet / mainnet executor.
+stray_orders = "cancel"               # unknown open orders on the coin at startup: cancel | keep
+adopt_position = true                 # manage a position found at startup (fresh 8h clock); false = halt
+cancel_on_shutdown = true             # SIGINT / SIGTERM cancels the bot's open orders
+flatten_on_shutdown = false           # keep the position on shutdown by default
+reconcile_secs = 30                   # clearinghouseState / openOrders reconciliation period
+max_exchange_actions_per_min = 60     # client-side per-address action budget (cancels always allowed)
+rate_limit_backoff_secs = 60          # pause new orders after a rate-limit answer
+expires_after_ms = 30000              # expiresAfter window on signed actions (0 = off)

@@ -316,6 +316,21 @@ impl InfoClient {
         self.post(json!({"type": "userFills", "user": user})).await
     }
 
+    /// Status of one order by oid (number) or cloid (`0x...` string).
+    /// Raw JSON: `{"status":"order","order":{"order":{..},"status":"filled",..}}`
+    /// or `{"status":"unknownOid"}`.
+    pub async fn order_status(&self, user: &str, oid_or_cloid: Value) -> anyhow::Result<Value> {
+        self.post_raw(json!({"type": "orderStatus", "user": user, "oid": oid_or_cloid}))
+            .await
+    }
+
+    /// Funding payments since `start_ms` (all coins; raw JSON entries
+    /// `{time, delta: {type: "funding", coin, usdc, szi, fundingRate}}`).
+    pub async fn user_funding(&self, user: &str, start_ms: u64) -> anyhow::Result<Vec<Value>> {
+        self.post(json!({"type": "userFunding", "user": user, "startTime": start_ms}))
+            .await
+    }
+
     /// Candles, `interval` e.g. `"1m"`, `"1h"`; times in ms.
     pub async fn candle_snapshot(
         &self,

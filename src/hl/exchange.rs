@@ -100,6 +100,36 @@ pub enum ExchangeError {
     Decode(String),
 }
 
+/// Below the 10 USD minimum order value, with a small epsilon: an exact
+/// 10.00 USD notional computed in f64 may come out as 9.999999999999998.
+pub fn below_min_notional(notional_usd: f64) -> bool {
+    notional_usd < MIN_ORDER_NOTIONAL_USD - 1e-9
+}
+
+/// True for the exchange's rate-limit answers: per-IP (HTTP 429) or the
+/// per-address action budget ("Too many cumulative requests sent ...").
+pub fn is_rate_limit_msg(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("too many") || m.contains("rate limit")
+}
+
+impl ExchangeError {
+    /// The action was refused because of a rate limit (back off, alert).
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            ExchangeError::Http { status, body } => *status == 429 || is_rate_limit_msg(body),
+            ExchangeError::Api(m) => is_rate_limit_msg(m),
+            _ => false,
+        }
+    }
+
+    /// The request may or may not have reached the exchange.
+    pub fn outcome_unknown(&self) -> bool {
+        matches!(self, ExchangeError::Transport(_))
+            || matches!(self, ExchangeError::Http { status, .. } if *status >= 500)
+    }
+}
+
 /// Asset identity needed to build orders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AssetRef {
@@ -190,7 +220,7 @@ impl OrderRequest {
                 self.sz, asset.sz_decimals
             )));
         }
-        if !self.reduce_only && self.px * self.sz < MIN_ORDER_NOTIONAL_USD {
+        if !self.reduce_only && below_min_notional(self.px * self.sz) {
             return Err(ExchangeError::InvalidOrder(format!(
                 "notional {:.2} USD below the {MIN_ORDER_NOTIONAL_USD} USD minimum",
                 self.px * self.sz
@@ -236,6 +266,14 @@ impl OrderStatus {
     /// ALO order rejected because it would have crossed the book.
     pub fn is_post_only_reject(&self) -> bool {
         matches!(self, OrderStatus::Error(m) if m.to_ascii_lowercase().contains("post only"))
+    }
+    /// IOC order that found nothing to match.
+    pub fn is_ioc_no_match(&self) -> bool {
+        matches!(self, OrderStatus::Error(m) if m.to_ascii_lowercase().contains("could not immediately match"))
+    }
+    /// Per-address / per-IP rate limit.
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, OrderStatus::Error(m) if is_rate_limit_msg(m))
     }
 }
 
@@ -415,10 +453,12 @@ impl ExchangeClient {
     /// Sign with a fresh nonce and POST. Never retried.
     pub async fn post_action(&self, action: Action) -> Result<Value, ExchangeError> {
         let weight = 1.0 + (action.batch_len() / 40) as f64;
-        let req = self.sign_request(action, self.nonces.next())?;
+        // Wait for the rate budget *before* taking the nonce, so a drained
+        // bucket cannot eat the `expiresAfter` window or age the nonce.
         if let Some(b) = &self.bucket {
             b.acquire(weight).await;
         }
+        let req = self.sign_request(action, self.nonces.next())?;
         tracing::debug!(
             action = req.action.type_name(),
             nonce = req.nonce,
@@ -973,5 +1013,52 @@ mod tests {
         let ok_default: Value =
             serde_json::from_str(r#"{"status":"ok","response":{"type":"default"}}"#).unwrap();
         assert!(check_ok(ok_default).is_ok());
+    }
+
+    #[test]
+    fn min_notional_uses_epsilon() {
+        let base = OrderRequest {
+            is_buy: true,
+            px: 33.33,
+            sz: 0.3,
+            tif: Tif::Alo,
+            reduce_only: false,
+            cloid: None,
+        };
+        // 9.999 USD: genuinely below the minimum.
+        assert!(base.to_wire(ANT).is_err());
+        let exact = OrderRequest {
+            px: 12.5,
+            sz: 0.8,
+            ..base.clone()
+        };
+        assert!(exact.to_wire(ANT).is_ok(), "exactly 10 USD is allowed");
+        // f64 round-off just under 10 must not count as below the minimum.
+        assert!(!below_min_notional(9.999_999_999_999_998));
+        assert!(below_min_notional(9.99));
+    }
+
+    #[test]
+    fn rate_limit_classification() {
+        assert!(is_rate_limit_msg(
+            "Too many cumulative requests sent (10123 > 10000) for cumulative volume traded $0.00."
+        ));
+        assert!(ExchangeError::Api("Too many requests".into()).is_rate_limited());
+        assert!(ExchangeError::Http {
+            status: 429,
+            body: String::new()
+        }
+        .is_rate_limited());
+        assert!(!ExchangeError::Api("Insufficient margin".into()).is_rate_limited());
+        assert!(OrderStatus::Error("Too many cumulative requests sent".into()).is_rate_limited());
+        assert!(OrderStatus::Error(
+            "Order could not immediately match against any resting orders. asset=110138".into()
+        )
+        .is_ioc_no_match());
+        assert!(ExchangeError::Http {
+            status: 502,
+            body: String::new()
+        }
+        .outcome_unknown());
     }
 }

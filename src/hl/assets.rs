@@ -63,7 +63,10 @@ pub fn coin_to_asset<'a>(
     }
     let mut out = std::collections::HashMap::new();
     for (dex, meta) in metas {
-        let off = offsets[dex];
+        // A dex missing from perpDexs is skipped (no panic).
+        let Some(&off) = offsets.get(dex) else {
+            continue;
+        };
         for (a, info) in meta.universe.iter().enumerate() {
             out.insert(info.name.clone(), a as u32 + off);
         }

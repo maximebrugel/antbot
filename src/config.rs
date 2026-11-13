@@ -98,6 +98,55 @@ pub struct Config {
     pub fees: FeesConfig,
     pub timing: TimingConfig,
     pub monitor: MonitorConfig,
+    pub paper: PaperConfig,
+    pub live: LiveConfig,
+}
+
+/// What to do with open orders on the coin that the bot does not know
+/// about at startup (live modes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StrayOrders {
+    /// Cancel them (default): the bot assumes it owns the coin.
+    #[default]
+    Cancel,
+    /// Leave them alone (logged and alerted, never managed).
+    Keep,
+}
+
+/// Paper executor (simulated fills on live mainnet data).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PaperConfig {
+    /// Simulated account balance (USD), used for available margin.
+    pub initial_balance_usd: f64,
+    /// A resting order fills when a trade prints exactly at its price
+    /// ("touch"); false = only trades through the price (pessimistic queue).
+    pub fill_on_touch: bool,
+}
+
+/// Live executor (testnet / guarded mainnet).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LiveConfig {
+    /// Unknown open orders on the coin at startup: cancel | keep.
+    pub stray_orders: StrayOrders,
+    /// Adopt a position found at startup when the bot thinks it is flat
+    /// (it is then managed with a fresh 8h clock). false = halt instead.
+    pub adopt_position: bool,
+    /// Cancel the bot's open orders on SIGINT / SIGTERM.
+    pub cancel_on_shutdown: bool,
+    /// Also close the position (reduce-only IOC) on shutdown.
+    pub flatten_on_shutdown: bool,
+    /// Periodic reconciliation with clearinghouseState / openOrders.
+    pub reconcile_secs: u64,
+    /// Client-side cap on exchange actions per rolling minute (per-address
+    /// action budget). New orders beyond it are refused; cancels always go.
+    pub max_exchange_actions_per_min: u32,
+    /// Pause new orders this long after a rate-limit answer.
+    pub rate_limit_backoff_secs: u64,
+    /// `expiresAfter` window for signed actions (ms, 0 = off).
+    pub expires_after_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -212,6 +261,8 @@ impl Default for Config {
             fees: FeesConfig::default(),
             timing: TimingConfig::default(),
             monitor: MonitorConfig::default(),
+            paper: PaperConfig::default(),
+            live: LiveConfig::default(),
         }
     }
 }
@@ -328,6 +379,30 @@ impl Default for MonitorConfig {
             data_dir: PathBuf::from("data"),
             log_json: false,
             telegram_enabled: true,
+        }
+    }
+}
+
+impl Default for PaperConfig {
+    fn default() -> Self {
+        Self {
+            initial_balance_usd: 10_000.0,
+            fill_on_touch: true,
+        }
+    }
+}
+
+impl Default for LiveConfig {
+    fn default() -> Self {
+        Self {
+            stray_orders: StrayOrders::Cancel,
+            adopt_position: true,
+            cancel_on_shutdown: true,
+            flatten_on_shutdown: false,
+            reconcile_secs: 30,
+            max_exchange_actions_per_min: 60,
+            rate_limit_backoff_secs: 60,
+            expires_after_ms: 30_000,
         }
     }
 }
@@ -597,6 +672,21 @@ impl Config {
         if !finite_pos(t.rest_refill_per_sec) || t.rest_refill_per_sec > 20.0 {
             // 1200 weight/min = 20/s is the HL per-IP budget.
             e.push("timing.rest_refill_per_sec must be in (0, 20]".into());
+        }
+
+        // paper / live
+        if !finite_pos(self.paper.initial_balance_usd) {
+            e.push("paper.initial_balance_usd must be > 0".into());
+        }
+        let l = &self.live;
+        if l.reconcile_secs == 0 || l.reconcile_secs > 3600 {
+            e.push("live.reconcile_secs must be in [1, 3600]".into());
+        }
+        if l.max_exchange_actions_per_min == 0 {
+            e.push("live.max_exchange_actions_per_min must be >= 1".into());
+        }
+        if l.expires_after_ms != 0 && !(5_000..=300_000).contains(&l.expires_after_ms) {
+            e.push("live.expires_after_ms must be 0 (off) or in [5000, 300000]".into());
         }
 
         // monitor

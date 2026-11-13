@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::info::InfoClient;
 use super::market::{now_ms, DataSource, MarketState};
-use super::types::{Fill, OrderUpdate, WsMessage};
+use super::types::{Fill, OrderUpdate, WsMessage, WsTrade};
 
 #[derive(Debug, Clone)]
 pub struct FeedConfig {
@@ -43,6 +43,8 @@ pub struct FeedConfig {
     pub connect_timeout: Duration,
     /// false = REST polling only (diagnostics).
     pub ws_enabled: bool,
+    /// Subscribe to `trades{coin}` (paper fill model).
+    pub trades: bool,
 }
 
 impl FeedConfig {
@@ -60,6 +62,7 @@ impl FeedConfig {
             backoff_max: Duration::from_millis(t.ws_reconnect_max_ms),
             connect_timeout: Duration::from_secs(cfg.network.http_timeout_secs),
             ws_enabled: true,
+            trades: false,
         }
     }
 
@@ -69,6 +72,9 @@ impl FeedConfig {
             json!({"type": "l2Book", "coin": self.coin}),
             json!({"type": "activeAssetCtx", "coin": self.coin}),
         ];
+        if self.trades {
+            subs.push(json!({"type": "trades", "coin": self.coin}));
+        }
         if let Some(u) = &self.user {
             subs.push(json!({"type": "userFills", "user": u}));
             subs.push(json!({"type": "orderUpdates", "user": u}));
@@ -94,6 +100,9 @@ pub enum UserEvent {
 pub struct MarketFeed {
     pub state: watch::Receiver<MarketState>,
     pub user_events: mpsc::Receiver<UserEvent>,
+    /// Public trades for the coin (only with `FeedConfig::trades`). The first
+    /// batch after each (re)subscription is a snapshot of recent trades.
+    pub trades: mpsc::Receiver<Vec<WsTrade>>,
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -103,13 +112,17 @@ impl MarketFeed {
         let (state_tx, state_rx) = watch::channel(MarketState::new(cfg.coin.clone()));
         let state_tx = Arc::new(state_tx);
         let (user_tx, user_rx) = mpsc::channel(1024);
+        let (trades_tx, trades_rx) = mpsc::channel(1024);
         let (sd_tx, sd_rx) = watch::channel(false);
         let mut tasks = Vec::new();
         if cfg.ws_enabled {
             tasks.push(tokio::spawn(ws_task(
                 cfg.clone(),
                 state_tx.clone(),
-                user_tx,
+                Sinks {
+                    user: user_tx,
+                    trades: trades_tx,
+                },
                 sd_rx.clone(),
             )));
         }
@@ -117,6 +130,7 @@ impl MarketFeed {
         Self {
             state: state_rx,
             user_events: user_rx,
+            trades: trades_rx,
             shutdown: sd_tx,
             tasks,
         }
@@ -174,6 +188,12 @@ impl Backoff {
     }
 }
 
+/// Output channels of the websocket task.
+struct Sinks {
+    user: mpsc::Sender<UserEvent>,
+    trades: mpsc::Sender<Vec<WsTrade>>,
+}
+
 enum ConnEnd {
     Shutdown,
 }
@@ -181,7 +201,7 @@ enum ConnEnd {
 async fn ws_task(
     cfg: FeedConfig,
     state: Arc<watch::Sender<MarketState>>,
-    user_tx: mpsc::Sender<UserEvent>,
+    sinks: Sinks,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut backoff = Backoff::new(cfg.backoff_initial, cfg.backoff_max);
@@ -190,7 +210,7 @@ async fn ws_task(
             break;
         }
         let mut got_data = false;
-        let res = run_connection(&cfg, &state, &user_tx, &mut shutdown, &mut got_data).await;
+        let res = run_connection(&cfg, &state, &sinks, &mut shutdown, &mut got_data).await;
         state.send_modify(|s| s.ws_connected = false);
         match res {
             Ok(ConnEnd::Shutdown) => break,
@@ -213,7 +233,7 @@ async fn ws_task(
 async fn run_connection(
     cfg: &FeedConfig,
     state: &watch::Sender<MarketState>,
-    user_tx: &mpsc::Sender<UserEvent>,
+    sinks: &Sinks,
     shutdown: &mut watch::Receiver<bool>,
     got_data: &mut bool,
 ) -> anyhow::Result<ConnEnd> {
@@ -229,10 +249,7 @@ async fn run_connection(
         sink.send(Message::text(sub.to_string())).await?;
     }
     let connected_at = now_ms();
-    state.send_modify(|s| {
-        s.ws_connected = true;
-        s.ws_connects += 1;
-    });
+    state.send_modify(|s| s.on_ws_connected());
     tracing::info!(url = %cfg.ws_url, coin = %cfg.coin, user = cfg.user.is_some(), "websocket connected");
 
     let mut ping = tokio::time::interval(cfg.ping_interval);
@@ -251,7 +268,7 @@ async fn run_connection(
                 match msg {
                     Message::Text(t) => {
                         let recv = now_ms();
-                        if handle_text(cfg, t.as_str(), recv, state, user_tx).await? {
+                        if handle_text(cfg, t.as_str(), recv, state, sinks).await? {
                             last_market_ms = recv;
                             *got_data = true;
                         }
@@ -284,7 +301,7 @@ async fn handle_text(
     text: &str,
     recv_ms: u64,
     state: &watch::Sender<MarketState>,
-    user_tx: &mpsc::Sender<UserEvent>,
+    sinks: &Sinks,
 ) -> anyhow::Result<bool> {
     let msg = match WsMessage::parse(text) {
         Ok(m) => m,
@@ -313,14 +330,27 @@ async fn handle_text(
                 is_snapshot: f.is_snapshot.unwrap_or(false),
                 fills: f.fills,
             };
-            if user_tx.try_send(ev).is_err() {
-                tracing::error!("user event channel full/closed, dropping fills");
+            if sinks.user.try_send(ev).is_err() {
+                // Counted in the market state: the main loop forces a
+                // userFills / clearinghouseState resync and alerts.
+                tracing::error!("user event channel full/closed, dropping fills (resync required)");
+                state.send_modify(|s| s.user_events_dropped += 1);
             }
         }
         WsMessage::OrderUpdates(u) => {
-            if user_tx.try_send(UserEvent::OrderUpdates(u)).is_err() {
-                tracing::error!("user event channel full/closed, dropping order updates");
+            if sinks.user.try_send(UserEvent::OrderUpdates(u)).is_err() {
+                tracing::error!(
+                    "user event channel full/closed, dropping order updates (resync required)"
+                );
+                state.send_modify(|s| s.user_events_dropped += 1);
             }
+        }
+        WsMessage::Trades(t) => {
+            let ours: Vec<WsTrade> = t.into_iter().filter(|t| t.coin == cfg.coin).collect();
+            if !ours.is_empty() && sinks.trades.try_send(ours).is_err() {
+                tracing::warn!("trades channel full/closed, dropping public trades");
+            }
+            return Ok(false);
         }
         WsMessage::Error(e) => bail!("server error: {e}"),
         WsMessage::SubscriptionResponse(v) => {
@@ -370,6 +400,7 @@ pub async fn poll_rest_once(
     info: &InfoClient,
     state: &watch::Sender<MarketState>,
 ) -> anyhow::Result<()> {
+    let req_start = now_ms();
     let (mac, book) =
         tokio::try_join!(info.meta_and_asset_ctxs(&cfg.dex), info.l2_book(&cfg.coin))?;
     let recv = now_ms();
@@ -378,7 +409,8 @@ pub async fn poll_rest_once(
         .ok_or_else(|| anyhow!("{} not in metaAndAssetCtxs({})", cfg.coin, cfg.dex))?;
     let ctx = ctx.clone();
     state.send_modify(|s| {
-        s.apply_ctx(&ctx, recv, DataSource::Rest);
+        // Out-of-order guard: a ws ctx newer than this request wins.
+        s.apply_rest_ctx(&ctx, req_start, recv);
         s.apply_book(&book, recv, DataSource::Rest);
         s.rest_polls += 1;
     });
@@ -414,6 +446,10 @@ mod tests {
             json!({"method":"subscribe","subscription":{"type":"l2Book","coin":"xyz:ANT"}})
         );
         assert_eq!(s[1]["subscription"]["type"], "activeAssetCtx");
+        c.trades = true;
+        assert_eq!(c.subscriptions().len(), 3);
+        assert_eq!(c.subscriptions()[2]["subscription"]["type"], "trades");
+        c.trades = false;
         c.user = Some("0xabc".into());
         let s = c.subscriptions();
         assert_eq!(s.len(), 4);

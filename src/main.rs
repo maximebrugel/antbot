@@ -33,6 +33,46 @@ struct ModeArgs {
     mainnet: bool,
 }
 
+#[derive(Debug, Args)]
+struct ReplayArgs {
+    /// Directory with candles_1h.json and funding_history.json (or
+    /// api_funding_history.json), looked up in the directory and its parent.
+    #[arg(long, conflicts_with = "fetch")]
+    input: Option<PathBuf>,
+    /// Explicit candles file (with --funding).
+    #[arg(long, requires = "funding", conflicts_with_all = ["input", "fetch"])]
+    candles: Option<PathBuf>,
+    /// Explicit funding history file (with --candles).
+    #[arg(long, requires = "candles")]
+    funding: Option<PathBuf>,
+    /// Fetch candleSnapshot + fundingHistory from the mainnet info API
+    /// (read-only).
+    #[arg(long)]
+    fetch: bool,
+    /// Days of history to fetch.
+    #[arg(long, default_value_t = 30)]
+    days: u64,
+    /// Save the fetched data here (candles_1h.json, funding_history.json).
+    #[arg(long, requires = "fetch")]
+    save_dir: Option<PathBuf>,
+    /// Research results.json to compare with (S2_ANT base rule / fee case).
+    #[arg(long)]
+    compare: Option<PathBuf>,
+    /// Disable the early exit on convergence (pure max-hold, like the
+    /// research 8h_fixed rule).
+    #[arg(long)]
+    no_early_exit: bool,
+    /// Synthetic book spread in bps.
+    #[arg(long, default_value_t = 2.0)]
+    spread_bps: f64,
+    /// Engine tick inside each hour, seconds.
+    #[arg(long, default_value_t = 60)]
+    step_secs: u64,
+    /// Write the replayed trades as CSV.
+    #[arg(long)]
+    trades_csv: Option<PathBuf>,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the bot (paper by default).
@@ -43,12 +83,9 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
-    /// Replay the strategy over historical data.
-    Replay {
-        /// Optional input data (directory or file) for the replay.
-        #[arg(long)]
-        input: Option<PathBuf>,
-    },
+    /// Replay the strategy + paper fill model over historical hourly data
+    /// (fundingHistory premium + 1h candles). Read-only, never trades.
+    Replay(ReplayArgs),
     /// Read-only market probe: resolve the asset (perpDexs + meta) and stream
     /// book / oracle / premium for a while. Never needs a key, never trades.
     Probe {
@@ -116,12 +153,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         } => probe(&cfg, secs, interval_ms, testnet, rest_only).await,
         Command::KillStatus { data_dir } => kill_status(&cfg, data_dir),
         Command::ResetKill { data_dir, confirm } => reset_kill(&cfg, data_dir, confirm),
-        Command::Replay { input } => {
-            anyhow::bail!(
-                "replay is not implemented yet (input: {:?}) — TODO(step5)",
-                input
-            )
-        }
+        Command::Replay(args) => replay(cfg, args).await,
     }
 }
 
@@ -266,7 +298,7 @@ async fn run(mut cfg: Config, args: &ModeArgs, data_dir: Option<PathBuf>) -> any
     if let Some(d) = data_dir {
         cfg.monitor.data_dir = d;
     }
-    let (m, _creds) = resolve(&cfg, args)?;
+    let (m, creds) = resolve(&cfg, args)?;
     let _guard = logging::init(&cfg.monitor.data_dir, cfg.monitor.log_json)
         .context("initialising logging")?;
     let ep = cfg.endpoints(m);
@@ -282,7 +314,64 @@ async fn run(mut cfg: Config, args: &ModeArgs, data_dir: Option<PathBuf>) -> any
         // Development build: mainnet trading is intentionally not wired.
         anyhow::bail!("mainnet trading is not available in this build");
     }
-    anyhow::bail!("run loop not implemented yet — TODO(step5)")
+    let token = if m == Mode::Mainnet {
+        Some(mode::confirm_mainnet(args.mainnet, process_env)?)
+    } else {
+        None
+    };
+    antbot::runner::run(cfg, m, creds, token).await
+}
+
+async fn replay(mut cfg: Config, a: ReplayArgs) -> anyhow::Result<()> {
+    use antbot::replay::{self, ReplayData, ReplayParams};
+    let coin = cfg.market.coin.clone();
+    let data = if a.fetch {
+        // Paper endpoints: mainnet info, no exchange URL.
+        let ep = cfg.endpoints(Mode::Paper);
+        let info = antbot::hl::info::InfoClient::from_config(&cfg, &ep.info_url)?;
+        let (data, funding, candles) =
+            ReplayData::fetch(&info, &coin, a.days, antbot::hl::market::now_ms()).await?;
+        if let Some(dir) = &a.save_dir {
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(
+                dir.join("candles_1h.json"),
+                serde_json::to_vec(&serde_json::json!({ &coin: candles }))?,
+            )?;
+            std::fs::write(
+                dir.join("funding_history.json"),
+                serde_json::to_vec(&serde_json::json!({ &coin: funding }))?,
+            )?;
+            println!("saved fetched data to {}", dir.display());
+        }
+        data
+    } else if let (Some(c), Some(f)) = (&a.candles, &a.funding) {
+        ReplayData::load_files(c, f, &coin)?
+    } else if let Some(dir) = &a.input {
+        ReplayData::load_dir(dir, &coin)?
+    } else {
+        anyhow::bail!("replay needs --input DIR, --candles/--funding FILES or --fetch");
+    };
+    if a.no_early_exit {
+        cfg.strategy.early_exit_on_converge = false;
+    }
+    let p = ReplayParams {
+        sz_decimals: cfg.market.expected_sz_decimals,
+        max_leverage: cfg.market.expected_max_leverage,
+        spread_bps: a.spread_bps,
+        step_secs: a.step_secs,
+        ..ReplayParams::default()
+    };
+    let res = replay::run(&cfg, &data, &p)?;
+    let refr = match &a.compare {
+        Some(path) => Some(replay::load_reference(path)?),
+        None => None,
+    };
+    print!("{}", replay::report(&cfg, &data, &res, refr.as_ref()));
+    if let Some(path) = &a.trades_csv {
+        replay::write_trades_csv(path, &res.trades)?;
+        println!("trades written to {}", path.display());
+    }
+    Ok(())
 }
 
 /// Read-only market probe (info + ws only).

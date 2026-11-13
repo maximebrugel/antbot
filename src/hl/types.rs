@@ -451,6 +451,28 @@ pub struct WsActiveAssetCtx {
     pub ctx: PerpAssetCtx,
 }
 
+/// WS `trades` entry. `side` is the aggressor side ("B" = buyer lifted
+/// the ask, "A" = seller hit the bid), checked live on xyz:ANT.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WsTrade {
+    pub coin: String,
+    pub side: String,
+    #[serde(deserialize_with = "num::f64")]
+    pub px: f64,
+    #[serde(deserialize_with = "num::f64")]
+    pub sz: f64,
+    pub time: u64,
+    #[serde(default)]
+    pub tid: u64,
+}
+
+impl WsTrade {
+    /// True if the aggressor was a buyer.
+    pub fn buyer_aggressor(&self) -> bool {
+        self.side == "B"
+    }
+}
+
 /// Parsed websocket message (only the channels the bot uses).
 #[derive(Debug, Clone, PartialEq)]
 pub enum WsMessage {
@@ -459,6 +481,7 @@ pub enum WsMessage {
     AssetCtx(WsActiveAssetCtx),
     UserFills(UserFills),
     OrderUpdates(Vec<OrderUpdate>),
+    Trades(Vec<WsTrade>),
     Pong,
     Error(String),
     /// Any other channel (ignored).
@@ -480,6 +503,7 @@ impl WsMessage {
             "activeAssetCtx" => WsMessage::AssetCtx(serde_json::from_value(env.data)?),
             "userFills" => WsMessage::UserFills(serde_json::from_value(env.data)?),
             "orderUpdates" => WsMessage::OrderUpdates(serde_json::from_value(env.data)?),
+            "trades" => WsMessage::Trades(serde_json::from_value(env.data)?),
             "pong" => WsMessage::Pong,
             "error" => WsMessage::Error(match env.data {
                 serde_json::Value::String(s) => s,
@@ -518,8 +542,19 @@ mod tests {
         );
         assert_eq!(
             WsMessage::parse(r#"{"channel":"trades","data":[]}"#).unwrap(),
-            WsMessage::Other("trades".into())
+            WsMessage::Trades(vec![])
         );
+        assert_eq!(
+            WsMessage::parse(r#"{"channel":"candle","data":{}}"#).unwrap(),
+            WsMessage::Other("candle".into())
+        );
+        // Live capture (xyz:ANT): a buyer lifting the ask at 104.52.
+        let t = WsMessage::parse(r#"{"channel":"trades","data":[{"coin":"xyz:ANT","side":"B","px":"104.52","sz":"0.12","time":1794516998036,"hash":"0x00","tid":543030405407367,"users":["0x5071","0xd99f"]}]}"#).unwrap();
+        let WsMessage::Trades(v) = t else { panic!() };
+        assert_eq!(v[0].px, 104.52);
+        assert_eq!(v[0].sz, 0.12);
+        assert!(v[0].buyer_aggressor());
+        assert_eq!(v[0].tid, 543030405407367);
         assert_eq!(
             WsMessage::parse(r#"{"channel":"pong"}"#).unwrap(),
             WsMessage::Pong
