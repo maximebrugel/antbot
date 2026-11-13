@@ -93,7 +93,7 @@ fn client(url: &str) -> ExchangeClient {
         Mode::Testnet,
         &ep,
         &Credentials {
-            private_key: KEY.into(),
+            private_key: antbot::mode::PrivateKey::parse(KEY).unwrap(),
             account_address: Some(ACCOUNT.into()),
         },
         None,

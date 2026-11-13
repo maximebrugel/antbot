@@ -11,8 +11,9 @@
 # unless the key name ends in `_bps`.
 
 # paper (default, live mainnet market data + simulated fills, no key, never
-# calls /exchange) | testnet | mainnet (requires `--mainnet` AND
-# ANTBOT_CONFIRM_MAINNET=yes-i-understand).
+# calls /exchange) | testnet | mainnet (REAL FUNDS; requires `--mainnet`,
+# ANTBOT_CONFIRM_MAINNET=yes-i-understand, HL_PRIVATE_KEY = an API wallet key
+# and HL_ACCOUNT_ADDRESS = the main account; see README).
 mode = "paper"
 
 [market]

@@ -23,6 +23,8 @@ struct Fake {
     pos_coin: Mutex<Option<String>>,
     /// Filled size reported by orderStatus, by cloid.
     filled: Mutex<HashMap<String, f64>>,
+    /// Margin mode / leverage of the fake position (default isolated 1x).
+    pos_leverage: Mutex<Option<(String, u32)>>,
 }
 
 impl LiveApi for Fake {
@@ -75,10 +77,18 @@ impl LiveApi for Fake {
                     position: Position {
                         coin,
                         szi,
-                        leverage: Leverage {
-                            kind: "isolated".into(),
-                            value: 1,
-                            raw_usd: None,
+                        leverage: {
+                            let (kind, value) = self
+                                .pos_leverage
+                                .lock()
+                                .unwrap()
+                                .clone()
+                                .unwrap_or(("isolated".into(), 1));
+                            Leverage {
+                                kind,
+                                value,
+                                raw_usd: None,
+                            }
                         },
                         entry_px: Some(100.0),
                         position_value: szi.abs() * 100.0,
@@ -124,7 +134,7 @@ impl LiveApi for Fake {
 }
 
 fn params() -> LiveParams {
-    LiveParams::from_config(&Config::default(), 2)
+    LiveParams::from_config(&Config::default(), 2, 10)
 }
 
 fn exec(fake: Fake) -> LiveExecutor<Fake> {
@@ -791,4 +801,465 @@ mod shutdown_regression {
             "no second cancel sent"
         );
     }
+}
+
+// ---- last-line order checks (same on testnet and mainnet) -------------
+
+fn exec_with(cfg: &Config, asset_max_leverage: u32, fake: Fake) -> LiveExecutor<Fake> {
+    LiveExecutor::new(
+        LiveParams::from_config(cfg, 2, asset_max_leverage),
+        fake,
+        None,
+        T0,
+    )
+    .unwrap()
+}
+
+fn small_cfg(max_notional: f64) -> Config {
+    let mut c = Config::default();
+    c.sizing.notional_usd = max_notional;
+    c.sizing.max_notional_usd = max_notional;
+    c
+}
+
+fn intent(tag: u64, kind: OrderKind, sz: f64, reduce_only: bool) -> OrderIntent {
+    OrderIntent {
+        tag,
+        is_buy: true,
+        px: 100.0,
+        sz,
+        kind,
+        reduce_only,
+        purpose: if reduce_only {
+            Purpose::Exit
+        } else {
+            Purpose::Entry
+        },
+    }
+}
+
+fn refused(ev: &[ExecEvent], tag: u64) -> bool {
+    matches!(dones(ev).as_slice(), [(t, DoneReason::Rejected(_))] if *t == tag)
+        && ev
+            .iter()
+            .any(|e| matches!(e, ExecEvent::Alert(a) if a.contains("refused by the live executor")))
+}
+
+#[tokio::test]
+async fn opening_order_must_be_post_only() {
+    let mut x = exec(Fake::default());
+    let ev = x
+        .execute(
+            T0,
+            vec![Command::Place(intent(1, OrderKind::Ioc, 1.0, false))],
+            &m(),
+        )
+        .await;
+    assert!(refused(&ev, 1), "{ev:?}");
+    assert!(x.api().placed.lock().unwrap().is_empty(), "never sent");
+    // The same order as ALO goes out, flagged post-only.
+    x.execute(
+        T0 + 1,
+        vec![Command::Place(intent(2, OrderKind::Alo, 1.0, false))],
+        &m(),
+    )
+    .await;
+    let placed = x.api().placed.lock().unwrap().clone();
+    assert_eq!(placed.len(), 1);
+    assert_eq!(placed[0].tif, crate::hl::actions::Tif::Alo);
+    assert!(!placed[0].reduce_only);
+}
+
+#[tokio::test]
+async fn opening_order_capped_by_max_notional() {
+    // max_notional 300 USD: 306 USD allowed (re-quote tolerance), 310 not.
+    let mut x = exec_with(&small_cfg(300.0), 10, Fake::default());
+    let ev = x
+        .execute(
+            T0,
+            vec![Command::Place(intent(1, OrderKind::Alo, 3.1, false))],
+            &m(),
+        )
+        .await;
+    assert!(refused(&ev, 1), "{ev:?}");
+    assert!(x.api().placed.lock().unwrap().is_empty());
+    let ev = x
+        .execute(
+            T0 + 1,
+            vec![Command::Place(intent(2, OrderKind::Alo, 3.06, false))],
+            &m(),
+        )
+        .await;
+    assert_eq!(ev, vec![ExecEvent::Order(OrderUpdate::Resting { tag: 2 })]);
+}
+
+#[tokio::test]
+async fn opening_order_never_above_hard_cap() {
+    // Default config: max_notional = hard cap = 10 000 USD, no tolerance.
+    let mut x = exec(Fake::default());
+    let ev = x
+        .execute(
+            T0,
+            vec![Command::Place(intent(1, OrderKind::Alo, 100.01, false))],
+            &m(),
+        )
+        .await;
+    assert!(refused(&ev, 1), "{ev:?}");
+    let ev = x
+        .execute(
+            T0 + 1,
+            vec![Command::Place(intent(2, OrderKind::Alo, 100.0, false))],
+            &m(),
+        )
+        .await;
+    assert_eq!(ev, vec![ExecEvent::Order(OrderUpdate::Resting { tag: 2 })]);
+    assert_eq!(x.api().placed.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn venue_position_counts_toward_the_cap() {
+    let fake = Fake::default();
+    *fake.szi.lock().unwrap() = 2.0; // 200 USD at entry 100
+                                     // No startup / reconcile: the executor refreshes the venue position
+                                     // itself before an opening order.
+    let mut x = exec_with(&small_cfg(300.0), 10, fake);
+    assert!(x.venue().is_none());
+    let ev = x
+        .execute(
+            T0 + 1,
+            vec![Command::Place(intent(1, OrderKind::Alo, 1.5, false))],
+            &m(),
+        )
+        .await;
+    assert!(refused(&ev, 1), "{ev:?}");
+    let ev = x
+        .execute(
+            T0 + 2,
+            vec![Command::Place(intent(2, OrderKind::Alo, 1.0, false))],
+            &m(),
+        )
+        .await;
+    assert_eq!(ev, vec![ExecEvent::Order(OrderUpdate::Resting { tag: 2 })]);
+}
+
+#[tokio::test]
+async fn reduce_only_exits_are_never_blocked() {
+    // Maker exit and IOC taker fallback / flatten, far above the cap: they
+    // can only shrink the position.
+    let mut x = exec_with(&small_cfg(300.0), 10, Fake::default());
+    x.execute(
+        T0,
+        vec![
+            Command::Place(intent(1, OrderKind::Alo, 50.0, true)),
+            Command::Place(intent(2, OrderKind::Ioc, 50.0, true)),
+        ],
+        &m(),
+    )
+    .await;
+    let placed = x.api().placed.lock().unwrap().clone();
+    assert_eq!(placed.len(), 2);
+    assert!(placed.iter().all(|r| r.reduce_only));
+    assert_eq!(placed[1].tif, crate::hl::actions::Tif::Ioc);
+}
+
+#[tokio::test]
+async fn leverage_is_isolated_and_clamped() {
+    // Config 2x on an asset whose max is 1x: 1x.
+    let mut c = Config::default();
+    c.sizing.leverage = 2;
+    let mut x = exec_with(&c, 1, Fake::default());
+    x.startup(T0).await.unwrap();
+    assert_eq!(*x.api().leverage_calls.lock().unwrap(), vec![1]);
+    // Config 2x, asset max 10x: 2x.
+    let mut x = exec_with(&c, 10, Fake::default());
+    x.startup(T0).await.unwrap();
+    assert_eq!(*x.api().leverage_calls.lock().unwrap(), vec![2]);
+    // An (unvalidated) 5x config on a 50x asset: never above MAX_ALLOWED_LEVERAGE.
+    c.sizing.leverage = 5;
+    let mut x = exec_with(&c, 50, Fake::default());
+    x.startup(T0).await.unwrap();
+    assert_eq!(
+        *x.api().leverage_calls.lock().unwrap(),
+        vec![MAX_ALLOWED_LEVERAGE]
+    );
+    // (`HlApi::update_leverage_isolated` sends isCross = false: checked on
+    // the wire in tests/exchange_mock.rs.)
+}
+
+#[tokio::test]
+async fn startup_position_on_cross_margin_is_reported_loudly() {
+    let fake = Fake::default();
+    *fake.szi.lock().unwrap() = 1.0;
+    *fake.pos_leverage.lock().unwrap() = Some(("cross".into(), 5));
+    let mut x = exec(fake);
+    let ev = x.startup(T0).await.unwrap();
+    assert!(x.api().leverage_calls.lock().unwrap().is_empty());
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, ExecEvent::Alert(a) if a.contains("CROSS margin at 5x"))),
+        "{ev:?}"
+    );
+    let v = x.venue().unwrap();
+    assert_eq!((v.isolated, v.leverage), (Some(false), Some(5)));
+}
+
+// ------------------------------- kill rules -> flatten on the live path
+
+/// The kill rules live in the engine, shared by paper and live: these drive
+/// a real [`Engine`] with market snapshots / spec polls through the live
+/// executor and check that each rule's kill flattens with reduce-only
+/// orders (maker ALO first, IOC after `kill_flatten_maker_secs`).
+mod kill_flatten_live {
+    use super::*;
+    use crate::engine::{Engine, EngineParams, Notice};
+    use crate::exec::state::Ledger;
+    use crate::hl::market::DataSource;
+    use crate::hl::types::{L2Book, Level};
+    use crate::risk::{KillReason, RiskManager, RiskParams, RiskState};
+    use crate::strategy::premium::Side;
+    use crate::strategy::signal::{Phase, Strategy, StrategyParams};
+
+    const SZ: f64 = 24.0;
+
+    fn engine(cfg: &Config) -> Engine {
+        let mut e = Engine::new(
+            EngineParams::from_config(cfg),
+            Strategy::new(StrategyParams::from_config(cfg, 2, 10)),
+            RiskManager::new(RiskParams::from(&cfg.risk), RiskState::default()),
+            Ledger::default(),
+            0,
+        );
+        e.strategy
+            .adopt_position(Side::Short, SZ, 100.0, T0)
+            .unwrap();
+        e
+    }
+
+    /// Book mid `mid`, oracle `oracle` (premium = mid / oracle - 1).
+    fn market(now: u64, mid: f64, oracle: f64) -> MarketState {
+        let mut m = MarketState::new("xyz:ANT");
+        let l = |px| Level {
+            px,
+            sz: 1000.0,
+            n: 1,
+        };
+        m.apply_book(
+            &L2Book {
+                coin: "xyz:ANT".into(),
+                time: now,
+                levels: (vec![l(mid - 0.01)], vec![l(mid + 0.01)]),
+            },
+            now,
+            DataSource::Rest,
+        );
+        m.oracle_px = Some(oracle);
+        m.mark_px = Some(mid);
+        m.impact_bid_px = Some(mid - 0.01);
+        m.impact_ask_px = Some(mid + 0.01);
+        m.ctx_recv_ms = Some(now);
+        m.funding = Some(0.0);
+        m
+    }
+
+    async fn pump(
+        e: &mut Engine,
+        x: &mut LiveExecutor<Fake>,
+        now: u64,
+        mk: &MarketState,
+        mut cmds: Vec<Command>,
+    ) {
+        for _ in 0..20 {
+            if cmds.is_empty() {
+                return;
+            }
+            let evs = x.execute(now, std::mem::take(&mut cmds), mk).await;
+            for ev in evs {
+                cmds.extend(e.on_exec(now, ev));
+            }
+        }
+        panic!("did not settle");
+    }
+
+    fn killed_by(e: &mut Engine) -> KillReason {
+        e.drain_notices()
+            .into_iter()
+            .find_map(|n| match n {
+                Notice::Kill(_, k) => {
+                    assert!(k.flatten && k.cancel_orders && k.stop_entries, "{k:?}");
+                    Some(k.reason)
+                }
+                _ => None,
+            })
+            .expect("no kill notice")
+    }
+
+    /// After the kill at `t_kill`: a reduce-only ALO buy (closing the
+    /// short) at once, then a reduce-only IOC buy once the maker window ran
+    /// out. Nothing that could open a position is ever sent.
+    async fn assert_flattens(
+        cfg: &Config,
+        e: &mut Engine,
+        x: &mut LiveExecutor<Fake>,
+        t_kill: u64,
+        mk: &MarketState,
+        cmds: Vec<Command>,
+    ) {
+        let before = x.api().placed.lock().unwrap().len();
+        pump(e, x, t_kill, mk, cmds).await;
+        {
+            let placed = x.api().placed.lock().unwrap();
+            assert_eq!(placed.len(), before + 1, "maker flatten order");
+            let o = &placed[before];
+            assert!(o.reduce_only && o.is_buy, "{o:?}");
+            assert_eq!(o.tif, crate::hl::actions::Tif::Alo);
+            assert!((o.sz - SZ).abs() < 1e-9);
+        }
+        let maker_ms = cfg.risk.kill_flatten_maker_secs * 1000;
+        let mut t = t_kill;
+        while t < t_kill + maker_ms + 5_000 {
+            t += 1_000;
+            // Canceled maker orders report "nothing filled" (orderStatus).
+            for o in &x.state().orders {
+                x.api()
+                    .filled
+                    .lock()
+                    .unwrap()
+                    .entry(o.cloid.to_string())
+                    .or_insert(0.0);
+            }
+            let mk = market(t, mk.mark_px.unwrap(), mk.oracle_px.unwrap());
+            let c = e.on_market(t, &mk, None);
+            pump(e, x, t, &mk, c).await;
+        }
+        let placed = x.api().placed.lock().unwrap();
+        let ioc: Vec<_> = placed[before..]
+            .iter()
+            .filter(|o| o.tif == crate::hl::actions::Tif::Ioc)
+            .collect();
+        assert!(!ioc.is_empty(), "no IOC taker flatten: {placed:?}");
+        assert!(ioc.iter().all(|o| o.is_buy && (o.sz - SZ).abs() < 1e-9));
+        assert!(placed[before..].iter().all(|o| o.reduce_only));
+        assert!(e.risk.is_killed());
+        assert!(!e.risk.entries_allowed());
+        assert!(matches!(
+            e.strategy.phase(),
+            Phase::Exiting { .. } | Phase::Halted { .. }
+        ));
+    }
+
+    fn fake_short() -> Fake {
+        let f = Fake::default();
+        *f.szi.lock().unwrap() = -SZ;
+        f
+    }
+
+    /// Live executor after its startup reconciliation (venue: short SZ).
+    async fn live_short() -> LiveExecutor<Fake> {
+        let mut x = exec(fake_short());
+        x.startup(T0).await.unwrap();
+        assert_eq!(x.venue_position(), Some(-SZ));
+        x
+    }
+
+    #[tokio::test]
+    async fn daily_loss_kill_flattens_on_live() {
+        let cfg = Config::default();
+        let mut e = engine(&cfg);
+        let mut x = live_short().await;
+        // Premium stays at +60 bps (no convergence exit): baseline equity.
+        let m0 = market(T0 + 1_000, 100.6, 100.0);
+        let c = e.on_market(T0 + 1_000, &m0, None);
+        pump(&mut e, &mut x, T0 + 1_000, &m0, c).await;
+        assert!(!e.risk.is_killed());
+        // Price +10 % against the 24-lot short: -240 USD > 150 daily limit.
+        let t = T0 + 2_000;
+        let m1 = market(t, 110.66, 110.0);
+        let c = e.on_market(t, &m1, None);
+        assert!(matches!(killed_by(&mut e), KillReason::DailyLoss { .. }));
+        assert_flattens(&cfg, &mut e, &mut x, t, &m1, c).await;
+    }
+
+    #[tokio::test]
+    async fn max_drawdown_kill_flattens_on_live() {
+        let mut cfg = Config::default();
+        cfg.risk.daily_loss_limit_usd = 5_000.0;
+        let mut e = engine(&cfg);
+        let mut x = live_short().await;
+        let m0 = market(T0 + 1_000, 100.6, 100.0);
+        let c = e.on_market(T0 + 1_000, &m0, None);
+        pump(&mut e, &mut x, T0 + 1_000, &m0, c).await;
+        // -24 * 14 = -336 USD > 300 drawdown limit.
+        let t = T0 + 2_000;
+        let m1 = market(t, 114.68, 114.0);
+        let c = e.on_market(t, &m1, None);
+        assert!(matches!(killed_by(&mut e), KillReason::MaxDrawdown { .. }));
+        assert_flattens(&cfg, &mut e, &mut x, t, &m1, c).await;
+    }
+
+    #[tokio::test]
+    async fn persistent_premium_kill_flattens_on_live() {
+        let cfg = Config::default();
+        let mut e = engine(&cfg);
+        let mut x = live_short().await;
+        // +200 bps (> 150) for longer than persistent_premium_secs; the
+        // loss stays under the equity limits (-48 USD).
+        let m0 = market(T0 + 1_000, 102.0, 100.0);
+        let c = e.on_market(T0 + 1_000, &m0, None);
+        pump(&mut e, &mut x, T0 + 1_000, &m0, c).await;
+        assert!(!e.risk.is_killed());
+        let t = T0 + 1_000 + cfg.risk.persistent_premium_secs * 1000 + 1_000;
+        let m1 = market(t, 102.0, 100.0);
+        let c = e.on_market(t, &m1, None);
+        assert!(matches!(
+            killed_by(&mut e),
+            KillReason::PersistentPremium { .. }
+        ));
+        assert_flattens(&cfg, &mut e, &mut x, t, &m1, c).await;
+    }
+
+    #[tokio::test]
+    async fn spec_change_kill_flattens_on_live() {
+        let cfg = Config::default();
+        let mut e = engine(&cfg);
+        let mut x = live_short().await;
+        let m0 = market(T0 + 1_000, 100.6, 100.0);
+        let c = e.on_market(T0 + 1_000, &m0, None);
+        pump(&mut e, &mut x, T0 + 1_000, &m0, c).await;
+        // The meta poll cannot find the market any more (delisted / halted).
+        let t = T0 + 2_000;
+        let c = e.on_spec(t, Err("xyz:ANT missing from meta".into()));
+        assert!(matches!(killed_by(&mut e), KillReason::SpecChange { .. }));
+        assert_flattens(&cfg, &mut e, &mut x, t, &m0, c).await;
+    }
+}
+
+#[tokio::test]
+async fn uncertain_opening_order_counts_toward_the_cap() {
+    // A transport error leaves the first entry's outcome unknown: it may be
+    // live, so a second opening order cannot stack on top of it.
+    let fake = Fake::default();
+    fake.place_replies
+        .lock()
+        .unwrap()
+        .push_back(Err(ExchangeError::Http {
+            status: 502,
+            body: String::new(),
+        }));
+    let mut x = exec_with(&small_cfg(300.0), 10, fake);
+    x.execute(
+        T0,
+        vec![Command::Place(intent(1, OrderKind::Alo, 2.5, false))],
+        &m(),
+    )
+    .await;
+    assert!(x.state().orders[0].uncertain);
+    let ev = x
+        .execute(
+            T0 + 1,
+            vec![Command::Place(intent(2, OrderKind::Alo, 2.5, false))],
+            &m(),
+        )
+        .await;
+    assert!(refused(&ev, 2), "{ev:?}");
+    assert_eq!(x.api().placed.lock().unwrap().len(), 1);
 }

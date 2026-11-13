@@ -6,7 +6,9 @@
 //! * any URL that is not the testnet host or a loopback address is treated as
 //!   mainnet, and a mainnet target needs a [`MainnetConfirmed`] token, which
 //!   only `mode::confirm_mainnet` (flag + env) can produce;
-//! * the mode and the URL must agree (testnet mode cannot hit a mainnet URL).
+//! * the mode and the URL must agree (testnet mode cannot hit a mainnet URL);
+//! * on mainnet the signer must be an API / agent wallet distinct from the
+//!   traded account (`HL_ACCOUNT_ADDRESS`): a main-wallet key is refused.
 //!
 //! Agent wallets: actions are signed with `HL_PRIVATE_KEY` (the agent / API
 //! wallet). `HL_ACCOUNT_ADDRESS` is the main account, used for info queries
@@ -84,6 +86,11 @@ pub enum ExchangeError {
         url: String,
         net: UrlNetwork,
     },
+    #[error(
+        "refusing to sign for mainnet with the MAIN wallet key (signer {signer} is the traded \
+         account): use an API wallet key and set HL_ACCOUNT_ADDRESS to the main account"
+    )]
+    MainWalletOnMainnet { signer: String },
     #[error("credentials: {0}")]
     Credentials(#[from] SigningError),
     #[error("invalid order: {0}")]
@@ -348,11 +355,19 @@ impl ExchangeClient {
         timeout: Duration,
     ) -> Result<Self, ExchangeError> {
         let (url, is_mainnet) = Self::check_guard(mode, endpoints, mainnet)?;
-        let wallet = Wallet::from_hex(&creds.private_key)?;
+        let wallet = Wallet::from_hex(creds.private_key.expose_secret())?;
         let account = match &creds.account_address {
             Some(a) => a.parse::<Address>()?,
             None => wallet.address(),
         };
+        // Defence in depth (the mode guard already refuses this): on mainnet
+        // the signer must be an API wallet distinct from the traded account,
+        // never the main wallet key that can also withdraw.
+        if is_mainnet && account == wallet.address() {
+            return Err(ExchangeError::MainWalletOnMainnet {
+                signer: wallet.address().to_hex(),
+            });
+        }
         let http = reqwest::Client::builder()
             .timeout(timeout)
             .user_agent(concat!("antbot/", env!("CARGO_PKG_VERSION")))
@@ -713,7 +728,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::hl::signing::recover_l1_signer;
-    use crate::mode::{confirm_mainnet, CONFIRM_MAINNET_VALUE, ENV_CONFIRM_MAINNET};
+    use crate::mode::{confirm_mainnet, PrivateKey, CONFIRM_MAINNET_VALUE, ENV_CONFIRM_MAINNET};
 
     const KEY: &str = "0x0123456789012345678901234567890123456789012345678901234567890123";
     const ACCOUNT: &str = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
@@ -724,7 +739,7 @@ mod tests {
 
     fn creds(account: Option<&str>) -> Credentials {
         Credentials {
-            private_key: KEY.into(),
+            private_key: PrivateKey::parse(KEY).unwrap(),
             account_address: account.map(str::to_string),
         }
     }
@@ -841,9 +856,46 @@ mod tests {
         // Construction only: nothing is sent.
         let cfg = Config::default();
         let ep = cfg.endpoints(Mode::Mainnet);
-        let c = mk(Mode::Mainnet, &ep, Some(token())).unwrap();
+        let new = |acct: Option<&str>| {
+            ExchangeClient::new(
+                Mode::Mainnet,
+                &ep,
+                &creds(acct),
+                Some(token()),
+                Duration::from_secs(5),
+            )
+        };
+        let c = new(Some(ACCOUNT)).unwrap();
         assert!(c.is_mainnet());
+        assert!(c.is_agent());
         assert_eq!(c.url(), "https://api.hyperliquid.xyz/exchange");
+        assert!(format!("{c:?}").contains("is_mainnet: true"));
+    }
+
+    #[test]
+    fn mainnet_refuses_main_wallet_key() {
+        let cfg = Config::default();
+        let ep = cfg.endpoints(Mode::Mainnet);
+        let signer = "0x14791697260e4c9a71f18484c9f997b308e59325";
+        // No account (account = signer) or account == signer: refused even
+        // with the token.
+        for acct in [None, Some(signer)] {
+            let e = ExchangeClient::new(
+                Mode::Mainnet,
+                &ep,
+                &creds(acct),
+                Some(token()),
+                Duration::from_secs(5),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&e, ExchangeError::MainWalletOnMainnet { signer: s } if s == signer),
+                "{e}"
+            );
+            assert!(!e.to_string().contains(&KEY[2..]));
+        }
+        // Testnet keeps accepting the main wallet key.
+        assert!(mk(Mode::Testnet, &cfg.endpoints(Mode::Testnet), None).is_ok());
     }
 
     #[test]

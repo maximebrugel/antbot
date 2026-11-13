@@ -24,7 +24,8 @@ pub enum Mode {
     Paper,
     /// Real orders on the Hyperliquid testnet.
     Testnet,
-    /// Real orders on mainnet. Guarded by CLI flag + env confirmation.
+    /// Real orders on mainnet (REAL FUNDS). Guarded by `mode::authorize`: CLI
+    /// flag, env confirmation, API wallet key distinct from the main account.
     Mainnet,
 }
 

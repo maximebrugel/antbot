@@ -4,7 +4,7 @@ A premium mean-reversion bot for the HIP-3 perpetual **`xyz:ANT`** on Hyperliqui
 
 `xyz:ANT` is a builder-deployed perp on the `xyz` dex. It tracks pre-IPO Anthropic and has a funding multiplier of 0.005. Its order book often trades away from the oracle. When the gap (the **premium**) is extreme, the bot posts maker-only orders on the side that profits if the gap closes. It holds the position for at most 8 hours and exits earlier if the premium converges.
 
-**Default mode: paper.** Paper mode uses live mainnet market data and simulated fills. It needs no key and never calls `/exchange`.
+**Default mode: paper.** Paper mode uses live mainnet market data and simulated fills. It needs no key and never calls `/exchange`. Mainnet trading (real funds) is available behind an explicit multi-condition guard: see [Running on mainnet (real funds)](#running-on-mainnet-real-funds).
 
 > **This is not financial advice.** It is experimental software built on a very short history (17 days, 24 backtest trades) for an illiquid pre-IPO market. You can lose everything you put through it. See [Risks and limitations](#risks-and-limitations).
 
@@ -17,6 +17,7 @@ A premium mean-reversion bot for the HIP-3 perpetual **`xyz:ANT`** on Hyperliqui
 - [Modes and the mainnet guard](#modes-and-the-mainnet-guard)
 - [Environment variables](#environment-variables)
 - [Hyperliquid API / agent wallet](#hyperliquid-api--agent-wallet)
+- [Running on mainnet (real funds)](#running-on-mainnet-real-funds)
 - [Configuration reference](#configuration-reference)
 - [Replay / backtest](#replay--backtest)
 - [Docker deployment on a VPS](#docker-deployment-on-a-vps)
@@ -116,7 +117,7 @@ These figures come from the research notes (`writeup_v2`, `sizing`). They use re
 src/
   main.rs            CLI (run, replay, probe, check-config, kill-status, reset-kill)
   config.rs          TOML config, validation, hard caps, mode endpoints
-  mode.rs            mode guard (paper / testnet / mainnet) and credential loading
+  mode.rs            mode guard (paper / testnet / guarded mainnet), credential loading, key redaction
   runner.rs          main loop: tokio::select! over market data, user events, timers, signals
   engine.rs          synchronous core shared by run and replay: strategy + risk per update
   replay.rs          historical replay / backtest
@@ -129,7 +130,7 @@ src/
     rounding.rs      price tick / 5 significant figures / szDecimals
     signing.rs       L1 action signing (msgpack -> keccak -> phantom agent EIP-712)
     actions.rs       order / cancel / leverage actions (wire format)
-    exchange.rs      /exchange client, refuses mainnet without the guard token
+    exchange.rs      /exchange client, refuses mainnet without the guard token or with a main-wallet key
     types.rs         API types
   strategy/
     premium.rs       premium computation and rolling mean
@@ -207,27 +208,39 @@ Testnet uses `<data_dir>/state_testnet.json`. Use a separate `--data-dir` per mo
 |---|---|---|---|
 | `paper` (default) | mainnet info + ws | simulated locally, `/exchange` never called | not read |
 | `testnet` | testnet info + ws | signed, sent to the testnet `/exchange` | required |
-| `mainnet` | mainnet | **refused in this build** | required |
+| `mainnet` | mainnet info + ws | signed, sent to the mainnet `/exchange`: **REAL FUNDS**, only when every guard below passes | API wallet key + main account required |
 
-The mode comes from `mode` in the config or from `--mode`. Mainnet requires **all** of these:
+The mode comes from `mode` in the config or from `--mode`. Mainnet requires **all** of these, otherwise `run` exits non-zero with an explicit error **before** logging starts and before any network or exchange client is built:
 
 1. `--mode mainnet` (or `mode = "mainnet"`) **and** the `--mainnet` CLI flag;
-2. `ANTBOT_CONFIRM_MAINNET=yes-i-understand` in the environment;
-3. a valid `HL_PRIVATE_KEY`.
+2. `ANTBOT_CONFIRM_MAINNET=yes-i-understand` in the environment (exact value);
+3. `HL_PRIVATE_KEY` set to a valid key: the **API (agent) wallet** key;
+4. `HL_ACCOUNT_ADDRESS` set to a valid address: the **main** account. It is required on mainnet because an API wallet holds no funds: positions, margin, orders and fills are queried for the main account;
+5. the address derived from `HL_PRIVATE_KEY` must **differ** from `HL_ACCOUNT_ADDRESS`. If they are equal, the key is the main wallet's own key, which can also withdraw funds. Mainnet refuses it and asks for an API wallet (Hyperliquid UI: More > API), which can trade but cannot withdraw. Testnet still accepts a main wallet key.
 
-Passing `--mainnet` when the resolved mode is not mainnet is an error. The exchange client only accepts a mainnet URL with a confirmation token that can only be obtained from the guard. Testnet mode can never reach the mainnet URL.
+Passing `--mainnet` when the resolved mode is not mainnet is an error. Defence in depth: the exchange client only accepts a mainnet URL with a confirmation token that only the guard can produce, refuses to sign for mainnet when the signer is the traded account (main-wallet key), and testnet mode can never reach the mainnet URL.
 
-**On top of that, this development build refuses mainnet trading outright** (`run` exits with "mainnet trading is not available in this build"). Enabling it is a deliberate code change, to be made only after a long paper and testnet track record.
+`check-config` (no request is made) evaluates the same rules plus the exchange URL guard. In mainnet mode it prints every guard condition as `[ok]` / `[FAIL]` (so you see everything that is missing at once), then `mainnet guard: PASSED` or `REFUSED`, and exits non-zero when any guard refuses.
 
-`check-config` only checks the guard conditions above. Its `exchange guard` line does not reflect this build-level refusal: it can print `ok` for mainnet even though `run` refuses it (a `note:` line says so in mainnet mode).
+At startup on mainnet the log shows a `MODE: MAINNET - REAL FUNDS` banner with the main account address and the signer (API wallet) address, never the key. Telegram alerts are prefixed `[antbot MAINNET <coin>]` and the startup alert starts with `🚨 MODE: MAINNET - REAL FUNDS` followed by both addresses.
+
+### Safety checks on the live path (testnet and mainnet)
+
+The same rules apply on testnet and mainnet:
+
+- **Notional caps.** Sizing never exceeds `sizing.max_notional_usd` nor the built-in 10,000 USD hard cap (config validation, sizing, and a strategy check on committed notional). The live executor re-checks every order that can open or grow a position just before signing it. It refreshes `clearinghouseState` first, then requires that the order notional, plus the venue position (at its entry price), plus any other active opening order (for example one whose outcome is uncertain) stay within `max_notional_usd` (+2% tolerance for an entry re-quoted after the touch moved) and never above the hard cap. Violations are refused locally, logged and alerted; nothing is sent.
+- **Post-only entries.** Entries are ALO (post-only) limit orders only; the executor refuses any non-reduce-only order that is not ALO. Exits are reduce-only: maker ALO first, then a reduce-only IOC taker fallback near the max-hold deadline or `exit_maker_timeout_secs` into a convergence exit. The kill flatten is reduce-only ALO for `kill_flatten_maker_secs`, then reduce-only IOC. Reduce-only orders are never blocked by the caps, since they can only shrink the position.
+- **Isolated margin and leverage.** Only `margin_mode = "isolated"` is accepted. At startup (when flat) the bot sends `updateLeverage` with `isCross = false` and leverage clamped to `1..=min(2, asset max)`. A position found open at startup keeps its settings; if it is on cross margin or above the configured leverage, an alert says so.
+- **Kill switches.** Hit rate, daily loss, max drawdown, persistent premium and spec change (plus position mismatch) are evaluated by the engine shared by paper and live. On a kill, new entries stop, open orders are canceled and, with `risk.flatten_on_kill = true` (default), the position is flattened as above. Kills are persisted and survive restarts until `reset-kill --confirm`.
+- **The key is never written out.** Once loaded it is held in a type with no `Display` and a redacting `Debug`, wiped when dropped (transient copies made while parsing are not all wiped, and the variable stays in the process environment, readable by root via `/proc/<pid>/environ`). No error message contains it. Fatal errors are printed with long hex runs scrubbed, so a config path that mistakenly points at the env file does not echo the key. Logs, alerts, journals and the persisted state hold addresses only.
 
 ## Environment variables
 
 | variable | used in | meaning |
 |---|---|---|
-| `HL_PRIVATE_KEY` | testnet / mainnet | signing key, 64 hex, with or without `0x`. **Use an API/agent wallet key, not your main wallet key.** Never read in paper mode |
-| `HL_ACCOUNT_ADDRESS` | testnet / mainnet | main account address (`0x` + 40 hex) when `HL_PRIVATE_KEY` is an API wallet. Positions, balances, open orders and fills are queried for this address. Empty = the address derived from the key |
-| `ANTBOT_CONFIRM_MAINNET` | mainnet | must equal `yes-i-understand` (plus the `--mainnet` flag). Leave empty |
+| `HL_PRIVATE_KEY` | testnet / mainnet | signing key, 64 hex, with or without `0x`. **Use an API/agent wallet key, not your main wallet key** (mainnet refuses a main wallet key). Never read in paper mode, never logged |
+| `HL_ACCOUNT_ADDRESS` | testnet / mainnet | main account address (`0x` + 40 hex) when `HL_PRIVATE_KEY` is an API wallet. Positions, balances, open orders and fills are queried for this address. **Required on mainnet.** On testnet, empty = the address derived from the key |
+| `ANTBOT_CONFIRM_MAINNET` | mainnet | must equal `yes-i-understand` (plus `--mode mainnet --mainnet`). Leave empty except in the mainnet env file |
 | `TELEGRAM_BOT_TOKEN` | all | Telegram bot token. Alerts are disabled if unset |
 | `TELEGRAM_CHAT_ID` | all | chat id that receives the alerts. Commands (`/pnl`, `/trades`, `/help`) are answered only when this is your own user id (private chat with the bot), see [Telegram commands](#telegram-commands) |
 | `TELEGRAM_API_BASE` | all | optional Bot API base URL (default `https://api.telegram.org`, used by tests) |
@@ -252,12 +265,137 @@ To create one:
    - `HL_ACCOUNT_ADDRESS` = the **main** account address (not the API wallet address).
 
 Notes:
-- `HL_ACCOUNT_ADDRESS` is required with an API wallet. The API wallet holds no funds or positions; the info queries (`clearinghouseState`, `openOrders`, `userFills`, ws `orderUpdates`/`userFills`) must target the main account.
+- `HL_ACCOUNT_ADDRESS` is required with an API wallet (and always on mainnet). The API wallet holds no funds or positions; the info queries (`clearinghouseState`, `openOrders`, `userFills`, ws `orderUpdates`/`userFills`) must target the main account.
 - Hyperliquid tracks nonces per signer. Use **one API wallet per running bot**, and do not share it with other software.
 - API wallets expire, and unused ones can be pruned. Renew before expiry and deregister old ones.
 - `vaultAddress` is not used: it is for vaults and sub-accounts, not agent wallets.
 - HIP-3 dexs have their own clearinghouse. Make sure the account has collateral usable on the `xyz` dex. The bot reads `clearinghouseState` with `dex: "xyz"` for positions and available margin.
 - `antbot check-config --mode testnet` prints the signer and account addresses without making any request.
+
+## Running on mainnet (real funds)
+
+**This trades real money.** Run paper (and ideally testnet) first, read [Risks and limitations](#risks-and-limitations), and start small. Never put the key in the TOML config or on the command line (it would end up in shell history and `ps`).
+
+### 1. Create and authorize an API wallet
+
+1. Open [app.hyperliquid.xyz](https://app.hyperliquid.xyz) connected with your **main** wallet, then **More > API** ([app.hyperliquid.xyz/API](https://app.hyperliquid.xyz/API)).
+2. Name the API wallet and click "Generate". Copy its **private key** (shown once).
+3. Click "Authorize API Wallet", choose a validity period, and sign with the main wallet. The API wallet can now trade for the main account but **cannot withdraw or transfer**.
+4. Note the **main** account address (the wallet you are connected with, not the API wallet address).
+
+Use this API wallet for this bot only (nonces are tracked per signer). Renew it before it expires.
+
+### 2. Deposit margin on the `xyz` dex
+
+`xyz:ANT` is a HIP-3 perp: the `xyz` dex has its own clearinghouse and USDC collateral that is separate from the main perps balance. Move the USDC you want to trade with to the `xyz` dex in the Hyperliquid UI (open the `xyz:ANT` market and transfer USDC to that dex). The bot reads `clearinghouseState` with `dex: "xyz"` for the account's margin and positions. With no margin there the available margin is 0 and the bot cannot size an entry. To check from the VPS (read-only info call, replace the address):
+
+```sh
+curl -s https://api.hyperliquid.xyz/info -H 'Content-Type: application/json' \
+  -d '{"type":"clearinghouseState","user":"0xYOUR_MAIN_ACCOUNT","dex":"xyz"}' | jq '.marginSummary, .withdrawable'
+```
+
+### 3. Separate directory, env file, config and binary
+
+The live instance gets its own directory: never reuse a paper data dir (`risk_state.json` and the state files must not mix).
+
+```sh
+mkdir -p /root/projects/antbot-live/bin /root/projects/antbot-live/data
+chmod 700 /root/projects/antbot-live
+
+# A copy of the binary, so rebuilding the repo never swaps it under the running bot
+cd /root/projects/antbot && cargo build --release
+cp target/release/antbot /root/projects/antbot-live/bin/antbot
+
+# Its own config
+cp config/default.toml /root/projects/antbot-live/live.toml
+```
+
+Edit `/root/projects/antbot-live/live.toml`:
+
+```toml
+mode = "mainnet"
+
+[sizing]
+notional_usd = 250.0          # first run: a few hundred USD (exchange minimum: 10 USD per order)
+max_notional_usd = 300.0      # opening orders above this (+2% re-quote tolerance) are refused
+
+[monitor]
+data_dir = "/root/projects/antbot-live/data"
+# If another instance (e.g. paper) already polls the same Telegram bot token,
+# disable commands here or use a separate bot (two pollers get 409 Conflict).
+# telegram_commands_enabled = false
+```
+
+Keep the `[risk]` defaults (or tighten `daily_loss_limit_usd` / `max_drawdown_usd` for the first run); the `[market] expected_*` values must match the live spec (`antbot probe`), or the spec-change rule kills at once.
+
+Create the env file `/root/projects/antbot-live/live.env` with exactly these variable names, and restrict it:
+
+```sh
+cat > /root/projects/antbot-live/live.env <<'EOF'
+HL_PRIVATE_KEY=0x...                      # the API wallet private key (64 hex)
+HL_ACCOUNT_ADDRESS=0x...                  # the MAIN account address (40 hex)
+ANTBOT_CONFIRM_MAINNET=yes-i-understand
+# Optional Telegram alerts (and /pnl, /trades, /help commands)
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+EOF
+chmod 600 /root/projects/antbot-live/live.env
+```
+
+The bot reads the **process environment**. It does not read `live.env` by itself (it only auto-loads a file named `.env` from the working directory or its parents, which never overrides variables already set). Export the file into the bot's environment with `set -a; . live.env; set +a`, for example via a small launcher, `/root/projects/antbot-live/run-live.sh`:
+
+```sh
+#!/usr/bin/env bash
+# Launch antbot on mainnet with the variables from live.env (never on the command line).
+set -euo pipefail
+cd /root/projects/antbot-live
+set -a; . ./live.env; set +a
+exec ./bin/antbot -c ./live.toml run --mode mainnet --mainnet --data-dir ./data
+```
+
+```sh
+chmod 700 /root/projects/antbot-live/run-live.sh
+```
+
+### 4. Check, then launch
+
+`check-config` makes no request. It prints every mainnet guard condition and exits non-zero if `run` would refuse:
+
+```sh
+cd /root/projects/antbot-live
+( set -a; . ./live.env; set +a; ./bin/antbot -c ./live.toml check-config --mode mainnet --mainnet --data-dir ./data )
+```
+
+Expect five `[ok]` lines, `mainnet guard: PASSED`, the signer (API wallet) and main account addresses, `exchange url: https://api.hyperliquid.xyz/exchange` and your reduced sizing. Then launch (in the background, logs to a file; the bot also writes `data/logs/antbot.log.YYYY-MM-DD`):
+
+```sh
+cd /root/projects/antbot-live
+nohup ./run-live.sh >> run-live.out 2>&1 &
+tail -f run-live.out          # look for "MODE: MAINNET - REAL FUNDS", "asset resolved", "LIVE executor", "main loop started"
+```
+
+A `tmux` / `screen` session running `./run-live.sh` works as well.
+
+### 5. Stop, flatten, reset a kill
+
+- **Status:** `/pnl` and `/trades` on Telegram; the last heartbeat (`grep heartbeat /root/projects/antbot-live/data/logs/antbot.log.$(date -u +%F) | tail -1`: phase, position, venue position, equity, kill); `./bin/antbot -c ./live.toml kill-status --data-dir ./data`; and `data/trades.csv` / `data/orders.csv`. (`scripts/paper_status.sh` is for paper data dirs.)
+- **Stop:** `kill -TERM "$(jq -r .pid /root/projects/antbot-live/data/antbot.lock)"` (or Ctrl-C in the foreground). The bot cancels its open orders, saves its state and **keeps the position** (it resumes managing it at the next start).
+- **Flatten:**
+  - automatically on any kill (`risk.flatten_on_kill = true`): reduce-only maker first for `kill_flatten_maker_secs`, then reduce-only IOC;
+  - on stop, if `[live] flatten_on_shutdown = true` was set in `live.toml` **before** starting: a reduce-only IOC within `strategy.taker_max_slippage_bps` of the touch;
+  - or manually in the Hyperliquid UI after stopping the bot. At the next start the bot replays the fills it missed: your closing fill is booked as an external close (alert "fill for an order the bot did not place"), the trade is recorded with exit reason `external`, and the bot is flat again. **It then resumes trading after `cooldown_after_exit_secs`.** To stop trading, keep the bot stopped. If its saved position and the exchange still disagree after the replay, it halts without trading (a kill): check with `kill-status`, then `reset-kill --confirm`.
+- **Reset a kill** (after reviewing the reason; the bot must be stopped, `reset-kill` refuses otherwise):
+
+  ```sh
+  cd /root/projects/antbot-live
+  ./bin/antbot -c ./live.toml kill-status --data-dir ./data
+  ./bin/antbot -c ./live.toml reset-kill --confirm --data-dir ./data
+  nohup ./run-live.sh >> run-live.out 2>&1 &
+  ```
+
+  `kill-status` and `reset-kill` never read the key.
+- **Scale up** only after a meaningful live track record: raise `notional_usd` / `max_notional_usd` in `live.toml` (hard cap 10,000 USD) and restart.
+- **Revoke** the API wallet in the Hyperliquid UI (More > API) when you stop using the bot, or if the VPS or the env file may have been exposed.
 
 ## Configuration reference
 
@@ -607,7 +745,7 @@ After a spec change (for example growth mode turned off), update `[market] expec
 
 ## Risks and limitations
 
-- **Not financial advice.** No warranty. Run paper first, then testnet. This build does not enable mainnet.
+- **Not financial advice.** No warranty. Run paper first, then testnet, then mainnet at a small size. Mainnet trades real funds as soon as every guard passes.
 - **Tiny sample.** About 17 days of history and 24 backtest trades. The edge may not exist, or may disappear once others trade it.
 - **Pre-IPO oracle risk.** The oracle can jump on news (IPO, funding round, methodology change), the market can be halted or settled, and the "fair value" itself is a model. A position can gap far beyond the backtest's worst excursion (5.3%).
 - **Fee regime.** The edge assumes growth-mode fees. Standard fees cost 10x more (6–18 bps per round trip). The deployer can switch growth mode off.
@@ -615,7 +753,7 @@ After a spec change (for example growth mode turned off), update `[market] expec
 - **Fill model.** Paper and replay maker fills are optimistic: there is no adverse selection model, and the queue position is estimated. Live results will be worse.
 - **Directional exposure.** The bot holds an unhedged position in a volatile pre-IPO perp for up to 8 h. Part of the backtest PnL came from favourable oracle moves.
 - **Operational risk.** Venue outages, websocket gaps, clock drift, API changes or bugs in this software. Reconciliation, kill rules and alerts reduce these risks but do not remove them. Watch the alerts.
-- **Key security.** Use an API wallet (no withdrawal rights), keep `.env` at mode 600, and never commit it.
+- **Key security.** Use an API wallet (no withdrawal rights; mainnet refuses a main wallet key), keep the env file at mode 600 in a mode-700 directory, never commit it, and never pass the key on the command line. Anyone with root on the VPS can still read it.
 - **Hyperliquid limits.** The per-address action budget and the REST weight limits are respected client-side but are not guaranteed.
 
 ## Development

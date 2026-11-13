@@ -5,7 +5,7 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 
 use antbot::config::{Config, Mode, DEFAULT_CONFIG_PATH};
-use antbot::mode::{self, load_credentials, process_env, requires_key, resolve_mode};
+use antbot::mode::{self, process_env, requires_key};
 use antbot::monitor::logging;
 
 #[derive(Debug, Parser)]
@@ -28,7 +28,9 @@ struct ModeArgs {
     /// Override the config mode: paper | testnet | mainnet.
     #[arg(long)]
     mode: Option<Mode>,
-    /// Required (with ANTBOT_CONFIRM_MAINNET=yes-i-understand) for mainnet.
+    /// Required for mainnet (REAL FUNDS), together with --mode mainnet,
+    /// ANTBOT_CONFIRM_MAINNET=yes-i-understand, HL_PRIVATE_KEY (API wallet key)
+    /// and HL_ACCOUNT_ADDRESS (main account). An error in any other mode.
     #[arg(long)]
     mainnet: bool,
 }
@@ -102,7 +104,9 @@ enum Command {
         #[arg(long)]
         rest_only: bool,
     },
-    /// Load + validate the config and the mode guard, then print a summary.
+    /// Load + validate the config and the mode guard (in mainnet mode: every
+    /// guard condition), then print a summary. Read-only: no network call.
+    /// Exits non-zero when `run` would refuse to start.
     CheckConfig {
         #[command(flatten)]
         mode: ModeArgs,
@@ -137,7 +141,9 @@ async fn main() -> ExitCode {
     match real_main(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            // Scrubbed: a config parse error quotes the offending line, which
+            // could hold a key if the config path points at an env file.
+            eprintln!("error: {}", mode::scrub_secrets(&format!("{e:#}")));
             ExitCode::FAILURE
         }
     }
@@ -231,20 +237,38 @@ fn reset_kill(cfg: &Config, data_dir: Option<PathBuf>, confirm: bool) -> anyhow:
     Ok(())
 }
 
-fn resolve(cfg: &Config, args: &ModeArgs) -> anyhow::Result<(Mode, Option<mode::Credentials>)> {
-    let m = resolve_mode(cfg.mode, args.mode, args.mainnet, process_env)?;
-    let creds = load_credentials(m, process_env)?;
-    Ok((m, creds))
-}
-
 fn check_config(
     cfg: &Config,
     path: &std::path::Path,
     args: &ModeArgs,
     data_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
-    let (m, creds) = resolve(cfg, args)?;
+    let requested = args.mode.unwrap_or(cfg.mode);
+    if requested == Mode::Mainnet {
+        // Every condition, independently, so the operator sees all that is
+        // missing at once. Same rules as `run` (mode::authorize).
+        println!("mainnet guard (REAL FUNDS):");
+        for c in mode::mainnet_guard_report(args.mainnet, process_env) {
+            match &c.result {
+                Ok(d) => println!("  [ok]   {:<28} {d}", c.name),
+                Err(e) => println!("  [FAIL] {:<28} {e}", c.name),
+            }
+        }
+    }
+    let auth = match mode::authorize(cfg.mode, args.mode, args.mainnet, process_env) {
+        Ok(a) => a,
+        Err(e) => {
+            if requested == Mode::Mainnet {
+                println!("mainnet guard: REFUSED (`run` exits before any network call)");
+            }
+            return Err(e.into());
+        }
+    };
+    let m = auth.mode;
     let ep = cfg.endpoints(m);
+    if m == Mode::Mainnet {
+        println!("mainnet guard: PASSED: `run` would trade REAL FUNDS");
+    }
     println!("config:        {} (valid)", path.display());
     println!("mode:          {m}");
     println!(
@@ -261,31 +285,25 @@ fn check_config(
     );
     println!(
         "key:           {}",
-        match (&creds, requires_key(m)) {
-            (_, false) => "not required".to_string(),
-            (Some(c), true) => match antbot::hl::signing::Wallet::from_hex(&c.private_key) {
-                Ok(w) => format!(
-                    "loaded (signer {}, account {})",
-                    w.address(),
-                    c.account_address
-                        .as_deref()
-                        .unwrap_or("= signer (no HL_ACCOUNT_ADDRESS)")
-                ),
-                Err(e) => format!("INVALID ({e})"),
-            },
-            (None, true) => "MISSING".to_string(),
+        match (&auth.signer, &auth.account, requires_key(m)) {
+            (_, _, false) => "not required".to_string(),
+            (Some(s), Some(a), true) if s == a => format!("loaded (signer = account {a})"),
+            (Some(s), Some(a), true) => format!("loaded (signer {s} = API wallet, account {a})"),
+            _ => "MISSING".to_string(),
         }
     );
     if m != Mode::Paper {
-        // Guard check only: no request is made.
-        let token = mode::confirm_mainnet(args.mainnet, process_env).ok();
-        println!(
-            "exchange guard: {}",
-            match antbot::hl::exchange::ExchangeClient::check_guard(m, &ep, token) {
-                Ok((url, mainnet)) => format!("ok ({url}, signing for mainnet: {mainnet})"),
-                Err(e) => format!("REFUSED: {e}"),
+        // Guard check only: no request is made. A refusal here means `run`
+        // would fail to build the exchange client: exit non-zero too.
+        match antbot::hl::exchange::ExchangeClient::check_guard(m, &ep, auth.mainnet) {
+            Ok((url, mainnet)) => {
+                println!("exchange guard: ok ({url}, signing for mainnet: {mainnet})")
             }
-        );
+            Err(e) => {
+                println!("exchange guard: REFUSED: {e}");
+                return Err(anyhow::Error::from(e).context("exchange guard refused"));
+            }
+        }
     }
     let s = &cfg.strategy;
     println!(
@@ -304,6 +322,12 @@ fn check_config(
         cfg.sizing.leverage,
         cfg.sizing.margin_mode
     );
+    println!(
+        "orders:        entries ALO (post-only) only; exits reduce-only ALO first, reduce-only IOC near the deadline / {}s into a convergence exit; flatten on kill {} (IOC after {}s)",
+        s.exit_maker_timeout_secs,
+        cfg.risk.flatten_on_kill,
+        cfg.risk.kill_flatten_maker_secs
+    );
     let r = &cfg.risk;
     println!(
         "kill:          hit rate < {} over {} trades, |premium| > {} bps for {}s, daily loss {} USD, max DD {} USD, spec change {}",
@@ -318,11 +342,6 @@ fn check_config(
         ),
         None => println!("data dir:      {}", cfg.monitor.data_dir.display()),
     }
-    if m == Mode::Mainnet {
-        println!(
-            "note:          `run` refuses mainnet in this build (mainnet trading is not wired)"
-        );
-    }
     Ok(())
 }
 
@@ -330,14 +349,37 @@ async fn run(mut cfg: Config, args: &ModeArgs, data_dir: Option<PathBuf>) -> any
     if let Some(d) = data_dir {
         cfg.monitor.data_dir = d;
     }
-    let (m, creds) = resolve(&cfg, args)?;
+    // The whole mode guard (mainnet: flag, confirmation, API wallet key,
+    // main account, key != main wallet) runs before logging, the data dir or
+    // any network / exchange client.
+    let auth = mode::authorize(cfg.mode, args.mode, args.mainnet, process_env)?;
     let _guard = logging::init(
         &cfg.monitor.data_dir,
         cfg.monitor.log_json,
         cfg.monitor.log_max_files,
     )
     .context("initialising logging")?;
+    let m = auth.mode;
     let ep = cfg.endpoints(m);
+    if m == Mode::Mainnet {
+        let addr = |a: Option<antbot::hl::signing::Address>| a.map_or("?".into(), |a| a.to_hex());
+        tracing::warn!("============================================================");
+        tracing::warn!("MODE: MAINNET - REAL FUNDS");
+        tracing::warn!(
+            account = %addr(auth.account),
+            signer = %addr(auth.signer),
+            "MODE: MAINNET - REAL FUNDS: main account {}, signer (API wallet) {}",
+            addr(auth.account),
+            addr(auth.signer)
+        );
+        tracing::warn!(
+            notional_usd = cfg.effective_notional_usd(),
+            max_notional_usd = cfg.sizing.max_notional_usd,
+            config_leverage = cfg.sizing.leverage,
+            "MODE: MAINNET - REAL FUNDS: sizing (leverage is clamped to the asset max at startup)"
+        );
+        tracing::warn!("============================================================");
+    }
     tracing::info!(
         mode = %m,
         coin = %cfg.market.coin,
@@ -346,16 +388,7 @@ async fn run(mut cfg: Config, args: &ModeArgs, data_dir: Option<PathBuf>) -> any
         notional_usd = cfg.effective_notional_usd(),
         "antbot starting"
     );
-    if m == Mode::Mainnet {
-        // Development build: mainnet trading is intentionally not wired.
-        anyhow::bail!("mainnet trading is not available in this build");
-    }
-    let token = if m == Mode::Mainnet {
-        Some(mode::confirm_mainnet(args.mainnet, process_env)?)
-    } else {
-        None
-    };
-    antbot::runner::run(cfg, m, creds, token).await
+    antbot::runner::run(cfg, auth).await
 }
 
 async fn replay(mut cfg: Config, a: ReplayArgs) -> anyhow::Result<()> {

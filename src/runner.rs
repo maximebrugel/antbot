@@ -40,7 +40,7 @@ use crate::hl::exchange::{build_for_mode, AssetRef};
 use crate::hl::info::InfoClient;
 use crate::hl::market::{now_ms, MarketState};
 use crate::hl::ws::{FeedConfig, MarketFeed};
-use crate::mode::{Credentials, MainnetConfirmed};
+use crate::mode::{Authorized, Credentials, MainnetConfirmed};
 use crate::monitor::alerts::{self, DailySummary, DayTracker};
 use crate::monitor::commands::{CommandsHandle, StatusSnapshot};
 use crate::monitor::csv::{Journal, SignalRow};
@@ -87,15 +87,20 @@ struct Ctx {
     /// Snapshot for the read-only Telegram commands (`None` when they are
     /// disabled: nothing is built then).
     status: Option<watch::Sender<Arc<StatusSnapshot>>>,
+    /// Live modes: traded account and signer addresses (never the key), for
+    /// the startup alert.
+    identity: Option<String>,
 }
 
-/// Run the bot until SIGINT / SIGTERM.
-pub async fn run(
-    cfg: Config,
-    mode: Mode,
-    creds: Option<Credentials>,
-    mainnet: Option<MainnetConfirmed>,
-) -> anyhow::Result<()> {
+/// Run the bot until SIGINT / SIGTERM. `auth` comes from
+/// [`crate::mode::authorize`] (the mode guard already passed).
+pub async fn run(cfg: Config, auth: Authorized) -> anyhow::Result<()> {
+    let Authorized {
+        mode,
+        creds,
+        mainnet,
+        ..
+    } = auth;
     let alerter = Alerter::from_env(
         cfg.monitor.telegram_enabled,
         |k| std::env::var(k).ok(),
@@ -107,7 +112,7 @@ pub async fn run(
     );
     let res = run_inner(cfg, mode, creds, mainnet, alerter.clone()).await;
     if let Err(e) = &res {
-        let msg = format!("antbot stopped on error: {e:#}");
+        let msg = crate::mode::scrub_secrets(&format!("antbot stopped on error: {e:#}"));
         tracing::error!("{msg}");
         alerter.send(alerts::error(&msg));
     }
@@ -160,6 +165,7 @@ async fn run_inner(
         day: DayTracker::new(now_ms()),
         missed_day: None,
         status: None,
+        identity: None,
         cfg,
     };
 
@@ -243,12 +249,19 @@ async fn run_inner(
                 (ctx.cfg.live.expires_after_ms > 0).then_some(ctx.cfg.live.expires_after_ms);
             let client = client.with_expires_after_window(expires);
             let user = client.account_address().to_hex();
+            let signer = client.signer_address().to_hex();
+            ctx.identity = Some(if client.is_agent() {
+                format!("account {user} (main), signer {signer} (API wallet)")
+            } else {
+                format!("account {user} (signer = account)")
+            });
             tracing::warn!(
                 mode = %mode,
                 exchange = client.url(),
-                signer = %client.signer_address(),
+                signer = %signer,
                 account = %user,
-                "LIVE executor: real orders will be sent"
+                "LIVE executor: real orders will be sent{}",
+                if client.is_mainnet() { " (MODE: MAINNET - REAL FUNDS)" } else { "" }
             );
             let api = HlApi {
                 exchange: client,
@@ -259,7 +272,7 @@ async fn run_inner(
                 user: user.clone(),
             };
             let mut exec = LiveExecutor::new(
-                LiveParams::from_config(&ctx.cfg, spec.sz_decimals),
+                LiveParams::from_config(&ctx.cfg, spec.sz_decimals, spec.max_leverage),
                 api,
                 exec_saved,
                 now,
@@ -694,9 +707,12 @@ fn send_daily_summary<E: Executor>(ctx: &Ctx, engine: &Engine, exec: &E, done: &
     ctx.mon.notify(s.text(&ctx.mode.to_string(), &ctx.coin));
 }
 
-/// Header of alerts and command replies.
+/// Header of alerts and command replies (`MAINNET` in capitals: real funds).
 fn msg_prefix(mode: Mode, coin: &str) -> String {
-    format!("[antbot {mode} {coin}]")
+    match mode {
+        Mode::Mainnet => format!("[antbot MAINNET {coin}]"),
+        _ => format!("[antbot {mode} {coin}]"),
+    }
 }
 
 /// Publish the state snapshot for the Telegram commands (non-blocking;
@@ -775,6 +791,7 @@ async fn main_loop<E: Executor>(
         ctx.cfg.effective_notional_usd(),
         engine.strategy.phase().kind().as_str(),
         engine.risk.kill_record().map(|k| k.message.as_str()),
+        ctx.identity.as_deref(),
     ));
     // A day whose summary was due while the bot was down.
     if let Some(missed) = ctx.missed_day.take() {

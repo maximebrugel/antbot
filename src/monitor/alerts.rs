@@ -39,6 +39,9 @@ fn hold(secs: f64) -> String {
 }
 
 /// Bot started.
+///
+/// `identity` (live modes): the traded account and the signer address,
+/// never the key. Mainnet gets a leading `MODE: MAINNET - REAL FUNDS` line.
 pub fn startup(
     mode: &str,
     coin: &str,
@@ -46,10 +49,18 @@ pub fn startup(
     notional_usd: f64,
     phase: &str,
     kill: Option<&str>,
+    identity: Option<&str>,
 ) -> String {
-    let mut s = format!(
+    let mut s = String::new();
+    if mode == "mainnet" {
+        s.push_str("🚨 MODE: MAINNET - REAL FUNDS\n");
+    }
+    s.push_str(&format!(
         "🚀 antbot started ({mode})\n{coin} asset {asset_id}, notional {notional_usd:.0} USD\nstate: {phase}"
-    );
+    ));
+    if let Some(id) = identity {
+        s.push_str(&format!("\n{id}"));
+    }
     if let Some(k) = kill {
         s.push_str(&format!("\n⛔ kill switch active: {k}"));
     }
@@ -350,11 +361,26 @@ mod tests {
         );
         assert!(kill("x", false).contains("position left untouched"));
         assert_eq!(
-            startup("paper", "xyz:ANT", 110138, 2500.0, "flat", None),
+            startup("paper", "xyz:ANT", 110138, 2500.0, "flat", None, None),
             "🚀 antbot started (paper)\nxyz:ANT asset 110138, notional 2500 USD\nstate: flat"
         );
-        assert!(startup("paper", "xyz:ANT", 1, 1.0, "halted", Some("dd"))
-            .ends_with("⛔ kill switch active: dd"));
+        assert!(
+            startup("paper", "xyz:ANT", 1, 1.0, "halted", Some("dd"), None)
+                .ends_with("⛔ kill switch active: dd")
+        );
+        assert_eq!(
+            startup(
+                "mainnet",
+                "xyz:ANT",
+                110138,
+                300.0,
+                "flat",
+                None,
+                Some("account 0xaa (main), signer 0xbb (API wallet)")
+            ),
+            "🚨 MODE: MAINNET - REAL FUNDS\n🚀 antbot started (mainnet)\nxyz:ANT asset 110138, notional 300 USD\nstate: flat\naccount 0xaa (main), signer 0xbb (API wallet)"
+        );
+        assert!(!startup("testnet", "xyz:ANT", 1, 1.0, "flat", None, None).contains("MAINNET"));
         assert_eq!(
             shutdown("SIGTERM", "in_position", -24.24, 12.5, 3),
             "🛑 antbot stopping (SIGTERM)\nstate: in_position, position -24.24\nrealized PnL +12.50 USD over 3 trades"

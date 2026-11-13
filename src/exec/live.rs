@@ -20,6 +20,18 @@
 //!   pause of `live.rate_limit_backoff_secs` after any rate-limit answer.
 //! * Shutdown: cancel the bot's open orders (`live.cancel_on_shutdown`),
 //!   keep the position unless `live.flatten_on_shutdown`.
+//! * Last-line order checks, independent of the strategy (same rules on
+//!   testnet and mainnet): every order that can open or grow a position
+//!   (not reduce-only) must be ALO (post-only) and its notional, plus the
+//!   venue position (`clearinghouseState` refreshed just before, valued at
+//!   its entry price) and any other active opening order, must stay within
+//!   `sizing.max_notional_usd` (+2% for entry re-quotes at a moved price) and
+//!   never above the 10 000 USD hard cap. Reduce-only exits (maker ALO first, IOC taker fallback, kill /
+//!   shutdown flatten) are never blocked: they can only shrink the position.
+//! * Margin: isolated only (`updateLeverage` with `isCross = false` at
+//!   startup), leverage clamped to `1..=min(2, asset max)`. A position found
+//!   open at startup keeps its margin settings; a cross or over-cap leverage
+//!   one is reported loudly.
 
 use std::collections::VecDeque;
 
@@ -27,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{ExecEvent, Executor, OrderView};
-use crate::config::{Config, LiveConfig, StrayOrders};
+use crate::config::{Config, LiveConfig, StrayOrders, HARD_CAP_NOTIONAL_USD, MAX_ALLOWED_LEVERAGE};
 use crate::hl::actions::Cloid;
 use crate::hl::exchange::{
     AssetRef, CancelStatus, CloidGen, ExchangeClient, ExchangeError, OrderRequest, OrderStatus,
@@ -39,13 +51,17 @@ use crate::hl::types::{ClearinghouseState, Fill, OpenOrder, WsTrade};
 use crate::hl::ws::UserEvent;
 use crate::strategy::premium::from_bps;
 use crate::strategy::signal::{Command, DoneReason, OrderIntent, OrderKind, OrderUpdate};
-use crate::strategy::sizing::lot_epsilon;
+use crate::strategy::sizing::{effective_leverage, lot_epsilon};
 
 const MINUTE_MS: u64 = 60_000;
 const SEEN_TIDS_KEEP: usize = 4_000;
 const DONE_ORDERS_KEEP: usize = 32;
 /// An order unknown to the exchange this long after placement is dropped.
 const UNKNOWN_ORDER_GRACE_MS: u64 = 10_000;
+/// Tolerance over `sizing.max_notional_usd` for an opening order: an entry
+/// re-quoted after the touch moved keeps its size at a slightly different
+/// price. The hard cap itself has no tolerance.
+pub const MAX_NOTIONAL_TOLERANCE: f64 = 0.02;
 
 /// Exchange status of one order (`orderStatus`, `orderUpdates`).
 #[derive(Debug, Clone, PartialEq)]
@@ -260,20 +276,32 @@ pub struct LiveParams {
     pub live: LiveConfig,
     /// Traded coin (clearinghouseState{dex} lists every coin of the dex).
     pub coin: String,
+    /// Isolated leverage set at startup, already clamped to
+    /// `1..=min(MAX_ALLOWED_LEVERAGE, asset max)`.
     pub leverage: u32,
     pub sz_decimals: u32,
     pub taker_max_slippage_bps: f64,
+    /// Opening-order cap: `sizing.max_notional_usd`, never above the hard cap.
+    pub max_notional_usd: f64,
 }
 
 impl LiveParams {
-    pub fn from_config(cfg: &Config, sz_decimals: u32) -> Self {
+    pub fn from_config(cfg: &Config, sz_decimals: u32, asset_max_leverage: u32) -> Self {
         Self {
             live: cfg.live.clone(),
             coin: cfg.market.coin.clone(),
-            leverage: cfg.sizing.leverage.max(1),
+            leverage: effective_leverage(cfg.sizing.leverage, asset_max_leverage)
+                .min(MAX_ALLOWED_LEVERAGE),
             sz_decimals,
             taker_max_slippage_bps: cfg.strategy.taker_max_slippage_bps,
+            max_notional_usd: cfg.sizing.max_notional_usd.min(HARD_CAP_NOTIONAL_USD),
         }
+    }
+
+    /// Highest notional (order + venue position) an opening order may reach.
+    pub fn opening_limit_usd(&self) -> f64 {
+        (self.max_notional_usd * (1.0 + MAX_NOTIONAL_TOLERANCE))
+            .min(HARD_CAP_NOTIONAL_USD * (1.0 + 1e-9))
     }
 }
 
@@ -283,6 +311,10 @@ pub struct VenuePosition {
     /// Signed size (> 0 long).
     pub szi: f64,
     pub entry_px: Option<f64>,
+    /// Margin mode of the position (`None` when flat / unknown).
+    pub isolated: Option<bool>,
+    /// Leverage of the position (`None` when flat / unknown).
+    pub leverage: Option<u32>,
 }
 
 pub struct LiveExecutor<A: LiveApi> {
@@ -424,6 +456,43 @@ impl<A: LiveApi> LiveExecutor<A> {
         out.push(done(o.tag, reason, filled_sz));
     }
 
+    /// Last-line checks on an order that can open or grow a position (see
+    /// the module docs). `None` = allowed. Reduce-only orders always pass.
+    pub fn opening_order_violation(&self, kind: OrderKind, req: &OrderRequest) -> Option<String> {
+        if req.reduce_only {
+            return None;
+        }
+        if kind != OrderKind::Alo {
+            return Some(format!(
+                "opening order must be ALO (post-only), got {kind:?}"
+            ));
+        }
+        let notional = req.px * req.sz;
+        // Venue position at its entry price (as the strategy counts it),
+        // plus any other opening order still active (e.g. one whose outcome
+        // is uncertain): it may still fill.
+        let venue = self.venue.map_or(0.0, |v| {
+            v.szi.abs()
+                * v.entry_px
+                    .filter(|p| p.is_finite() && *p > 0.0)
+                    .unwrap_or(req.px)
+        });
+        let pending: f64 = self
+            .active()
+            .filter(|o| !o.reduce_only)
+            .map(|o| o.px * o.sz)
+            .sum();
+        let limit = self.p.opening_limit_usd();
+        let total = notional + venue + pending;
+        if !total.is_finite() || total > limit {
+            return Some(format!(
+                "opening notional {notional:.2} USD (+ {venue:.2} USD venue position, + {pending:.2} USD other opening orders) exceeds the cap of {limit:.2} USD (sizing.max_notional_usd {} USD, hard cap {HARD_CAP_NOTIONAL_USD} USD)",
+                self.p.max_notional_usd
+            ));
+        }
+        None
+    }
+
     async fn place(&mut self, now_ms: u64, o: OrderIntent) -> Vec<ExecEvent> {
         let mut out = Vec::new();
         self.prune(now_ms);
@@ -473,6 +542,22 @@ impl<A: LiveApi> LiveExecutor<A> {
                 return out;
             }
         };
+        if !req.reduce_only {
+            // Fresh venue position for the cap check (fills do not update it;
+            // opening orders are rare). On failure the last known one is used.
+            if let Err(e) = self.refresh_account().await {
+                tracing::warn!(error = %format!("{e:#}"), "clearinghouseState before an opening order failed");
+            }
+        }
+        if let Some(why) = self.opening_order_violation(o.kind, &req) {
+            tracing::error!(tag = o.tag, px = req.px, sz = req.sz, kind = ?o.kind, %why, "order refused by the live executor checks");
+            out.push(done(o.tag, DoneReason::Rejected(why.clone()), Some(0.0)));
+            out.push(ExecEvent::Alert(format!(
+                "order {} refused by the live executor: {why}",
+                o.tag
+            )));
+            return out;
+        }
         self.s.orders.push(LiveOrder {
             tag: o.tag,
             cloid,
@@ -742,10 +827,14 @@ impl<A: LiveApi> LiveExecutor<A> {
             Some(p) => VenuePosition {
                 szi: p.szi,
                 entry_px: p.entry_px,
+                isolated: Some(p.leverage.kind == "isolated"),
+                leverage: Some(p.leverage.value),
             },
             None => VenuePosition {
                 szi: 0.0,
                 entry_px: None,
+                isolated: None,
+                leverage: None,
             },
         });
         Ok(())
@@ -825,9 +914,24 @@ impl<A: LiveApi> LiveExecutor<A> {
                 anyhow::bail!("updateLeverage (isolated {}x) failed: {e}", self.p.leverage);
             }
         } else {
-            out.push(ExecEvent::Alert(
-                "position open at startup: leverage / margin mode left unchanged".into(),
-            ));
+            let v = self.venue.unwrap_or(VenuePosition {
+                szi: f64::NAN,
+                entry_px: None,
+                isolated: None,
+                leverage: None,
+            });
+            let unsafe_margin =
+                v.isolated == Some(false) || v.leverage.is_some_and(|l| l > self.p.leverage.max(1));
+            out.push(ExecEvent::Alert(if unsafe_margin {
+                format!(
+                    "position open at startup on {} margin at {}x (the bot uses isolated {}x): leverage / margin mode left unchanged, review it on the exchange",
+                    if v.isolated == Some(false) { "CROSS" } else { "isolated" },
+                    v.leverage.map_or("?".into(), |l| l.to_string()),
+                    self.p.leverage
+                )
+            } else {
+                "position open at startup: leverage / margin mode left unchanged".into()
+            }));
         }
         if self.s.last_funding_ms == 0 {
             self.s.last_funding_ms = now_ms;
