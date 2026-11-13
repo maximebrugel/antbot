@@ -103,8 +103,8 @@ impl Monitor {
         self.alerter.send(text);
     }
 
-    pub fn command(&mut self, ts_ms: u64, c: &Command) {
-        self.journal.command(ts_ms, c);
+    pub fn command(&mut self, ts_ms: u64, c: &Command, touch: (Option<f64>, Option<f64>)) {
+        self.journal.command(ts_ms, c, touch);
     }
 
     pub fn order_update(&mut self, ts_ms: u64, u: &OrderUpdate) {

@@ -369,7 +369,7 @@ async fn pump<E: Executor>(
         }
         let now = now_ms();
         for c in &pending {
-            mon.command(now, c);
+            mon.command(now, c, (m.best_bid.map(|l| l.px), m.best_ask.map(|l| l.px)));
         }
         let evs = exec.execute(now, std::mem::take(&mut pending), m).await;
         pending = apply_events(engine, mon, now, evs);

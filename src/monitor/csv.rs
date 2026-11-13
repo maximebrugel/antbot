@@ -480,8 +480,11 @@ impl Journal {
         }
     }
 
-    /// A command handed to the executor.
-    pub fn command(&mut self, ts_ms: u64, c: &Command) {
+    /// A command handed to the executor. `touch` is the best bid / ask the
+    /// command was decided on: it goes in the `detail` of `place` rows
+    /// (`book <bid>/<ask>`) so the post-only and IOC prices can be audited
+    /// against the book from the journal alone.
+    pub fn command(&mut self, ts_ms: u64, c: &Command, touch: (Option<f64>, Option<f64>)) {
         match c {
             Command::Place(i) => {
                 if self.intents.len() >= MAX_TRACKED_INTENTS {
@@ -494,6 +497,8 @@ impl Journal {
                 let mut row = self.base(ts_ms, "place", Some(i.tag));
                 row.px = Some(i.px);
                 row.sz = Some(i.sz);
+                let side = |v: Option<f64>| v.map_or_else(|| "-".to_string(), num);
+                row.detail = format!("book {}/{}", side(touch.0), side(touch.1));
                 self.order(row);
             }
             Command::Cancel { tag } => {
@@ -752,7 +757,7 @@ mod tests {
             reduce_only: false,
             purpose: Purpose::Entry,
         };
-        j.command(1_000, &Command::Place(i));
+        j.command(1_000, &Command::Place(i), (Some(103.19), None));
         j.order_update(1_100, &OrderUpdate::Resting { tag: 7 });
         j.order_update(
             1_200,
@@ -766,7 +771,7 @@ mod tests {
                 time_ms: 1_190,
             },
         );
-        j.command(1_300, &Command::Cancel { tag: 7 });
+        j.command(1_300, &Command::Cancel { tag: 7 }, (None, None));
         j.order_update(
             1_400,
             &OrderUpdate::Done {
@@ -780,7 +785,7 @@ mod tests {
         assert_eq!(rows[0], OrderRow::HEADER);
         assert_eq!(
             rows[1],
-            "1000,1970-01-01T00:00:01.000Z,paper,place,7,sell,alo,entry,false,103.2,24.24,,,,,"
+            "1000,1970-01-01T00:00:01.000Z,paper,place,7,sell,alo,entry,false,103.2,24.24,,,,,book 103.19/-"
         );
         assert_eq!(
             rows[2],
@@ -810,6 +815,6 @@ mod tests {
         let mut j = Journal::disabled();
         j.signal(&SignalRow::default());
         j.trade(&trade());
-        j.command(1, &Command::Cancel { tag: 1 });
+        j.command(1, &Command::Cancel { tag: 1 }, (None, None));
     }
 }
