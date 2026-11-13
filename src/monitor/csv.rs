@@ -55,10 +55,25 @@ pub fn line(fields: &[String]) -> String {
         .join(",")
 }
 
+/// Price or size without binary float noise: rounded to 8 decimals with
+/// trailing zeros trimmed, so a VWAP of fills at 111.93 prints as `111.93`,
+/// not `111.93000000000002`. Empty when not finite.
+fn num(v: f64) -> String {
+    if !v.is_finite() {
+        return String::new();
+    }
+    let s = format!("{v:.8}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s == "-0" {
+        "0".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 /// Optional float, empty when unknown.
 fn opt(v: Option<f64>) -> String {
-    v.filter(|x| x.is_finite())
-        .map_or_else(String::new, |x| x.to_string())
+    v.map_or_else(String::new, num)
 }
 
 /// Float rounded to `dp` decimals.
@@ -260,7 +275,7 @@ impl SignalRow {
             self.avg_ready.to_string(),
             self.stale.to_string(),
             self.state.clone(),
-            self.position.to_string(),
+            num(self.position),
             self.killed.to_string(),
         ]
     }
@@ -369,9 +384,9 @@ impl TradeRow<'_> {
             fmt_utc_ms(t.closed_ms),
             self.mode.to_string(),
             t.side.as_str().to_string(),
-            t.size.to_string(),
-            t.entry_px.to_string(),
-            t.exit_px.to_string(),
+            num(t.size),
+            num(t.entry_px),
+            num(t.exit_px),
             fixed(t.entry_notional_usd(), 2),
             fixed(t.fees_usd, 6),
             fixed(t.funding_usd, 6),
@@ -382,7 +397,7 @@ impl TradeRow<'_> {
             opt_fixed(t.entry_premium_bps, 3),
             opt_fixed(t.exit_premium_bps, 3),
             fixed(t.hold_secs(), 0),
-            t.exit_taker_sz.to_string(),
+            num(t.exit_taker_sz),
             t.signal_ms.to_string(),
         ]
     }
@@ -542,6 +557,30 @@ mod tests {
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    #[test]
+    fn prices_and_sizes_print_without_float_noise() {
+        assert_eq!(num(111.93000000000002), "111.93");
+        assert_eq!(num(0.1 + 0.2), "0.3");
+        assert_eq!(num(22.33), "22.33");
+        assert_eq!(num(100.0), "100");
+        assert_eq!(num(0.0), "0");
+        assert_eq!(num(-1e-12), "0");
+        assert_eq!(num(-21.94), "-21.94");
+        assert_eq!(num(0.000_012_346), "0.00001235");
+        assert_eq!(num(f64::NAN), "");
+        assert_eq!(opt(None), "");
+        let mut t = trade();
+        t.entry_px = (111.93 * 10.0 + 111.93 * 12.33) / 22.33;
+        t.size = 0.1 + 0.2;
+        let f = TradeRow {
+            mode: "paper",
+            t: &t,
+        }
+        .fields();
+        assert_eq!(f[6], "0.3");
+        assert_eq!(f[7], "111.93");
     }
 
     fn trade() -> TradeRecord {
