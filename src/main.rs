@@ -80,7 +80,7 @@ enum Command {
         #[command(flatten)]
         mode: ModeArgs,
         /// Override monitor.data_dir.
-        #[arg(long)]
+        #[arg(long, env = "ANTBOT_DATA_DIR")]
         data_dir: Option<PathBuf>,
     },
     /// Replay the strategy + paper fill model over historical hourly data
@@ -110,7 +110,7 @@ enum Command {
     /// Show the persisted kill-switch state (<data_dir>/risk_state.json).
     KillStatus {
         /// Override monitor.data_dir.
-        #[arg(long)]
+        #[arg(long, env = "ANTBOT_DATA_DIR")]
         data_dir: Option<PathBuf>,
     },
     /// Clear a persisted kill so the bot may trade again (manual reset).
@@ -118,7 +118,7 @@ enum Command {
     /// baseline so the same rule does not fire again at once. Stop the bot first.
     ResetKill {
         /// Override monitor.data_dir.
-        #[arg(long)]
+        #[arg(long, env = "ANTBOT_DATA_DIR")]
         data_dir: Option<PathBuf>,
         /// Required: confirms the operator reviewed the kill reason.
         #[arg(long)]

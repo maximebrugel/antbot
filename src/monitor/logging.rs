@@ -1,7 +1,9 @@
 //! tracing setup: stdout + daily rolling file in `<data_dir>/logs/`
 //! (`antbot.log.YYYY-MM-DD`, the last `max_files` days kept). Filter from
-//! `RUST_LOG` (default `info`). JSON output optional (both outputs).
+//! `RUST_LOG` (default `info`). JSON output optional (both outputs). ANSI
+//! colors on stdout only when it is a terminal.
 
+use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::Context;
@@ -36,10 +38,17 @@ pub fn env_filter() -> EnvFilter {
 /// process so the file writer flushes on exit.
 pub fn init(data_dir: &Path, json: bool, max_files: usize) -> anyhow::Result<WorkerGuard> {
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender(data_dir, max_files)?);
+    // Colors only on an interactive terminal: `docker logs`, journald and
+    // redirected output get plain text.
+    let ansi = std::io::stdout().is_terminal();
 
     let (stdout_layer, file_layer) = if json {
         (
-            fmt::layer().json().with_filter(env_filter()).boxed(),
+            fmt::layer()
+                .json()
+                .with_ansi(false)
+                .with_filter(env_filter())
+                .boxed(),
             fmt::layer()
                 .json()
                 .with_ansi(false)
@@ -49,7 +58,10 @@ pub fn init(data_dir: &Path, json: bool, max_files: usize) -> anyhow::Result<Wor
         )
     } else {
         (
-            fmt::layer().with_filter(env_filter()).boxed(),
+            fmt::layer()
+                .with_ansi(ansi)
+                .with_filter(env_filter())
+                .boxed(),
             fmt::layer()
                 .with_ansi(false)
                 .with_writer(file_writer)
