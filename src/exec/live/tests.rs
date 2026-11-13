@@ -25,6 +25,10 @@ struct Fake {
     filled: Mutex<HashMap<String, f64>>,
     /// Margin mode / leverage of the fake position (default isolated 1x).
     pos_leverage: Mutex<Option<(String, u32)>>,
+    /// `clearinghouseState` fails while set.
+    fail_reads: Mutex<bool>,
+    /// `updateLeverage` fails while set.
+    fail_leverage: Mutex<bool>,
 }
 
 impl LiveApi for Fake {
@@ -49,9 +53,18 @@ impl LiveApi for Fake {
     }
     async fn update_leverage_isolated(&self, leverage: u32) -> Result<(), ExchangeError> {
         self.leverage_calls.lock().unwrap().push(leverage);
+        if *self.fail_leverage.lock().unwrap() {
+            return Err(ExchangeError::Http {
+                status: 500,
+                body: String::new(),
+            });
+        }
         Ok(())
     }
     async fn clearinghouse(&self) -> anyhow::Result<ClearinghouseState> {
+        if *self.fail_reads.lock().unwrap() {
+            anyhow::bail!("mock clearinghouseState failure");
+        }
         let szi = *self.szi.lock().unwrap();
         let coin = self
             .pos_coin
@@ -1231,6 +1244,88 @@ mod kill_flatten_live {
         assert!(matches!(killed_by(&mut e), KillReason::SpecChange { .. }));
         assert_flattens(&cfg, &mut e, &mut x, t, &m0, c).await;
     }
+
+    /// Review M1 r1 finding 1, through the real engine: an entry partially
+    /// fills on the venue, its cancel succeeds without a filled size, the
+    /// fills never arrive and account reads fail. The strategy gives up
+    /// waiting and retries the entry; no second opening order may reach
+    /// the exchange until the exposure is known and fits the cap.
+    #[tokio::test]
+    async fn no_reentry_on_top_of_unconfirmed_fills() {
+        let mut cfg = Config::default();
+        cfg.sizing.notional_usd = 10_000.0;
+        cfg.strategy.premium_avg_secs = 0; // instantaneous premium: no warm-up
+        let mut e = Engine::new(
+            EngineParams::from_config(&cfg),
+            Strategy::new(StrategyParams::from_config(&cfg, 2, 10)),
+            RiskManager::new(RiskParams::from(&cfg.risk), RiskState::default()),
+            Ledger::default(),
+            0,
+        );
+        // (The engine is given ample margin: Some(1e9) below.)
+        let mut x = exec(Fake::default());
+        x.startup(T0).await.unwrap();
+        let entry_mk = |t| market(t, 100.0, 99.4); // +60 bps: short entry
+        let flat_mk = |t| market(t, 100.0, 100.0); // converged
+        let mk = entry_mk(T0);
+        let c = e.on_market(T0, &mk, Some(1e9));
+        pump(&mut e, &mut x, T0, &mk, c).await;
+        let opening = |x: &LiveExecutor<Fake>| {
+            x.api()
+                .placed
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|o| !o.reduce_only)
+                .count()
+        };
+        assert_eq!(opening(&x), 1, "first entry order");
+        // 99 lots fill on the venue (no fill event), then account reads fail.
+        *x.api().szi.lock().unwrap() = -99.0;
+        *x.api().fail_reads.lock().unwrap() = true;
+        let mut t = T0 + 1_000;
+        let mk = flat_mk(t);
+        let c = e.on_market(t, &mk, Some(1e9));
+        pump(&mut e, &mut x, t, &mk, c).await;
+        assert!(x.state().orders[0].done, "entry canceled");
+        // Past the strategy's missing-fill wait and retry cooldown, with
+        // forced reconciliations (failing reads) on the way.
+        let mut alerted = false;
+        while t < T0 + 200_000 {
+            t += 5_000;
+            if t % 30_000 < 5_000 {
+                for ev in x.reconcile(t, true).await {
+                    alerted |= matches!(&ev, ExecEvent::Alert(a) if a.contains("clearinghouseState failed"));
+                    let c = e.on_exec(t, ev);
+                    pump(&mut e, &mut x, t, &mk, c).await;
+                }
+                // A stale snapshot is not reported as the venue position.
+                assert_eq!(x.venue_position(), None);
+            }
+            let mk = if t >= T0 + 60_000 {
+                entry_mk(t)
+            } else {
+                flat_mk(t)
+            };
+            let c = e.on_market(t, &mk, Some(1e9));
+            pump(&mut e, &mut x, t, &mk, c).await;
+        }
+        assert!(alerted, "persistent account-read failure alerted");
+        assert_eq!(opening(&x), 1, "no second opening order while reads fail");
+        // Reads recover: the venue shows the 9 900 USD short, so a new
+        // ~10 000 USD entry still does not fit the cap.
+        *x.api().fail_reads.lock().unwrap() = false;
+        while t < T0 + 400_000 {
+            t += 5_000;
+            let mk = entry_mk(t);
+            let c = e.on_market(t, &mk, Some(1e9));
+            pump(&mut e, &mut x, t, &mk, c).await;
+        }
+        assert_eq!(opening(&x), 1, "cap holds once the venue is readable");
+        assert_eq!(x.venue_position(), Some(-99.0));
+        // The runner's mismatch check now sees the real gap.
+        assert!((e.strategy_position() - (-99.0)).abs() > 1e-6);
+    }
 }
 
 #[tokio::test]
@@ -1262,4 +1357,350 @@ async fn uncertain_opening_order_counts_toward_the_cap() {
         .await;
     assert!(refused(&ev, 2), "{ev:?}");
     assert_eq!(x.api().placed.lock().unwrap().len(), 1);
+}
+
+// ---- review M1 r1: fresh account state and margin on opening orders -----
+
+#[tokio::test]
+async fn failed_account_read_refuses_opening_orders_but_not_exits() {
+    let fake = Fake::default();
+    let mut x = exec(fake);
+    x.startup(T0).await.unwrap();
+    *x.api().fail_reads.lock().unwrap() = true;
+    let ev = x
+        .execute(
+            T0 + 1,
+            vec![Command::Place(intent(1, OrderKind::Alo, 1.0, false))],
+            &m(),
+        )
+        .await;
+    assert!(refused(&ev, 1), "{ev:?}");
+    assert!(x.api().placed.lock().unwrap().is_empty());
+    assert_eq!(x.venue(), None);
+    assert_eq!(x.venue_position(), None);
+    // Exits do not need the account read.
+    x.execute(
+        T0 + 2,
+        vec![Command::Place(intent(2, OrderKind::Ioc, 1.0, true))],
+        &m(),
+    )
+    .await;
+    assert_eq!(x.api().placed.lock().unwrap().len(), 1);
+    // Readable again: allowed.
+    *x.api().fail_reads.lock().unwrap() = false;
+    let ev = x
+        .execute(
+            T0 + 3,
+            vec![Command::Place(intent(3, OrderKind::Alo, 1.0, false))],
+            &m(),
+        )
+        .await;
+    assert_eq!(ev, vec![ExecEvent::Order(OrderUpdate::Resting { tag: 3 })]);
+}
+
+#[tokio::test]
+async fn canceled_entry_with_unknown_fill_blocks_reentry() {
+    // Direct executor version of the engine regression: the cancel succeeds
+    // but orderStatus gives no filled size; the fills never arrive.
+    let mut x = exec(Fake::default());
+    x.startup(T0).await.unwrap();
+    x.execute(
+        T0 + 1,
+        vec![Command::Place(intent(1, OrderKind::Alo, 100.0, false))],
+        &m(),
+    )
+    .await;
+    *x.api().szi.lock().unwrap() = 99.0;
+    x.execute(T0 + 2, vec![Command::Cancel { tag: 1 }], &m())
+        .await;
+    assert!(x.state().orders[0].done);
+    // Reads fail: refused.
+    *x.api().fail_reads.lock().unwrap() = true;
+    let ev = x
+        .execute(
+            T0 + 80_000,
+            vec![Command::Place(intent(2, OrderKind::Alo, 100.0, false))],
+            &m(),
+        )
+        .await;
+    assert!(refused(&ev, 2), "{ev:?}");
+    // Reads succeed: the venue position counts, still refused.
+    *x.api().fail_reads.lock().unwrap() = false;
+    let ev = x
+        .execute(
+            T0 + 81_000,
+            vec![Command::Place(intent(3, OrderKind::Alo, 100.0, false))],
+            &m(),
+        )
+        .await;
+    assert!(refused(&ev, 3), "{ev:?}");
+    assert_eq!(x.api().placed.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn unconfirmed_fill_counts_until_fills_arrive_or_settle() {
+    // The account read right after the cancel does not show the fill yet
+    // (lagging info node): the unconfirmed size still counts.
+    let mut x = exec_with(&small_cfg(300.0), 10, Fake::default());
+    x.startup(T0).await.unwrap();
+    x.execute(
+        T0 + 1,
+        vec![Command::Place(intent(1, OrderKind::Alo, 2.0, false))],
+        &m(),
+    )
+    .await;
+    let cloid = x.state().orders[0].cloid;
+    x.api()
+        .filled
+        .lock()
+        .unwrap()
+        .insert(cloid.to_string(), 2.0);
+    x.execute(T0 + 2, vec![Command::Cancel { tag: 1 }], &m())
+        .await;
+    assert_eq!(x.state().orders[0].done_filled_sz, Some(2.0));
+    // 200 USD unconfirmed + 200 USD new > 306 USD: refused.
+    let ev = x
+        .execute(
+            T0 + 3,
+            vec![Command::Place(intent(2, OrderKind::Alo, 2.0, false))],
+            &m(),
+        )
+        .await;
+    assert!(refused(&ev, 2), "{ev:?}");
+    // The fills arrive: confirmed, and the venue now shows the position.
+    x.on_user_event(
+        T0 + 4,
+        UserEvent::Fills {
+            is_snapshot: false,
+            fills: vec![fill(Some(cloid), 1, 900, T0 + 1, 2.0)],
+        },
+    )
+    .await;
+    *x.api().szi.lock().unwrap() = 2.0;
+    let ev = x
+        .execute(
+            T0 + 5,
+            vec![Command::Place(intent(3, OrderKind::Alo, 1.0, false))],
+            &m(),
+        )
+        .await;
+    assert_eq!(ev, vec![ExecEvent::Order(OrderUpdate::Resting { tag: 3 })]);
+
+    // Fills that never arrive: released by an account read taken
+    // FILL_SETTLE_MS after the order finished (which reflects them).
+    let mut y = exec_with(&small_cfg(300.0), 10, Fake::default());
+    y.startup(T0).await.unwrap();
+    y.execute(
+        T0 + 1,
+        vec![Command::Place(intent(1, OrderKind::Alo, 2.0, false))],
+        &m(),
+    )
+    .await;
+    y.execute(T0 + 2, vec![Command::Cancel { tag: 1 }], &m())
+        .await; // filled size unknown: the whole 2 lots count
+    let ev = y
+        .execute(
+            T0 + 2 + FILL_SETTLE_MS - 1,
+            vec![Command::Place(intent(2, OrderKind::Alo, 2.0, false))],
+            &m(),
+        )
+        .await;
+    assert!(refused(&ev, 2), "{ev:?}");
+    let ev = y
+        .execute(
+            T0 + 2 + FILL_SETTLE_MS,
+            vec![Command::Place(intent(3, OrderKind::Alo, 2.0, false))],
+            &m(),
+        )
+        .await;
+    assert_eq!(ev, vec![ExecEvent::Order(OrderUpdate::Resting { tag: 3 })]);
+}
+
+#[tokio::test]
+async fn unsafe_margin_position_is_exit_only_then_isolated_before_reentry() {
+    // Review M1 r1 finding 2: a position carried at startup on CROSS 5x.
+    let fake = Fake::default();
+    *fake.szi.lock().unwrap() = 1.0;
+    *fake.pos_leverage.lock().unwrap() = Some(("cross".into(), 5));
+    let mut x = exec(fake);
+    let ev = x.startup(T0).await.unwrap();
+    assert!(ev
+        .iter()
+        .any(|e| matches!(e, ExecEvent::Alert(a) if a.contains("exits only"))));
+    // A resumed partial entry cannot grow it.
+    let ev = x
+        .execute(
+            T0 + 1,
+            vec![Command::Place(intent(1, OrderKind::Alo, 1.0, false))],
+            &m(),
+        )
+        .await;
+    assert!(refused(&ev, 1), "{ev:?}");
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, ExecEvent::Alert(a) if a.contains("CROSS margin at 5x"))),
+        "{ev:?}"
+    );
+    // Exits go out.
+    x.execute(
+        T0 + 2,
+        vec![Command::Place(intent(2, OrderKind::Alo, 1.0, true))],
+        &m(),
+    )
+    .await;
+    assert_eq!(x.api().placed.lock().unwrap().len(), 1);
+    assert!(x.api().leverage_calls.lock().unwrap().is_empty());
+    // Closed: the next entry first establishes isolated 1x, then goes out.
+    *x.api().szi.lock().unwrap() = 0.0;
+    let ev = x
+        .execute(
+            T0 + 3,
+            vec![Command::Place(intent(3, OrderKind::Alo, 1.0, false))],
+            &m(),
+        )
+        .await;
+    assert_eq!(ev, vec![ExecEvent::Order(OrderUpdate::Resting { tag: 3 })]);
+    assert_eq!(*x.api().leverage_calls.lock().unwrap(), vec![1]);
+    // Its top-up on an isolated 1x position is fine, without a new call.
+    *x.api().szi.lock().unwrap() = 1.0;
+    *x.api().pos_leverage.lock().unwrap() = Some(("isolated".into(), 1));
+    let ev = x
+        .execute(
+            T0 + 4,
+            vec![Command::Place(intent(4, OrderKind::Alo, 1.0, false))],
+            &m(),
+        )
+        .await;
+    assert_eq!(ev, vec![ExecEvent::Order(OrderUpdate::Resting { tag: 4 })]);
+    assert_eq!(x.api().leverage_calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn isolated_position_above_bot_leverage_cannot_grow() {
+    let fake = Fake::default();
+    *fake.szi.lock().unwrap() = 1.0;
+    *fake.pos_leverage.lock().unwrap() = Some(("isolated".into(), 3));
+    let mut x = exec(fake); // bot leverage 1x
+    x.startup(T0).await.unwrap();
+    let ev = x
+        .execute(
+            T0 + 1,
+            vec![Command::Place(intent(1, OrderKind::Alo, 1.0, false))],
+            &m(),
+        )
+        .await;
+    assert!(refused(&ev, 1), "{ev:?}");
+    assert!(x.api().placed.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn failed_update_leverage_refuses_the_entry() {
+    // Started with a (safe) position, now flat: the entry from flat needs
+    // isolated leverage first; when that fails nothing is sent.
+    let fake = Fake::default();
+    *fake.szi.lock().unwrap() = 1.0;
+    let mut x = exec(fake);
+    x.startup(T0).await.unwrap();
+    *x.api().szi.lock().unwrap() = 0.0;
+    *x.api().fail_leverage.lock().unwrap() = true;
+    let ev = x
+        .execute(
+            T0 + 1,
+            vec![Command::Place(intent(1, OrderKind::Alo, 1.0, false))],
+            &m(),
+        )
+        .await;
+    assert!(refused(&ev, 1), "{ev:?}");
+    assert!(x.api().placed.lock().unwrap().is_empty());
+    assert_eq!(x.api().leverage_calls.lock().unwrap().len(), 1);
+    *x.api().fail_leverage.lock().unwrap() = false;
+    let ev = x
+        .execute(
+            T0 + 2,
+            vec![Command::Place(intent(2, OrderKind::Alo, 1.0, false))],
+            &m(),
+        )
+        .await;
+    assert_eq!(ev, vec![ExecEvent::Order(OrderUpdate::Resting { tag: 2 })]);
+}
+
+#[tokio::test]
+async fn isolated_leverage_is_resent_before_a_later_entry_from_flat() {
+    let mut x = exec(Fake::default());
+    x.startup(T0).await.unwrap();
+    assert_eq!(x.api().leverage_calls.lock().unwrap().len(), 1);
+    // Soon after startup: no new call.
+    x.execute(T0 + 1, vec![Command::Place(alo(1))], &m()).await;
+    assert_eq!(x.api().leverage_calls.lock().unwrap().len(), 1);
+    // Much later (a manual change while flat would be invisible): re-sent.
+    let t = T0 + LEVERAGE_RECHECK_MS + 1;
+    x.execute(t, vec![Command::Cancel { tag: 1 }], &m()).await;
+    x.execute(t, vec![Command::Place(alo(2))], &m()).await;
+    assert_eq!(*x.api().leverage_calls.lock().unwrap(), vec![1, 1]);
+}
+
+#[tokio::test]
+async fn cancel_after_prune_targets_the_right_order() {
+    // More than DONE_ORDERS_KEEP finished orders: the prune inside cancel
+    // shifts indexes; the cancel must still go to the requested order.
+    let fake = Fake::default();
+    let n = DONE_ORDERS_KEEP as u64 + 1;
+    for _ in 0..n {
+        fake.place_replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(OrderStatus::Error("rejected".into())));
+    }
+    let mut p = params();
+    p.live.max_exchange_actions_per_min = 1_000;
+    let mut x = LiveExecutor::new(p, fake, None, T0).unwrap();
+    for tag in 1..=n {
+        x.execute(
+            T0,
+            vec![Command::Place(intent(tag, OrderKind::Alo, 1.0, true))],
+            &m(),
+        )
+        .await;
+    }
+    let (b, a) = (n + 1, n + 2);
+    x.execute(
+        T0,
+        vec![
+            Command::Place(intent(b, OrderKind::Alo, 1.0, true)),
+            Command::Place(intent(a, OrderKind::Alo, 1.0, true)),
+        ],
+        &m(),
+    )
+    .await;
+    let cloid_of = |x: &LiveExecutor<Fake>, tag: u64| {
+        x.state()
+            .orders
+            .iter()
+            .find(|o| o.tag == tag)
+            .unwrap()
+            .cloid
+    };
+    let (cb, ca) = (cloid_of(&x, b), cloid_of(&x, a));
+    // B is canceled on the exchange (orderUpdates): one more finished order.
+    let up = crate::hl::types::OrderUpdate {
+        order: OpenOrder {
+            coin: "xyz:ANT".into(),
+            side: "B".into(),
+            limit_px: 100.0,
+            sz: 1.0,
+            oid: 1,
+            timestamp: T0,
+            orig_sz: Some(1.0),
+            cloid: Some(cb.to_string()),
+        },
+        status: "canceled".into(),
+        status_timestamp: T0 + 1,
+    };
+    x.on_user_event(T0 + 1, UserEvent::OrderUpdates(vec![up]))
+        .await;
+    let ev = x
+        .execute(T0 + 2, vec![Command::Cancel { tag: a }], &m())
+        .await;
+    assert_eq!(*x.api().canceled.lock().unwrap(), vec![ca]);
+    assert_eq!(dones(&ev), vec![(a, DoneReason::Canceled)]);
 }

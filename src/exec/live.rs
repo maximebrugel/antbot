@@ -21,17 +21,31 @@
 //! * Shutdown: cancel the bot's open orders (`live.cancel_on_shutdown`),
 //!   keep the position unless `live.flatten_on_shutdown`.
 //! * Last-line order checks, independent of the strategy (same rules on
-//!   testnet and mainnet): every order that can open or grow a position
-//!   (not reduce-only) must be ALO (post-only) and its notional, plus the
-//!   venue position (`clearinghouseState` refreshed just before, valued at
-//!   its entry price) and any other active opening order, must stay within
-//!   `sizing.max_notional_usd` (+2% for entry re-quotes at a moved price) and
-//!   never above the 10 000 USD hard cap. Reduce-only exits (maker ALO first, IOC taker fallback, kill /
+//!   testnet and mainnet), on every order that can open or grow a position
+//!   (not reduce-only):
+//!   - it must be ALO (post-only);
+//!   - `clearinghouseState` must be read successfully just before it: if
+//!     that read fails the order is refused (a stale snapshot is never used
+//!     to admit new exposure);
+//!   - its notional, plus the venue position (valued at its entry price),
+//!     plus any other active opening order, plus the unconfirmed part of
+//!     recently finished opening orders (reported filled, or with an unknown
+//!     filled size, but whose fills have not arrived yet and that no account
+//!     read taken [`FILL_SETTLE_MS`] later reflects), must stay within
+//!     `sizing.max_notional_usd` (+2% for entry re-quotes at a moved price)
+//!     and never above the 10 000 USD hard cap;
+//!   - margin: an existing venue position must be isolated at no more than
+//!     the bot's leverage, and before opening from flat the executor
+//!     (re-)establishes isolated leverage with `updateLeverage`; if that
+//!     fails, the order is refused.
+//!
+//!   Reduce-only exits (maker ALO first, IOC taker fallback, kill /
 //!   shutdown flatten) are never blocked: they can only shrink the position.
-//! * Margin: isolated only (`updateLeverage` with `isCross = false` at
-//!   startup), leverage clamped to `1..=min(2, asset max)`. A position found
-//!   open at startup keeps its margin settings; a cross or over-cap leverage
-//!   one is reported loudly.
+//! * Margin: isolated only (`updateLeverage` with `isCross = false`),
+//!   leverage clamped to `1..=min(2, asset max)`. A position found open at
+//!   startup keeps its margin settings (they cannot be changed while it is
+//!   open); one on cross margin or above the bot's leverage is reported
+//!   loudly and becomes exit-only: no order may grow it.
 
 use std::collections::VecDeque;
 
@@ -62,6 +76,17 @@ const UNKNOWN_ORDER_GRACE_MS: u64 = 10_000;
 /// re-quoted after the touch moved keeps its size at a slightly different
 /// price. The hard cap itself has no tolerance.
 pub const MAX_NOTIONAL_TOLERANCE: f64 = 0.02;
+/// An opening order that finished with fills not yet received keeps
+/// counting toward the cap until those fills arrive, or until an account
+/// read taken at least this long after it finished (which then includes
+/// them in the venue position).
+pub const FILL_SETTLE_MS: u64 = 15_000;
+/// Isolated leverage is re-sent before opening from flat when the last
+/// successful `updateLeverage` is older than this (a manual change on the
+/// exchange while flat is not visible in `clearinghouseState`).
+pub const LEVERAGE_RECHECK_MS: u64 = 600_000;
+/// Consecutive failed account reads in reconciliation before an alert.
+const ACCOUNT_READ_ALERT_AFTER: u32 = 3;
 
 /// Exchange status of one order (`orderStatus`, `orderUpdates`).
 #[derive(Debug, Clone, PartialEq)]
@@ -258,6 +283,12 @@ pub struct LiveOrder {
     /// Filled size reported with the terminal state.
     #[serde(default)]
     pub done_filled_sz: Option<f64>,
+    /// Size of the fills received (userFills) for this order.
+    #[serde(default)]
+    pub fills_seen: f64,
+    /// When the order was marked done (ms).
+    #[serde(default)]
+    pub done_ms: Option<u64>,
 }
 
 /// Persisted live executor state.
@@ -327,6 +358,16 @@ pub struct LiveExecutor<A: LiveApi> {
     paused_until_ms: u64,
     available_margin: Option<f64>,
     venue: Option<VenuePosition>,
+    /// The last `clearinghouseState` read succeeded (`venue` is current).
+    venue_ok: bool,
+    /// Time of the last successful `clearinghouseState` read (ms).
+    venue_read_ms: u64,
+    /// Consecutive failed account reads, and whether that was alerted.
+    account_read_failures: u32,
+    account_read_alerted: bool,
+    /// Time of the last successful isolated `updateLeverage`; reset when a
+    /// venue position shows unsafe margin settings.
+    margin_set_ms: Option<u64>,
 }
 
 /// `oo` (from openOrders) is our order `o`: by cloid when it has one.
@@ -361,6 +402,11 @@ impl<A: LiveApi> LiveExecutor<A> {
             paused_until_ms: 0,
             available_margin: None,
             venue: None,
+            venue_ok: false,
+            venue_read_ms: 0,
+            account_read_failures: 0,
+            account_read_alerted: false,
+            margin_set_ms: None,
         })
     }
 
@@ -372,9 +418,39 @@ impl<A: LiveApi> LiveExecutor<A> {
         &self.s
     }
 
-    /// Last known venue position (`None` before the first reconciliation).
+    /// Venue position from the last account read; `None` before the first
+    /// one and while the latest read failed (a stale snapshot is not
+    /// reported as current).
     pub fn venue(&self) -> Option<VenuePosition> {
-        self.venue
+        self.venue.filter(|_| self.venue_ok)
+    }
+
+    /// Margin settings of a venue position the bot may add to: isolated,
+    /// at no more than the bot's leverage.
+    fn margin_safe(&self, v: &VenuePosition) -> bool {
+        v.isolated == Some(true) && v.leverage.is_some_and(|l| l <= self.p.leverage.max(1))
+    }
+
+    /// Notional of a finished opening order that may have filled on the
+    /// venue without the fills having been received yet (see
+    /// [`FILL_SETTLE_MS`]).
+    fn unconfirmed_usd(&self, o: &LiveOrder) -> f64 {
+        if !o.done || o.reduce_only {
+            return 0.0;
+        }
+        // Unknown filled size: assume the whole order filled.
+        let reported = o.done_filled_sz.unwrap_or(o.sz);
+        let missing = reported - o.fills_seen;
+        if missing.is_nan() || missing <= self.eps() {
+            return 0.0;
+        }
+        let settled = self.venue_ok
+            && self.venue_read_ms >= o.done_ms.unwrap_or(0).saturating_add(FILL_SETTLE_MS);
+        if settled {
+            0.0
+        } else {
+            missing * o.px
+        }
     }
 
     fn eps(&self) -> f64 {
@@ -416,11 +492,20 @@ impl<A: LiveApi> LiveExecutor<A> {
             self.action_times.pop_front();
         }
         // Keep the active orders and the most recent finished ones.
-        let done_count = self.s.orders.iter().filter(|o| o.done).count();
+        // Finished opening orders whose fills are unconfirmed are kept:
+        // they still count toward the cap.
+        let droppable: Vec<bool> = self
+            .s
+            .orders
+            .iter()
+            .map(|o| o.done && self.unconfirmed_usd(o) == 0.0)
+            .collect();
+        let done_count = droppable.iter().filter(|d| **d).count();
         if done_count > DONE_ORDERS_KEEP {
             let mut drop = done_count - DONE_ORDERS_KEEP;
-            self.s.orders.retain(|o| {
-                if o.done && drop > 0 {
+            let mut it = droppable.into_iter();
+            self.s.orders.retain(|_| {
+                if it.next().unwrap_or(false) && drop > 0 {
                     drop -= 1;
                     false
                 } else {
@@ -440,6 +525,7 @@ impl<A: LiveApi> LiveExecutor<A> {
 
     fn mark_done(
         &mut self,
+        now_ms: u64,
         i: usize,
         reason: DoneReason,
         filled_sz: Option<f64>,
@@ -453,6 +539,7 @@ impl<A: LiveApi> LiveExecutor<A> {
         o.uncertain = false;
         o.done_reason = Some(reason.clone());
         o.done_filled_sz = filled_sz;
+        o.done_ms = Some(now_ms);
         out.push(done(o.tag, reason, filled_sz));
     }
 
@@ -467,26 +554,48 @@ impl<A: LiveApi> LiveExecutor<A> {
                 "opening order must be ALO (post-only), got {kind:?}"
             ));
         }
+        // A current account read is required: never admit new exposure
+        // against a stale position.
+        let Some(v) = self.venue() else {
+            return Some(
+                "account state unavailable (clearinghouseState could not be read): opening orders are refused until it can be; exits stay allowed".into(),
+            );
+        };
+        if v.szi.abs() > self.eps() {
+            if !self.margin_safe(&v) {
+                return Some(format!(
+                    "the venue position is on {} margin at {}x (the bot only adds to isolated positions at <= {}x): no new exposure until it is closed; exits stay allowed",
+                    if v.isolated == Some(false) { "CROSS" } else { "isolated" },
+                    v.leverage.map_or("?".into(), |l| l.to_string()),
+                    self.p.leverage
+                ));
+            }
+        } else if self.margin_set_ms.is_none() {
+            return Some(format!(
+                "isolated {}x leverage is not established: opening orders are refused",
+                self.p.leverage
+            ));
+        }
         let notional = req.px * req.sz;
         // Venue position at its entry price (as the strategy counts it),
         // plus any other opening order still active (e.g. one whose outcome
-        // is uncertain): it may still fill.
-        let venue = self.venue.map_or(0.0, |v| {
-            v.szi.abs()
-                * v.entry_px
-                    .filter(|p| p.is_finite() && *p > 0.0)
-                    .unwrap_or(req.px)
-        });
+        // is uncertain): it may still fill; plus finished opening orders
+        // whose fills are not confirmed yet.
+        let venue = v.szi.abs()
+            * v.entry_px
+                .filter(|p| p.is_finite() && *p > 0.0)
+                .unwrap_or(req.px);
         let pending: f64 = self
             .active()
             .filter(|o| !o.reduce_only)
             .map(|o| o.px * o.sz)
             .sum();
+        let unconfirmed: f64 = self.s.orders.iter().map(|o| self.unconfirmed_usd(o)).sum();
         let limit = self.p.opening_limit_usd();
-        let total = notional + venue + pending;
+        let total = notional + venue + pending + unconfirmed;
         if !total.is_finite() || total > limit {
             return Some(format!(
-                "opening notional {notional:.2} USD (+ {venue:.2} USD venue position, + {pending:.2} USD other opening orders) exceeds the cap of {limit:.2} USD (sizing.max_notional_usd {} USD, hard cap {HARD_CAP_NOTIONAL_USD} USD)",
+                "opening notional {notional:.2} USD (+ {venue:.2} USD venue position, + {pending:.2} USD other opening orders, + {unconfirmed:.2} USD unconfirmed fills) exceeds the cap of {limit:.2} USD (sizing.max_notional_usd {} USD, hard cap {HARD_CAP_NOTIONAL_USD} USD)",
                 self.p.max_notional_usd
             ));
         }
@@ -542,11 +651,37 @@ impl<A: LiveApi> LiveExecutor<A> {
                 return out;
             }
         };
-        if !req.reduce_only {
-            // Fresh venue position for the cap check (fills do not update it;
-            // opening orders are rare). On failure the last known one is used.
-            if let Err(e) = self.refresh_account().await {
+        if !req.reduce_only && o.kind == OrderKind::Alo {
+            // Fresh venue position (and margin settings) for the checks:
+            // required, a failed read refuses the order.
+            if let Err(e) = self.refresh_account(now_ms).await {
                 tracing::warn!(error = %format!("{e:#}"), "clearinghouseState before an opening order failed");
+            } else if self.venue.is_some_and(|v| v.szi.abs() <= self.eps())
+                && self
+                    .margin_set_ms
+                    .is_none_or(|t| now_ms.saturating_sub(t) >= LEVERAGE_RECHECK_MS)
+            {
+                // Opening from flat: (re-)establish isolated leverage first.
+                match self.api.update_leverage_isolated(self.p.leverage).await {
+                    Ok(()) => self.margin_set_ms = Some(now_ms),
+                    Err(e) => {
+                        if e.is_rate_limited() {
+                            self.rate_limited(now_ms, "updateLeverage", &mut out);
+                        }
+                        self.margin_set_ms = None;
+                        let why = format!(
+                            "updateLeverage (isolated {}x) before opening failed: {e}",
+                            self.p.leverage
+                        );
+                        tracing::error!(tag = o.tag, %why, "order refused by the live executor checks");
+                        out.push(done(o.tag, DoneReason::Rejected(why.clone()), Some(0.0)));
+                        out.push(ExecEvent::Alert(format!(
+                            "order {} refused by the live executor: {why}",
+                            o.tag
+                        )));
+                        return out;
+                    }
+                }
             }
         }
         if let Some(why) = self.opening_order_violation(o.kind, &req) {
@@ -574,6 +709,8 @@ impl<A: LiveApi> LiveExecutor<A> {
             cancel_requested: false,
             done_reason: None,
             done_filled_sz: None,
+            fills_seen: 0.0,
+            done_ms: None,
         });
         let i = self.s.orders.len() - 1;
         self.action_times.push_back(now_ms);
@@ -596,7 +733,7 @@ impl<A: LiveApi> LiveExecutor<A> {
                     DoneReason::Filled
                 };
                 let filled = total_sz.is_finite().then_some(total_sz);
-                self.mark_done(i, reason, filled, &mut out);
+                self.mark_done(now_ms, i, reason, filled, &mut out);
             }
             Ok(st @ OrderStatus::Error(_)) => {
                 let reason = if st.is_post_only_reject() {
@@ -612,7 +749,7 @@ impl<A: LiveApi> LiveExecutor<A> {
                     };
                     DoneReason::Rejected(m)
                 };
-                self.mark_done(i, reason, Some(0.0), &mut out);
+                self.mark_done(now_ms, i, reason, Some(0.0), &mut out);
             }
             Ok(OrderStatus::Other(v)) => {
                 tracing::warn!(tag = o.tag, status = %v, "unexpected order status, resolving by cloid");
@@ -620,7 +757,13 @@ impl<A: LiveApi> LiveExecutor<A> {
             }
             Err(e) if e.is_rate_limited() => {
                 self.rate_limited(now_ms, "order", &mut out);
-                self.mark_done(i, DoneReason::Rejected(e.to_string()), Some(0.0), &mut out);
+                self.mark_done(
+                    now_ms,
+                    i,
+                    DoneReason::Rejected(e.to_string()),
+                    Some(0.0),
+                    &mut out,
+                );
             }
             Err(e) if e.outcome_unknown() || matches!(e, ExchangeError::Decode(_)) => {
                 self.s.orders[i].uncertain = true;
@@ -629,7 +772,13 @@ impl<A: LiveApi> LiveExecutor<A> {
                     o.tag
                 )));
             }
-            Err(e) => self.mark_done(i, DoneReason::Rejected(e.to_string()), Some(0.0), &mut out),
+            Err(e) => self.mark_done(
+                now_ms,
+                i,
+                DoneReason::Rejected(e.to_string()),
+                Some(0.0),
+                &mut out,
+            ),
         }
         out
     }
@@ -657,7 +806,18 @@ impl<A: LiveApi> LiveExecutor<A> {
             ));
             return out;
         }
+        // Pruning drops finished orders and shifts indexes: look the
+        // (active, so never pruned) order up again afterwards.
         self.prune(now_ms);
+        let Some(i) = self.s.orders.iter().rposition(|o| o.tag == tag) else {
+            // Not reachable (active orders are kept); never panic live.
+            out.push(done(
+                tag,
+                DoneReason::Rejected("order unknown to the executor".into()),
+                Some(0.0),
+            ));
+            return out;
+        };
         self.action_times.push_back(now_ms); // counted, never blocked
         self.s.orders[i].cancel_requested = true;
         let cloid = self.s.orders[i].cloid;
@@ -673,7 +833,7 @@ impl<A: LiveApi> LiveExecutor<A> {
                         None
                     }
                 };
-                self.mark_done(i, DoneReason::Canceled, filled, &mut out);
+                self.mark_done(now_ms, i, DoneReason::Canceled, filled, &mut out);
             }
             Ok(other) => {
                 // Already filled / canceled / never placed: ask the exchange.
@@ -718,6 +878,7 @@ impl<A: LiveApi> LiveExecutor<A> {
             }) => {
                 if now_ms.saturating_sub(placed) >= UNKNOWN_ORDER_GRACE_MS {
                     self.mark_done(
+                        now_ms,
                         i,
                         DoneReason::Rejected("order unknown to the exchange".into()),
                         Some(0.0),
@@ -729,7 +890,7 @@ impl<A: LiveApi> LiveExecutor<A> {
             }
             Ok(RemoteOrder { status, filled_sz }) => {
                 if let Some(r) = status.done_reason(kind) {
-                    self.mark_done(i, r, filled_sz, &mut out);
+                    self.mark_done(now_ms, i, r, filled_sz, &mut out);
                 }
             }
             Err(e) => {
@@ -767,6 +928,9 @@ impl<A: LiveApi> LiveExecutor<A> {
                 self.s.seen_tids.pop_front();
             }
             self.s.last_fill_ms = self.s.last_fill_ms.max(f.time);
+            if let Some(i) = idx {
+                self.s.orders[i].fills_seen += f.sz;
+            }
             let tag = idx.map(|i| self.s.orders[i].tag);
             if tag.is_none() {
                 out.push(ExecEvent::Alert(format!(
@@ -787,7 +951,11 @@ impl<A: LiveApi> LiveExecutor<A> {
         out
     }
 
-    fn process_order_updates(&mut self, ups: &[crate::hl::types::OrderUpdate]) -> Vec<ExecEvent> {
+    fn process_order_updates(
+        &mut self,
+        now_ms: u64,
+        ups: &[crate::hl::types::OrderUpdate],
+    ) -> Vec<ExecEvent> {
         let mut out = Vec::new();
         for u in ups {
             let Some(i) = self.find_idx(u.order.cloid.as_deref(), Some(u.order.oid)) else {
@@ -811,14 +979,21 @@ impl<A: LiveApi> LiveExecutor<A> {
                     (_, Some(o)) => Some((o - u.order.sz).max(0.0)),
                     _ => None,
                 };
-                self.mark_done(i, r, filled, &mut out);
+                self.mark_done(now_ms, i, r, filled, &mut out);
             }
         }
         out
     }
 
-    async fn refresh_account(&mut self) -> anyhow::Result<()> {
-        let ch = self.api.clearinghouse().await?;
+    async fn refresh_account(&mut self, now_ms: u64) -> anyhow::Result<()> {
+        let ch = match self.api.clearinghouse().await {
+            Ok(ch) => ch,
+            Err(e) => {
+                self.venue_ok = false;
+                self.account_read_failures = self.account_read_failures.saturating_add(1);
+                return Err(e);
+            }
+        };
         self.available_margin = ch.withdrawable.or(Some(
             ch.margin_summary.account_value - ch.margin_summary.total_margin_used,
         ));
@@ -837,6 +1012,16 @@ impl<A: LiveApi> LiveExecutor<A> {
                 leverage: None,
             },
         });
+        self.venue_ok = true;
+        self.venue_read_ms = self.venue_read_ms.max(now_ms);
+        self.account_read_failures = 0;
+        if let Some(v) = self.venue {
+            if v.szi.abs() > self.eps() && !self.margin_safe(&v) {
+                // Unsafe settings seen: re-establish before the next entry
+                // from flat.
+                self.margin_set_ms = None;
+            }
+        }
         Ok(())
     }
 
@@ -844,7 +1029,7 @@ impl<A: LiveApi> LiveExecutor<A> {
     /// then compares [`Self::venue_position`] with the strategy position.
     pub async fn startup(&mut self, now_ms: u64) -> anyhow::Result<Vec<ExecEvent>> {
         let mut out = Vec::new();
-        self.refresh_account().await?;
+        self.refresh_account(now_ms).await?;
         // Open orders: adopt ours, handle strays.
         let open = self.api.open_orders().await?;
         for oo in &open {
@@ -901,6 +1086,7 @@ impl<A: LiveApi> LiveExecutor<A> {
             if !self.s.orders[i].done {
                 // Not open and status unknown: treat as gone.
                 self.mark_done(
+                    now_ms,
                     i,
                     DoneReason::Rejected("not open at startup".into()),
                     None,
@@ -913,6 +1099,7 @@ impl<A: LiveApi> LiveExecutor<A> {
             if let Err(e) = self.api.update_leverage_isolated(self.p.leverage).await {
                 anyhow::bail!("updateLeverage (isolated {}x) failed: {e}", self.p.leverage);
             }
+            self.margin_set_ms = Some(now_ms);
         } else {
             let v = self.venue.unwrap_or(VenuePosition {
                 szi: f64::NAN,
@@ -920,11 +1107,10 @@ impl<A: LiveApi> LiveExecutor<A> {
                 isolated: None,
                 leverage: None,
             });
-            let unsafe_margin =
-                v.isolated == Some(false) || v.leverage.is_some_and(|l| l > self.p.leverage.max(1));
+            let unsafe_margin = !self.margin_safe(&v);
             out.push(ExecEvent::Alert(if unsafe_margin {
                 format!(
-                    "position open at startup on {} margin at {}x (the bot uses isolated {}x): leverage / margin mode left unchanged, review it on the exchange",
+                    "position open at startup on {} margin at {}x (the bot uses isolated {}x): leverage / margin mode left unchanged; the bot will not add to it (exits only) — review it on the exchange",
                     if v.isolated == Some(false) { "CROSS" } else { "isolated" },
                     v.leverage.map_or("?".into(), |l| l.to_string()),
                     self.p.leverage
@@ -969,17 +1155,35 @@ impl<A: LiveApi> Executor for LiveExecutor<A> {
         Vec::new()
     }
 
-    async fn on_user_event(&mut self, _now_ms: u64, ev: UserEvent) -> Vec<ExecEvent> {
+    async fn on_user_event(&mut self, now_ms: u64, ev: UserEvent) -> Vec<ExecEvent> {
         match ev {
             UserEvent::Fills { fills, .. } => self.process_fills(&fills),
-            UserEvent::OrderUpdates(u) => self.process_order_updates(&u),
+            UserEvent::OrderUpdates(u) => self.process_order_updates(now_ms, &u),
         }
     }
 
     async fn reconcile(&mut self, now_ms: u64, force: bool) -> Vec<ExecEvent> {
         let mut out = Vec::new();
-        if let Err(e) = self.refresh_account().await {
-            tracing::warn!(error = %format!("{e:#}"), "clearinghouseState failed");
+        match self.refresh_account(now_ms).await {
+            Ok(()) => {
+                if std::mem::take(&mut self.account_read_alerted) {
+                    out.push(ExecEvent::Alert(
+                        "clearinghouseState readable again: opening orders allowed".into(),
+                    ));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), failures = self.account_read_failures, "clearinghouseState failed");
+                if self.account_read_failures >= ACCOUNT_READ_ALERT_AFTER
+                    && !self.account_read_alerted
+                {
+                    self.account_read_alerted = true;
+                    out.push(ExecEvent::Alert(format!(
+                        "clearinghouseState failed {} times in a row ({e:#}): opening orders are refused until it can be read; exits continue",
+                        self.account_read_failures
+                    )));
+                }
+            }
         }
         if force {
             match self.api.user_fills().await {
@@ -1040,7 +1244,7 @@ impl<A: LiveApi> Executor for LiveExecutor<A> {
     }
 
     fn venue_position(&self) -> Option<f64> {
-        self.venue.map(|v| v.szi)
+        self.venue().map(|v| v.szi)
     }
 
     fn order_view(&self, tag: u64) -> OrderView {
@@ -1069,7 +1273,7 @@ impl<A: LiveApi> Executor for LiveExecutor<A> {
             }
         }
         if self.p.live.flatten_on_shutdown {
-            if let Err(e) = self.refresh_account().await {
+            if let Err(e) = self.refresh_account(now_ms).await {
                 out.push(ExecEvent::Alert(format!(
                     "shutdown flatten: cannot read position ({e:#})"
                 )));

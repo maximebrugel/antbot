@@ -14,10 +14,10 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 pub const LOG_FILE_PREFIX: &str = "antbot.log";
 pub const DEFAULT_FILTER: &str = "info";
 
-/// Smallest effective `max_files` (0 aside). `tracing-appender` prunes down
-/// to `max_files - 1` files *before* reopening today's file, so with 1 a
-/// same-day restart would delete the log it is about to append to; with 2
-/// or more, today's file is the newest and always survives.
+/// Smallest effective `max_files` (0 aside): today's file and the previous
+/// one. `tracing-appender` prunes down to `max_files - 1` files *before*
+/// opening today's file, as if it were always new; see [`file_appender`]
+/// for the same-day restart case.
 pub const MIN_LOG_FILES: usize = 2;
 
 /// `log_max_files` as given to the appender: 0 (keep all) unchanged,
@@ -30,13 +30,41 @@ pub fn effective_max_files(max_files: usize) -> usize {
     }
 }
 
-/// Daily rolling file appender in `<data_dir>/logs` (`max_files` = 0 keeps
-/// every file; 1 is raised to [`MIN_LOG_FILES`], see there).
-pub fn file_appender(data_dir: &Path, max_files: usize) -> anyhow::Result<RollingFileAppender> {
+/// Name of today's (UTC) log file, as `tracing-appender` names it.
+pub fn todays_log_file_name(now_ms: u64) -> String {
+    format!(
+        "{LOG_FILE_PREFIX}.{}",
+        crate::monitor::fmt_utc_day(now_ms / 86_400_000)
+    )
+}
+
+/// `max_log_files` to give the appender. It prunes to `max - 1` files
+/// before opening today's file; when today's file already exists (same-day
+/// restart) it is reopened, not added, so one more slot is given to keep
+/// `max` files in total instead of deleting an older one needlessly.
+pub fn appender_max_files(max_files: usize, todays_file_exists: bool) -> usize {
     let max_files = effective_max_files(max_files);
+    if max_files > 0 && todays_file_exists {
+        max_files + 1
+    } else {
+        max_files
+    }
+}
+
+/// Daily rolling file appender in `<data_dir>/logs` (`max_files` = 0 keeps
+/// every file; 1 is raised to [`MIN_LOG_FILES`], see there). At startup the
+/// newest `max_files` files are kept, today's included. A process started
+/// on a day whose file already existed keeps one extra old file after its
+/// day rollovers, until it is restarted.
+pub fn file_appender(data_dir: &Path, max_files: usize) -> anyhow::Result<RollingFileAppender> {
     let log_dir = data_dir.join("logs");
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("creating log dir {}", log_dir.display()))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let today_exists = log_dir.join(todays_log_file_name(now_ms)).is_file();
+    let max_files = appender_max_files(max_files, today_exists);
     let mut b = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
         .filename_prefix(LOG_FILE_PREFIX);
@@ -156,6 +184,59 @@ mod tests {
         let s = std::fs::read_to_string(&files[0]).unwrap();
         assert!(s.contains("BEFORE_RESTART_SENTINEL"), "{s}");
         assert!(s.contains("AFTER_RESTART_SENTINEL"), "{s}");
+    }
+
+    /// Review M1 r1 finding 3: with `log_max_files = 1` (effective 2), a
+    /// same-day restart keeps the previous day's file as well as today's.
+    #[test]
+    fn same_day_restart_keeps_the_previous_file() {
+        let d = tempfile::tempdir().unwrap();
+        let logs = d.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let old = logs.join("antbot.log.2000-01-01");
+        std::fs::write(&old, "PREVIOUS_DAY\n").unwrap();
+        // Older creation time than today's file (pruning sorts by it).
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        for line in ["FIRST_START", "SAME_DAY_RESTART", "SECOND_RESTART"] {
+            let mut a = file_appender(d.path(), 1).unwrap();
+            writeln!(a, "{line}").unwrap();
+            a.flush().unwrap();
+            assert!(old.exists(), "previous file deleted after {line}");
+            assert_eq!(std::fs::read_dir(&logs).unwrap().count(), 2);
+        }
+        // With a third file present, one goes (the appender prunes by
+        // creation time): 2 files kept in total, today's among them.
+        std::fs::write(logs.join("antbot.log.1999-12-31"), "OTHER\n").unwrap();
+        {
+            let mut a = file_appender(d.path(), 1).unwrap();
+            writeln!(a, "THIRD_RESTART").unwrap();
+            a.flush().unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&logs).unwrap().count(), 2);
+        let today = logs.join(todays_log_file_name(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        ));
+        let s = std::fs::read_to_string(today).unwrap();
+        for line in [
+            "FIRST_START",
+            "SAME_DAY_RESTART",
+            "SECOND_RESTART",
+            "THIRD_RESTART",
+        ] {
+            assert!(s.contains(line), "{s}");
+        }
+    }
+
+    #[test]
+    fn appender_max_files_reserves_no_slot_for_a_reopened_file() {
+        assert_eq!(appender_max_files(0, true), 0);
+        assert_eq!(appender_max_files(1, false), 2);
+        assert_eq!(appender_max_files(1, true), 3);
+        assert_eq!(appender_max_files(30, true), 31);
+        assert_eq!(todays_log_file_name(0), "antbot.log.1970-01-01");
     }
 
     #[test]
