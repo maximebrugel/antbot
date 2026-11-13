@@ -35,9 +35,10 @@
 //!     `sizing.max_notional_usd` (+2% for entry re-quotes at a moved price)
 //!     and never above the 10 000 USD hard cap;
 //!   - margin: an existing venue position must be isolated at no more than
-//!     the bot's leverage, and before opening from flat the executor
-//!     (re-)establishes isolated leverage with `updateLeverage`; if that
-//!     fails, the order is refused.
+//!     the bot's leverage, and before every order opening from flat the
+//!     executor sends `updateLeverage` (isolated, the bot's leverage) and
+//!     only places the order once that call succeeded (no cached result:
+//!     margin settings are invisible in `clearinghouseState` while flat).
 //!
 //!   Reduce-only exits (maker ALO first, IOC taker fallback, kill /
 //!   shutdown flatten) are never blocked: they can only shrink the position.
@@ -45,7 +46,10 @@
 //!   leverage clamped to `1..=min(2, asset max)`. A position found open at
 //!   startup keeps its margin settings (they cannot be changed while it is
 //!   open); one on cross margin or above the bot's leverage is reported
-//!   loudly and becomes exit-only: no order may grow it.
+//!   loudly and becomes exit-only: no order may grow it, and the bot's
+//!   active opening orders (e.g. a restored partial entry still resting)
+//!   are canceled, at startup and on every reconciliation that still sees
+//!   the unsafe settings; a failed cancel is retried by reconciliation.
 
 use std::collections::VecDeque;
 
@@ -81,10 +85,6 @@ pub const MAX_NOTIONAL_TOLERANCE: f64 = 0.02;
 /// read taken at least this long after it finished (which then includes
 /// them in the venue position).
 pub const FILL_SETTLE_MS: u64 = 15_000;
-/// Isolated leverage is re-sent before opening from flat when the last
-/// successful `updateLeverage` is older than this (a manual change on the
-/// exchange while flat is not visible in `clearinghouseState`).
-pub const LEVERAGE_RECHECK_MS: u64 = 600_000;
 /// Consecutive failed account reads in reconciliation before an alert.
 const ACCOUNT_READ_ALERT_AFTER: u32 = 3;
 
@@ -365,9 +365,13 @@ pub struct LiveExecutor<A: LiveApi> {
     /// Consecutive failed account reads, and whether that was alerted.
     account_read_failures: u32,
     account_read_alerted: bool,
-    /// Time of the last successful isolated `updateLeverage`; reset when a
-    /// venue position shows unsafe margin settings.
+    /// Time of the last successful isolated `updateLeverage`. An opening
+    /// order from flat needs one at or after the latest account read.
     margin_set_ms: Option<u64>,
+    /// The last successful account read showed a position on unsafe margin
+    /// settings (cross, or above the bot's leverage): exit-only, the bot's
+    /// opening orders are canceled. Kept as is while reads fail.
+    margin_unsafe: bool,
 }
 
 /// `oo` (from openOrders) is our order `o`: by cloid when it has one.
@@ -407,6 +411,7 @@ impl<A: LiveApi> LiveExecutor<A> {
             account_read_failures: 0,
             account_read_alerted: false,
             margin_set_ms: None,
+            margin_unsafe: false,
         })
     }
 
@@ -570,9 +575,11 @@ impl<A: LiveApi> LiveExecutor<A> {
                     self.p.leverage
                 ));
             }
-        } else if self.margin_set_ms.is_none() {
+        } else if self.margin_set_ms.is_none_or(|t| t < self.venue_read_ms) {
+            // Flat: margin settings are invisible in clearinghouseState, so
+            // only an updateLeverage sent after the latest read counts.
             return Some(format!(
-                "isolated {}x leverage is not established: opening orders are refused",
+                "isolated {}x leverage was not set just before this entry from flat: opening orders are refused",
                 self.p.leverage
             ));
         }
@@ -656,19 +663,23 @@ impl<A: LiveApi> LiveExecutor<A> {
             // required, a failed read refuses the order.
             if let Err(e) = self.refresh_account(now_ms).await {
                 tracing::warn!(error = %format!("{e:#}"), "clearinghouseState before an opening order failed");
-            } else if self.venue.is_some_and(|v| v.szi.abs() <= self.eps())
-                && self
-                    .margin_set_ms
-                    .is_none_or(|t| now_ms.saturating_sub(t) >= LEVERAGE_RECHECK_MS)
-            {
-                // Opening from flat: (re-)establish isolated leverage first.
+            } else if self.venue.is_some_and(|v| v.szi.abs() <= self.eps()) {
+                // Opening from flat: set isolated leverage right before every
+                // such order. A cached earlier success is not trusted: the
+                // asset could have been switched to cross / higher leverage
+                // on the exchange since, which clearinghouseState does not
+                // show while flat. Counted in the action budget (after the
+                // budget check above: at most one extra action per order).
+                self.margin_set_ms = None;
+                self.action_times.push_back(now_ms);
                 match self.api.update_leverage_isolated(self.p.leverage).await {
-                    Ok(()) => self.margin_set_ms = Some(now_ms),
+                    // Sent after the read just above (never stamped before
+                    // it, should the wall clock step back).
+                    Ok(()) => self.margin_set_ms = Some(now_ms.max(self.venue_read_ms)),
                     Err(e) => {
                         if e.is_rate_limited() {
                             self.rate_limited(now_ms, "updateLeverage", &mut out);
                         }
-                        self.margin_set_ms = None;
                         let why = format!(
                             "updateLeverage (isolated {}x) before opening failed: {e}",
                             self.p.leverage
@@ -1015,14 +1026,48 @@ impl<A: LiveApi> LiveExecutor<A> {
         self.venue_ok = true;
         self.venue_read_ms = self.venue_read_ms.max(now_ms);
         self.account_read_failures = 0;
-        if let Some(v) = self.venue {
-            if v.szi.abs() > self.eps() && !self.margin_safe(&v) {
-                // Unsafe settings seen: re-establish before the next entry
-                // from flat.
-                self.margin_set_ms = None;
-            }
-        }
+        self.margin_unsafe = self
+            .venue
+            .is_some_and(|v| v.szi.abs() > self.eps() && !self.margin_safe(&v));
         Ok(())
+    }
+
+    /// Exit-only enforcement: while the venue position is on unsafe margin
+    /// settings, cancel the bot's active opening (non-reduce-only) orders,
+    /// e.g. a restored partial entry still resting, which could otherwise
+    /// keep growing the position without passing the placement checks.
+    /// The strategy gets the usual terminal `Done` (with the filled size);
+    /// a re-placed remainder is then refused by [`Self::place`], which
+    /// aborts the entry. A cancel that fails stays `cancel_requested` and is
+    /// retried by [`Executor::reconcile`]; `retry_requested` also re-sends
+    /// cancels already requested (startup: a cancel persisted from the
+    /// previous run).
+    async fn cancel_opening_orders_if_unsafe(
+        &mut self,
+        now_ms: u64,
+        retry_requested: bool,
+    ) -> Vec<ExecEvent> {
+        let mut out = Vec::new();
+        if !self.margin_unsafe {
+            return out;
+        }
+        let tags: Vec<u64> = self
+            .active()
+            .filter(|o| !o.reduce_only && (retry_requested || !o.cancel_requested))
+            .map(|o| o.tag)
+            .collect();
+        for tag in tags {
+            tracing::warn!(
+                tag,
+                "canceling an opening order: the venue position is on unsafe margin settings"
+            );
+            out.push(ExecEvent::Alert(format!(
+                "canceling opening order {tag}: the venue position is on unsafe margin settings (cross or above isolated {}x), exits only",
+                self.p.leverage
+            )));
+            out.extend(self.cancel(now_ms, tag).await);
+        }
+        out
     }
 
     /// Startup reconciliation. The caller feeds the events to the engine,
@@ -1110,7 +1155,7 @@ impl<A: LiveApi> LiveExecutor<A> {
             let unsafe_margin = !self.margin_safe(&v);
             out.push(ExecEvent::Alert(if unsafe_margin {
                 format!(
-                    "position open at startup on {} margin at {}x (the bot uses isolated {}x): leverage / margin mode left unchanged; the bot will not add to it (exits only) — review it on the exchange",
+                    "position open at startup on {} margin at {}x (the bot uses isolated {}x): leverage / margin mode left unchanged; the bot will not add to it (exits only: its opening orders are canceled) — review it on the exchange",
                     if v.isolated == Some(false) { "CROSS" } else { "isolated" },
                     v.leverage.map_or("?".into(), |l| l.to_string()),
                     self.p.leverage
@@ -1119,6 +1164,9 @@ impl<A: LiveApi> LiveExecutor<A> {
                 "position open at startup: leverage / margin mode left unchanged".into()
             }));
         }
+        // Exits only on unsafe settings: no opening order of ours may keep
+        // working (restored entries were adopted above).
+        out.extend(self.cancel_opening_orders_if_unsafe(now_ms, true).await);
         if self.s.last_funding_ms == 0 {
             self.s.last_funding_ms = now_ms;
         }
@@ -1223,6 +1271,9 @@ impl<A: LiveApi> Executor for LiveExecutor<A> {
             tracing::info!(tag, "retrying cancel");
             out.extend(self.cancel(now_ms, tag).await);
         }
+        // Exits only while the (freshly read, or last known) venue position
+        // is on unsafe margin settings: cancel opening orders not yet asked.
+        out.extend(self.cancel_opening_orders_if_unsafe(now_ms, false).await);
         // Funding payments on the coin.
         match self.api.funding_since(self.s.last_funding_ms + 1).await {
             Ok(v) => {

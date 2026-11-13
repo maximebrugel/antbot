@@ -161,6 +161,6 @@ adopt_position = true                 # manage a position found at startup (fres
 cancel_on_shutdown = true             # SIGINT / SIGTERM cancels the bot's open orders
 flatten_on_shutdown = false           # keep the position on shutdown by default
 reconcile_secs = 30                   # clearinghouseState / openOrders reconciliation period
-max_exchange_actions_per_min = 60     # client-side per-address action budget (cancels always allowed)
+max_exchange_actions_per_min = 60     # client-side per-address action budget (cancels always allowed; pre-entry updateLeverage counted)
 rate_limit_backoff_secs = 60          # pause new orders after a rate-limit answer
 expires_after_ms = 30000              # expiresAfter window on signed actions (0 = off)

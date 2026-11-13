@@ -29,11 +29,19 @@ struct Fake {
     fail_reads: Mutex<bool>,
     /// `updateLeverage` fails while set.
     fail_leverage: Mutex<bool>,
+    /// Asset margin settings (mode, leverage) in force when each order was
+    /// placed (`pos_leverage`, which a successful `updateLeverage` sets, as
+    /// on the exchange).
+    placed_settings: Mutex<Vec<Option<(String, u32)>>>,
 }
 
 impl LiveApi for Fake {
     async fn place(&self, req: &OrderRequest) -> Result<OrderStatus, ExchangeError> {
         self.placed.lock().unwrap().push(req.clone());
+        self.placed_settings
+            .lock()
+            .unwrap()
+            .push(self.pos_leverage.lock().unwrap().clone());
         self.place_replies
             .lock()
             .unwrap()
@@ -59,6 +67,7 @@ impl LiveApi for Fake {
                 body: String::new(),
             });
         }
+        *self.pos_leverage.lock().unwrap() = Some(("isolated".into(), leverage));
         Ok(())
     }
     async fn clearinghouse(&self) -> anyhow::Result<ClearinghouseState> {
@@ -1326,6 +1335,176 @@ mod kill_flatten_live {
         // The runner's mismatch check now sees the real gap.
         assert!((e.strategy_position() - (-99.0)).abs() > 1e-6);
     }
+
+    /// Review M1 r2 finding 1: restart with a partially filled entry still
+    /// resting, strategy and venue sizes matching, but the venue position on
+    /// CROSS 5x. The restored opening remainder must be canceled (retried
+    /// if the cancel fails), the strategy must stop entering, and no opening
+    /// order may reach the exchange; exits stay possible.
+    async fn restart_with_unsafe_partial_entry(cancel_fails: bool) {
+        let mut cfg = Config::default();
+        cfg.sizing.notional_usd = 200.0;
+        cfg.sizing.max_notional_usd = 300.0;
+        let new_engine = |strategy: Strategy, risk: RiskState, ledger: Ledger| {
+            Engine::new(
+                EngineParams::from_config(&cfg),
+                strategy,
+                RiskManager::new(RiskParams::from(&cfg.risk), risk),
+                ledger,
+                0,
+            )
+        };
+        let sp = || StrategyParams::from_config(&cfg, 2, 10);
+        let mut e = new_engine(Strategy::new(sp()), RiskState::default(), Ledger::default());
+        // Previous run: flat, the premium (-98 bps) opens a long entry.
+        let mut prev = exec_with(&cfg, 10, Fake::default());
+        prev.startup(T0).await.unwrap();
+        let mk = market(T0 + 1, 100.01, 101.0);
+        let cmds = e.on_market(T0 + 1, &mk, Some(4000.0));
+        pump(&mut e, &mut prev, T0 + 1, &mk, cmds).await;
+        let o = prev.state().orders[0].clone();
+        assert!(!o.reduce_only && o.sz > 1.0, "{o:?}");
+        let tag = o.tag;
+        // One lot fills.
+        let f = Fill {
+            px: o.px,
+            ..fill(Some(o.cloid), o.oid.unwrap(), 998, T0 + 2, 1.0)
+        };
+        for ev in prev
+            .on_user_event(
+                T0 + 2,
+                UserEvent::Fills {
+                    is_snapshot: false,
+                    fills: vec![f],
+                },
+            )
+            .await
+        {
+            assert!(e.on_exec(T0 + 2, ev).is_empty());
+        }
+        assert_eq!(e.strategy_position(), 1.0);
+        let saved = prev.save_state();
+        let mut e = new_engine(
+            Strategy::from_state(sp(), e.strategy.state().clone()),
+            e.risk.state().clone(),
+            e.ledger.clone(),
+        );
+
+        // Restart: 1 lot on CROSS 5x, the remainder still resting.
+        let fake = Fake::default();
+        *fake.szi.lock().unwrap() = 1.0;
+        *fake.pos_leverage.lock().unwrap() = Some(("cross".into(), 5));
+        fake.open.lock().unwrap().push(OpenOrder {
+            coin: "xyz:ANT".into(),
+            side: "B".into(),
+            limit_px: o.px,
+            sz: o.sz - 1.0,
+            oid: o.oid.unwrap(),
+            timestamp: T0 + 1,
+            orig_sz: Some(o.sz),
+            cloid: Some(o.cloid.to_string()),
+        });
+        fake.filled.lock().unwrap().insert(o.cloid.to_string(), 1.0);
+        fake.statuses
+            .lock()
+            .unwrap()
+            .insert(o.cloid.to_string(), RemoteStatus::Open);
+        if cancel_fails {
+            fake.cancel_replies
+                .lock()
+                .unwrap()
+                .push_back(Err(ExchangeError::Http {
+                    status: 503,
+                    body: String::new(),
+                }));
+        }
+        let t = T0 + 3;
+        let mut x =
+            LiveExecutor::new(LiveParams::from_config(&cfg, 2, 10), fake, Some(saved), t).unwrap();
+        let ev = x.startup(t).await.unwrap();
+        // Cancel requested at startup, not just an "exits only" alert.
+        assert_eq!(*x.api().canceled.lock().unwrap(), vec![o.cloid]);
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e, ExecEvent::Alert(a) if a.contains("exits only"))));
+        let mut cmds = Vec::new();
+        for ev in ev {
+            cmds.extend(e.on_exec(t, ev));
+        }
+        cmds.extend(e.startup(t));
+        pump(&mut e, &mut x, t, &mk, cmds).await;
+        let t = T0 + 30_000;
+        let mk = market(t, 100.01, 101.0);
+        let cmds = e.on_market(t, &mk, Some(4000.0));
+        pump(&mut e, &mut x, t, &mk, cmds).await;
+        if cancel_fails {
+            // Still resting after the failed cancel: reconciliation retries.
+            assert!(
+                x.order_view(tag)
+                    == crate::exec::OrderView::Active {
+                        cancel_requested: true
+                    }
+            );
+            let cmds: Vec<Command> = x
+                .reconcile(t, true)
+                .await
+                .into_iter()
+                .flat_map(|ev| e.on_exec(t, ev))
+                .collect();
+            pump(&mut e, &mut x, t, &mk, cmds).await;
+            assert_eq!(x.api().canceled.lock().unwrap().len(), 2);
+        }
+        // The remainder is canceled with its 1 filled lot reported.
+        assert_eq!(
+            x.order_view(tag),
+            crate::exec::OrderView::Done {
+                reason: DoneReason::Canceled,
+                filled_sz: Some(1.0)
+            }
+        );
+        // No opening order reached the exchange (a re-placed remainder is
+        // refused), the strategy holds the position, sizes still match.
+        assert!(x.api().placed.lock().unwrap().iter().all(|r| r.reduce_only));
+        assert!(e.strategy.working().is_none());
+        assert!(
+            matches!(e.strategy.phase(), Phase::InPosition),
+            "{:?}",
+            e.strategy.phase()
+        );
+        assert_eq!(x.venue_position(), Some(e.strategy_position()));
+        assert!(!e.risk.is_killed());
+        // Later ticks and reconciliations: nothing more to cancel or place.
+        let t = T0 + 60_000;
+        let mk = market(t, 100.01, 101.0);
+        let cmds = e.on_market(t, &mk, Some(4000.0));
+        pump(&mut e, &mut x, t, &mk, cmds).await;
+        x.reconcile(t, true).await;
+        assert_eq!(
+            x.api().canceled.lock().unwrap().len(),
+            if cancel_fails { 2 } else { 1 }
+        );
+        assert!(x.api().placed.lock().unwrap().iter().all(|r| r.reduce_only));
+        // Exits still go out (the converged premium closes the position).
+        let t = T0 + 90_000;
+        let mk = market(t, 101.0, 101.0);
+        let cmds = e.on_market(t, &mk, Some(4000.0));
+        pump(&mut e, &mut x, t, &mk, cmds).await;
+        let placed = x.api().placed.lock().unwrap().clone();
+        assert!(
+            !placed.is_empty() && placed.iter().all(|r| r.reduce_only && !r.is_buy),
+            "{placed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_cancels_a_restored_opening_order_on_unsafe_margin() {
+        restart_with_unsafe_partial_entry(false).await;
+    }
+
+    #[tokio::test]
+    async fn restart_retries_a_failed_cancel_of_a_restored_opening_order() {
+        restart_with_unsafe_partial_entry(true).await;
+    }
 }
 
 #[tokio::test]
@@ -1625,18 +1804,115 @@ async fn failed_update_leverage_refuses_the_entry() {
 }
 
 #[tokio::test]
-async fn isolated_leverage_is_resent_before_a_later_entry_from_flat() {
+async fn isolated_leverage_is_sent_before_every_entry_from_flat() {
     let mut x = exec(Fake::default());
     x.startup(T0).await.unwrap();
     assert_eq!(x.api().leverage_calls.lock().unwrap().len(), 1);
-    // Soon after startup: no new call.
+    // Even right after startup: the startup call is not trusted.
     x.execute(T0 + 1, vec![Command::Place(alo(1))], &m()).await;
-    assert_eq!(x.api().leverage_calls.lock().unwrap().len(), 1);
-    // Much later (a manual change while flat would be invisible): re-sent.
-    let t = T0 + LEVERAGE_RECHECK_MS + 1;
-    x.execute(t, vec![Command::Cancel { tag: 1 }], &m()).await;
-    x.execute(t, vec![Command::Place(alo(2))], &m()).await;
     assert_eq!(*x.api().leverage_calls.lock().unwrap(), vec![1, 1]);
+    x.execute(T0 + 2, vec![Command::Cancel { tag: 1 }], &m())
+        .await;
+    x.execute(T0 + 3, vec![Command::Place(alo(2))], &m()).await;
+    assert_eq!(*x.api().leverage_calls.lock().unwrap(), vec![1, 1, 1]);
+    assert_eq!(x.api().placed.lock().unwrap().len(), 2);
+    // Reduce-only exits never need it.
+    x.execute(
+        T0 + 4,
+        vec![Command::Place(intent(3, OrderKind::Alo, 1.0, true))],
+        &m(),
+    )
+    .await;
+    assert_eq!(x.api().leverage_calls.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn margin_settings_changed_while_flat_are_corrected_before_the_entry() {
+    // Review M1 r2 finding 2: startup set isolated 1x; while flat the asset
+    // is switched to CROSS 5x on the exchange (invisible in
+    // clearinghouseState, which lists no position). Within what used to be
+    // the cache interval, the next entry must first restore isolated 1x.
+    let mut x = exec(Fake::default());
+    x.startup(T0).await.unwrap();
+    assert_eq!(
+        *x.api().pos_leverage.lock().unwrap(),
+        Some(("isolated".into(), 1))
+    );
+    *x.api().pos_leverage.lock().unwrap() = Some(("cross".into(), 5));
+    let ev = x
+        .execute(T0 + 60_000, vec![Command::Place(alo(1))], &m())
+        .await;
+    assert_eq!(ev, vec![ExecEvent::Order(OrderUpdate::Resting { tag: 1 })]);
+    assert_eq!(*x.api().leverage_calls.lock().unwrap(), vec![1, 1]);
+    assert_eq!(
+        *x.api().placed_settings.lock().unwrap(),
+        vec![Some(("isolated".into(), 1))]
+    );
+    // And if that correction fails, nothing is placed.
+    x.execute(T0 + 60_001, vec![Command::Cancel { tag: 1 }], &m())
+        .await;
+    *x.api().pos_leverage.lock().unwrap() = Some(("cross".into(), 5));
+    *x.api().fail_leverage.lock().unwrap() = true;
+    let ev = x
+        .execute(T0 + 60_002, vec![Command::Place(alo(2))], &m())
+        .await;
+    assert!(refused(&ev, 2), "{ev:?}");
+    assert_eq!(x.api().placed.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn flat_entry_check_requires_leverage_set_after_the_latest_read() {
+    // The last-line check itself: an updateLeverage older than the latest
+    // account read does not authorize an entry from flat.
+    let mut x = exec(Fake::default());
+    x.startup(T0).await.unwrap();
+    let req = OrderRequest::alo(x.asset(), true, 100.0, 1.0, false, None).unwrap();
+    assert_eq!(x.opening_order_violation(OrderKind::Alo, &req), None);
+    x.reconcile(T0 + 1, false).await;
+    let why = x.opening_order_violation(OrderKind::Alo, &req).unwrap();
+    assert!(why.contains("not set just before"), "{why}");
+}
+
+#[tokio::test]
+async fn unsafe_margin_seen_mid_run_cancels_the_working_entry() {
+    // An isolated 1x position with an entry top-up resting; the position
+    // is then switched to CROSS 5x on the exchange. The next periodic
+    // reconciliation cancels the opening order; exits keep working.
+    let fake = Fake::default();
+    *fake.szi.lock().unwrap() = 1.0;
+    let mut x = exec(fake);
+    x.startup(T0).await.unwrap();
+    let ev = x
+        .execute(
+            T0 + 1,
+            vec![
+                Command::Place(intent(1, OrderKind::Alo, 1.0, false)),
+                Command::Place(intent(2, OrderKind::Alo, 1.0, true)),
+            ],
+            &m(),
+        )
+        .await;
+    assert_eq!(dones(&ev), vec![]);
+    let entry = x.state().orders[0].cloid;
+    *x.api().pos_leverage.lock().unwrap() = Some(("cross".into(), 5));
+    let ev = x.reconcile(T0 + 30_000, false).await;
+    assert_eq!(*x.api().canceled.lock().unwrap(), vec![entry]);
+    assert_eq!(dones(&ev), vec![(1, DoneReason::Canceled)]);
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, ExecEvent::Alert(a) if a.contains("exits only"))),
+        "{ev:?}"
+    );
+    // The reduce-only exit stays.
+    assert!(matches!(
+        x.order_view(2),
+        crate::exec::OrderView::Active {
+            cancel_requested: false
+        }
+    ));
+    // Nothing more to cancel on the next pass.
+    x.reconcile(T0 + 60_000, false).await;
+    assert_eq!(x.api().canceled.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
