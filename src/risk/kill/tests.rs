@@ -411,3 +411,28 @@ fn describe_is_english_and_informative() {
     let json = serde_json::to_string(&r).unwrap();
     assert!(json.contains("\"rule\":\"hit_rate\""));
 }
+
+#[test]
+fn trades_with_unknown_premium_are_not_hit_rate_misses() {
+    let mut r = RiskManager::new(
+        RiskParams::from(&Config::default().risk),
+        RiskState::default(),
+    );
+    let mut adopted = miss();
+    adopted.entry_premium_bps = None;
+    let mut external = miss();
+    external.exit_premium_bps = None;
+    for _ in 0..10 {
+        assert!(r.on_trade_closed(T0, &adopted).is_none());
+        assert!(r.on_trade_closed(T0, &external).is_none());
+    }
+    assert!(r.state().outcomes.is_empty());
+    assert_eq!(r.state().trades_closed, 20);
+    assert!(!r.is_killed());
+    // With the PnL definition every trade counts.
+    let mut p = RiskParams::from(&Config::default().risk);
+    p.hit_definition = HitDefinition::PnlPositive;
+    let mut r = RiskManager::new(p, RiskState::default());
+    r.on_trade_closed(T0, &adopted);
+    assert_eq!(r.state().outcomes.len(), 1);
+}

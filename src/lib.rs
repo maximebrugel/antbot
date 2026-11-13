@@ -11,5 +11,6 @@ pub mod mode;
 pub mod monitor;
 pub mod replay;
 pub mod risk;
+pub mod runlock;
 pub mod runner;
 pub mod strategy;

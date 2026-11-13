@@ -63,12 +63,20 @@ use serde::{Deserialize, Serialize};
 
 use super::premium::{converged, entry_signal, from_bps, to_bps, Side};
 use super::sizing::{lot_epsilon, plan_entry};
+use crate::config::HARD_CAP_NOTIONAL_USD;
 use crate::config::{Config, PremiumSource, SizingConfig};
 use crate::hl::market::MarketState;
 use crate::hl::rounding::{round_price, round_size, RoundDir, MIN_ORDER_NOTIONAL_USD};
 
 const MINUTE_MS: u64 = 60_000;
 const RECENT_DONE_KEEP: usize = 16;
+/// How long to wait for fills announced by a `Done` before giving up.
+pub const AWAIT_FILLS_MS: u64 = 15_000;
+/// Repeat period of the "stale data past the deadline" warning.
+const STALE_EXIT_WARN_MS: u64 = 300_000;
+/// Past the hold deadline with stale data, an exit IOC is still priced off
+/// the last known book as long as the last fresh view is at most this old.
+pub const STALE_EXIT_MAX_DATA_AGE_MS: u64 = 300_000;
 
 /// Strategy parameters, all durations in ms.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -228,8 +236,16 @@ pub enum OrderUpdate {
         crossed: bool,
         time_ms: u64,
     },
-    /// Terminal state.
-    Done { tag: u64, reason: DoneReason },
+    /// Terminal state. `filled_sz` is the order's total filled size as
+    /// reported by the venue when known: fills are delivered on a separate
+    /// stream and may arrive after `Done`, so the strategy waits for (and
+    /// sizes against) fills it has not seen yet.
+    Done {
+        tag: u64,
+        reason: DoneReason,
+        #[serde(default)]
+        filled_sz: Option<f64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,7 +255,12 @@ pub enum AbortReason {
     SignalGone,
     EntriesBlocked,
     Rejected,
-    Killed { flatten: bool },
+    Killed {
+        flatten: bool,
+    },
+    /// A finished entry order reported fills that never arrived in time:
+    /// stop topping up (never risk an over-sized position).
+    FillsUnconfirmed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,6 +492,17 @@ impl Step {
     }
 }
 
+/// Fills reported by a finished order's `Done` that have not been seen yet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AwaitingFill {
+    pub tag: u64,
+    pub purpose: Purpose,
+    /// Size still expected.
+    pub remaining: f64,
+    /// Give up waiting after this time.
+    pub until_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkingOrder {
     pub intent: OrderIntent,
@@ -497,6 +529,15 @@ pub struct StrategyState {
     pub available_margin_usd: Option<f64>,
     /// Set by a kill; the phase ends in `Halted` with this reason.
     pub kill_reason: Option<String>,
+    /// Fills announced by a `Done` but not received yet.
+    #[serde(default)]
+    pub awaiting_fills: Vec<AwaitingFill>,
+    /// Last "stale data past the hold deadline" warning.
+    #[serde(default)]
+    pub stale_exit_warned_ms: Option<u64>,
+    /// Time of the last fresh (non-stale) market view.
+    #[serde(default)]
+    pub last_fresh_ms: Option<u64>,
 }
 
 impl Default for StrategyState {
@@ -517,6 +558,9 @@ impl Default for StrategyState {
             entries_allowed: true,
             available_margin_usd: None,
             kill_reason: None,
+            awaiting_fills: Vec::new(),
+            stale_exit_warned_ms: None,
+            last_fresh_ms: None,
         }
     }
 }
@@ -526,6 +570,9 @@ impl Default for StrategyState {
 pub struct Strategy {
     p: StrategyParams,
     s: StrategyState,
+    /// Set at shutdown: the machine records feedback but never issues new
+    /// commands (they could not be executed any more). Not persisted.
+    suspended: bool,
 }
 
 impl Strategy {
@@ -533,6 +580,7 @@ impl Strategy {
         Self {
             p: params,
             s: StrategyState::default(),
+            suspended: false,
         }
     }
 
@@ -541,6 +589,7 @@ impl Strategy {
         Self {
             p: params,
             s: state,
+            suspended: false,
         }
     }
 
@@ -564,6 +613,26 @@ impl Strategy {
         self.s.working.as_ref()
     }
 
+    /// Stop issuing commands (graceful shutdown). Order feedback is still
+    /// recorded, so the persisted state matches what the executor did.
+    pub fn suspend(&mut self) {
+        self.suspended = true;
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.suspended
+    }
+
+    /// Size announced by finished orders of `purpose` but not received yet.
+    pub fn awaiting_fill_sz(&self, purpose: Purpose) -> f64 {
+        self.s
+            .awaiting_fills
+            .iter()
+            .filter(|a| a.purpose == purpose)
+            .map(|a| a.remaining)
+            .sum()
+    }
+
     fn eps(&self) -> f64 {
         lot_epsilon(self.p.sz_decimals)
     }
@@ -577,6 +646,9 @@ impl Strategy {
     /// Market tick.
     pub fn on_tick(&mut self, input: TickInput) -> Step {
         self.s.last_view = input.view;
+        if !input.view.stale {
+            self.s.last_fresh_ms = Some(input.view.now_ms);
+        }
         self.s.entries_allowed = input.entries_allowed;
         self.s.available_margin_usd = input.available_margin_usd;
         let mut st = Step::default();
@@ -621,12 +693,44 @@ impl Strategy {
                 {
                     w.filled += sz;
                 }
+                if let Some(t) = tag {
+                    let eps = self.eps();
+                    for a in self.s.awaiting_fills.iter_mut().filter(|a| a.tag == t) {
+                        a.remaining -= sz;
+                    }
+                    self.s.awaiting_fills.retain(|a| a.remaining > eps);
+                }
                 self.apply_fill(is_buy, px, sz, fee_usd, crossed, time_ms, &mut st);
             }
-            OrderUpdate::Done { tag, reason } => {
+            OrderUpdate::Done {
+                tag,
+                reason,
+                filled_sz,
+            } => {
                 let Some(w) = self.s.working.take_if(|w| w.intent.tag == tag) else {
                     return st; // duplicate / stale Done
                 };
+                // Fills the venue reports for this order that we have not
+                // seen yet (fills and terminal states travel on different
+                // streams). Unknown filled size after a fill / cancel / IOC
+                // expiry: assume the worst (fully filled) until fills or the
+                // timeout say otherwise.
+                let expected = match (&reason, filled_sz) {
+                    (_, Some(f)) if f.is_finite() => f.min(w.intent.sz),
+                    (DoneReason::Filled | DoneReason::Canceled | DoneReason::IocExpired, _) => {
+                        w.intent.sz
+                    }
+                    _ => 0.0,
+                };
+                let unseen = expected - w.filled;
+                if unseen > self.eps() {
+                    self.s.awaiting_fills.push(AwaitingFill {
+                        tag,
+                        purpose: w.intent.purpose,
+                        remaining: unseen,
+                        until_ms: now_ms.saturating_add(AWAIT_FILLS_MS),
+                    });
+                }
                 self.s
                     .recent_done
                     .push_back((tag, w.intent.is_buy, w.intent.purpose));
@@ -714,6 +818,7 @@ impl Strategy {
         self.s.kill_reason = None;
         // The last view may be old: act only on the next fresh tick.
         self.s.last_view.stale = true;
+        self.s.last_fresh_ms = None;
         if let Phase::Halted { .. } = self.s.phase {
             self.s.phase = if self.pos_size() > self.eps() {
                 Phase::InPosition
@@ -871,6 +976,19 @@ impl Strategy {
         purpose: Purpose,
         st: &mut Step,
     ) {
+        if self.suspended {
+            return;
+        }
+        if purpose == Purpose::Entry {
+            let committed = self.s.position.as_ref().map_or(0.0, |p| p.entry_notional)
+                + self.awaiting_fill_sz(Purpose::Entry) * px;
+            if committed + sz * px > HARD_CAP_NOTIONAL_USD * (1.0 + 1e-9) {
+                st.events.push(Event::Warning(format!(
+                    "entry order {sz} @ {px} refused: would exceed the {HARD_CAP_NOTIONAL_USD} USD hard cap ({committed:.2} USD already committed)"
+                )));
+                return;
+            }
+        }
         let intent = OrderIntent {
             tag: self.s.next_tag,
             is_buy,
@@ -897,6 +1015,9 @@ impl Strategy {
     /// filled orders end on their own (their `Done` is pending), so they are
     /// not canceled.
     fn cancel_working(&mut self, now: u64, st: &mut Step) {
+        if self.suspended {
+            return;
+        }
         let eps = self.eps();
         if let Some(w) = self.s.working.as_mut() {
             let finished = w.intent.kind == OrderKind::Ioc || w.filled + eps >= w.intent.sz;
@@ -1035,6 +1156,11 @@ impl Strategy {
 
     /// Run the machine until the phase is stable.
     fn advance(&mut self, now: u64, st: &mut Step) {
+        if self.suspended {
+            self.maybe_close_trade(now, st);
+            return;
+        }
+        self.expire_awaiting(now, st);
         for _ in 0..6 {
             let before = self.s.phase.kind();
             self.maybe_close_trade(now, st);
@@ -1047,6 +1173,26 @@ impl Strategy {
             }
             if self.s.phase.kind() == before {
                 break;
+            }
+        }
+    }
+
+    /// Drop announced fills that did not arrive in time. An entry stops
+    /// topping up (the venue may hold more than we have seen).
+    fn expire_awaiting(&mut self, now: u64, st: &mut Step) {
+        let (expired, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.s.awaiting_fills)
+            .into_iter()
+            .partition(|a| now >= a.until_ms);
+        self.s.awaiting_fills = keep;
+        for a in expired {
+            st.events.push(Event::Warning(format!(
+                "order {} reported {} more filled than received; giving up waiting for those fills (position reconciliation will catch a mismatch)",
+                a.tag, a.remaining
+            )));
+            if a.purpose == Purpose::Entry {
+                if let Phase::Entering { abort, .. } = &mut self.s.phase {
+                    abort.get_or_insert(AbortReason::FillsUnconfirmed);
+                }
             }
         }
     }
@@ -1138,6 +1284,9 @@ impl Strategy {
             return;
         };
         let eps = self.eps();
+        if self.s.working.is_none() && self.awaiting_fill_sz(Purpose::Entry) > eps {
+            return; // fills of the last entry order are still in flight
+        }
         let filled = self.s.position.as_ref().map_or(0.0, |p| p.entry_sz);
         let remaining = target_sz - filled;
         let v = self.s.last_view;
@@ -1177,7 +1326,12 @@ impl Strategy {
                 let Some(px) = self.maker_px(is_buy) else {
                     return;
                 };
-                let rem = round_size(remaining, self.p.sz_decimals, RoundDir::Down).ok();
+                // Never let the position's entry notional exceed the caps,
+                // whatever the price did since the first order.
+                let cap = self.p.sizing.max_notional_usd.min(HARD_CAP_NOTIONAL_USD);
+                let spent = self.s.position.as_ref().map_or(0.0, |p| p.entry_notional);
+                let room = ((cap - spent) / px).max(0.0);
+                let rem = round_size(remaining.min(room), self.p.sz_decimals, RoundDir::Down).ok();
                 match rem {
                     Some(sz) if sz * px >= MIN_ORDER_NOTIONAL_USD => {
                         if self.can_place(now) {
@@ -1280,7 +1434,10 @@ impl Strategy {
         if size < self.eps() {
             return;
         }
-        let taker = now >= taker_at_ms;
+        let deadline = pos.deadline_ms(self.p.max_hold_ms);
+        let stale = !self.s.last_view.usable();
+        // Stale past the deadline: only a taker exit makes sense.
+        let taker = now >= taker_at_ms || (stale && now >= deadline);
         if let Some(w) = self.s.working.as_ref() {
             if w.cancel_requested {
                 return;
@@ -1292,8 +1449,36 @@ impl Strategy {
             }
             return;
         }
-        if !self.s.last_view.usable() {
-            return;
+        if self.awaiting_fill_sz(Purpose::Exit) > self.eps() {
+            return; // the last exit order's fills are still in flight
+        }
+        if stale {
+            // Stale data. Past the hold deadline, keep closing with an IOC
+            // priced off the last known book while it is recent enough
+            // (reduce-only, slippage-capped limit: at worst it does not
+            // fill), and warn the operator either way.
+            if now < deadline {
+                return;
+            }
+            let recent = self
+                .s
+                .last_fresh_ms
+                .is_some_and(|t| now.saturating_sub(t) <= STALE_EXIT_MAX_DATA_AGE_MS);
+            if self
+                .s
+                .stale_exit_warned_ms
+                .is_none_or(|t| now.saturating_sub(t) >= STALE_EXIT_WARN_MS)
+            {
+                self.s.stale_exit_warned_ms = Some(now);
+                st.events.push(Event::Warning(if recent {
+                    format!("market data stale past the hold deadline with {size} open: closing with IOC on the last known book")
+                } else {
+                    format!("market data stale past the hold deadline with {size} open and no recent book: position held until data returns")
+                }));
+            }
+            if !recent {
+                return;
+            }
         }
         let is_buy = side.close_is_buy();
         let Ok(sz) = round_size(size, self.p.sz_decimals, RoundDir::Nearest) else {

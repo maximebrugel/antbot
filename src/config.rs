@@ -71,7 +71,7 @@ pub enum PremiumSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HitDefinition {
-    /// |premium_exit| < |premium_entry| (writeup: "taux vers 0").
+    /// |premium_exit| < |premium_entry| (writeup: "moved toward 0" rate).
     #[default]
     PremiumTowardZero,
     /// Net PnL of the trade > 0.
@@ -123,6 +123,9 @@ pub struct PaperConfig {
     /// A resting order fills when a trade prints exactly at its price
     /// ("touch"); false = only trades through the price (pessimistic queue).
     pub fill_on_touch: bool,
+    /// Queue position for touch fills: the size shown at our price when we
+    /// join the level is ahead of us and must trade first.
+    pub queue_model: bool,
 }
 
 /// Live executor (testnet / guarded mainnet).
@@ -310,7 +313,7 @@ impl Default for StrategyConfig {
             taker_fallback_window_secs: 900,
             exit_maker_timeout_secs: 600,
             taker_max_slippage_bps: 50.0,
-            premium_avg_secs: 0,
+            premium_avg_secs: 3600,
             entry_retry_cooldown_secs: 60,
             min_order_interval_ms: 1000,
             max_order_actions_per_min: 30,
@@ -388,6 +391,7 @@ impl Default for PaperConfig {
         Self {
             initial_balance_usd: 10_000.0,
             fill_on_touch: true,
+            queue_model: true,
         }
     }
 }

@@ -390,7 +390,9 @@ pub fn run(cfg: &Config, data: &ReplayData, p: &ReplayParams) -> anyhow::Result<
         )),
         RiskManager::new(RiskParams::from(&cfg.risk), RiskState::default()),
         Ledger::default(),
-        cfg.strategy.premium_avg_secs * 1000,
+        // The replay's premium already is the hourly fundingHistory mean:
+        // averaging it again would only add lag.
+        0,
     );
     let sim = PaperSim::new(PaperParams::from_config(cfg, p.sz_decimals));
     let mut res = ReplayResult {

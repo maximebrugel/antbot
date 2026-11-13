@@ -238,6 +238,20 @@ pub fn is_hit(def: HitDefinition, t: &TradeRecord) -> bool {
     }
 }
 
+/// Whether a closed trade says anything about the strategy for the hit-rate
+/// rule. With the premium definition, a trade whose entry or exit premium is
+/// unknown (a position adopted at startup, an external close without data)
+/// is not counted, neither as a hit nor as a miss.
+pub fn counts_for_hit_rate(def: HitDefinition, t: &TradeRecord) -> bool {
+    match def {
+        HitDefinition::PremiumTowardZero => {
+            t.entry_premium_bps.is_some_and(f64::is_finite)
+                && t.exit_premium_bps.is_some_and(f64::is_finite)
+        }
+        HitDefinition::PnlPositive => true,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RiskManager {
     p: RiskParams,
@@ -328,12 +342,15 @@ impl RiskManager {
 
     /// Record a closed trade and apply the hit-rate rule.
     pub fn on_trade_closed(&mut self, now_ms: u64, t: &TradeRecord) -> Option<KillOrder> {
+        self.s.trades_closed += 1;
+        if !counts_for_hit_rate(self.p.hit_definition, t) {
+            return None;
+        }
         let hit = is_hit(self.p.hit_definition, t);
         self.s.outcomes.push_back(hit);
         while self.s.outcomes.len() > self.p.hit_rate_window {
             self.s.outcomes.pop_front();
         }
-        self.s.trades_closed += 1;
         let n = self.s.outcomes.len();
         let hits = self.s.outcomes.iter().filter(|h| **h).count();
         let misses = n - hits;

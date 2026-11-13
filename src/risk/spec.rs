@@ -14,9 +14,18 @@
 //! | `max_leverage`, `margin_mode`, `only_isolated` | meta.universe[] | margin change |
 //! | `asset_id` | perpDexs + meta index | asset re-indexing |
 //!
-//! Hyperliquid's meta has no separate "halted" flag. A halted or delisted
-//! HIP-3 asset shows up as `isDelisted`. If the coin disappears from meta, the
-//! caller reports it with [`crate::risk::kill::RiskManager::on_spec_unavailable`].
+//! Hyperliquid's meta has no separate "halted" flag, and the HIP-3 docs do
+//! not say how a `haltTrading` asset appears in `meta`. Checked empirically
+//! (read-only `metaAndAssetCtxs {"dex":"xyz"}`, 2026-11-13): every one of the
+//! 21 settled xyz assets (e.g. `xyz:URANIUM`, `xyz:VIX`, `xyz:SNAP`) is
+//! flagged `isDelisted: true`, with `openInterest` 0, `dayNtlVlm` 0 and
+//! `impactPxs`, `midPx`, `premium` all null (mark = oracle, frozen). So a
+//! halted asset is watched as `isDelisted`. The meta poll runs in every mode
+//! (paper included). Independently, a market without impact prices yields no
+//! premium, so nothing is entered on it, and in live mode a position settled by
+//! a halt is also caught by the position-mismatch check. If the coin
+//! disappears from meta, the caller reports it with
+//! [`crate::risk::kill::RiskManager::on_spec_unavailable`].
 
 use serde::{Deserialize, Serialize};
 

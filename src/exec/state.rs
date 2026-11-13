@@ -71,6 +71,10 @@ pub struct BotState {
     /// Executor-specific state (paper account and orders / live order map).
     #[serde(default)]
     pub executor: serde_json::Value,
+    /// Premium rolling-mean samples (slot start ms, premium bps), so a
+    /// restart does not restart the averaging warm-up.
+    #[serde(default)]
+    pub premium_samples: Vec<(u64, f64)>,
 }
 
 impl BotState {
@@ -134,6 +138,7 @@ mod tests {
             strategy: StrategyState::default(),
             ledger: Ledger::default(),
             executor: serde_json::json!({"orders": []}),
+            premium_samples: vec![(1, 2.0)],
         };
         st.ledger.push_equity(5, 1.5);
         st.save(&p).unwrap();

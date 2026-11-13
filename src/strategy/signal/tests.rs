@@ -92,8 +92,20 @@ fn fill(s: &mut Strategy, now: u64, o: &OrderIntent, px: f64, sz: f64) -> Step {
     )
 }
 
+/// `Done` reporting exactly the fills the strategy has already seen.
 fn done(s: &mut Strategy, now: u64, tag: u64, reason: DoneReason) -> Step {
-    s.on_order_update(now, OrderUpdate::Done { tag, reason })
+    let filled_sz = s
+        .working()
+        .filter(|w| w.intent.tag == tag)
+        .map(|w| w.filled);
+    s.on_order_update(
+        now,
+        OrderUpdate::Done {
+            tag,
+            reason,
+            filled_sz,
+        },
+    )
 }
 
 /// Enter a short at `T0` (premium +60 bps), fully filled at the ask.
@@ -798,4 +810,164 @@ fn market_view_from_market_state() {
     assert!(!v.stale);
     let v = MarketView::from_market(&m, T0 + 20 * S, PremiumSource::Impact, 15_000);
     assert!(v.stale);
+}
+
+// ------------------------------------------------- late fills / shutdown
+
+fn big_params() -> StrategyParams {
+    let mut cfg = Config::default();
+    cfg.sizing.notional_usd = 10_000.0;
+    StrategyParams::from_config(&cfg, 2, 10)
+}
+
+fn long_view(now: u64, bid: f64) -> MarketView {
+    view(now, Some(-100.0), bid, bid + 0.02)
+}
+
+/// Review finding: the cancel answer arrives before the fill that happened
+/// just before the cancel. The requote must not be sized without it.
+#[test]
+fn fill_after_cancel_ack_does_not_oversize_the_entry() {
+    let mut s = Strategy::new(big_params());
+    let st = tick_full(&mut s, long_view(T0, 100.0), true);
+    let o1 = placed(&st)[0];
+    assert_eq!(o1.sz, 100.0);
+    s.on_order_update(T0, OrderUpdate::Resting { tag: o1.tag });
+    let st = tick_full(&mut s, long_view(T0 + 30 * S, 100.1), true);
+    assert_eq!(cancels(&st), vec![o1.tag]);
+    // Cancel acknowledged: the venue says 99 filled, we have seen none.
+    let st = s.on_order_update(
+        T0 + 30 * S + 100,
+        OrderUpdate::Done {
+            tag: o1.tag,
+            reason: DoneReason::Canceled,
+            filled_sz: Some(99.0),
+        },
+    );
+    assert!(placed(&st).is_empty(), "{st:?}");
+    assert_eq!(s.awaiting_fill_sz(Purpose::Entry), 99.0);
+    let st = tick_full(&mut s, long_view(T0 + 32 * S, 100.1), true);
+    assert!(placed(&st).is_empty(), "must wait for the in-flight fills");
+    // The late fill arrives: only the remainder is quoted, and at the new
+    // (higher) bid the notional cap trims it to 0.99 (9900 + 0.99 * 100.1).
+    let st = fill(&mut s, T0 + 33 * S, &o1, 100.0, 99.0);
+    assert_eq!(s.awaiting_fill_sz(Purpose::Entry), 0.0);
+    let o2 = placed(&st)[0];
+    assert_eq!(o2.px, 100.1);
+    assert!((o2.sz - 0.99).abs() < 1e-9, "{o2:?}");
+    fill(&mut s, T0 + 35 * S, &o2, o2.px, o2.sz);
+    let p = s.position().unwrap();
+    assert!((p.size - 99.99).abs() < 1e-9, "{p:?}");
+    assert!(p.entry_notional <= HARD_CAP_NOTIONAL_USD + 1e-6);
+}
+
+/// Unknown filled size on a cancel: assume the worst, stop topping up after
+/// the wait if the fills never come.
+#[test]
+fn unknown_fill_size_after_cancel_ends_the_entry() {
+    let mut s = Strategy::new(big_params());
+    let o1 = placed(&tick_full(&mut s, long_view(T0, 100.0), true))[0];
+    tick_full(&mut s, long_view(T0 + 30 * S, 100.1), true);
+    s.on_order_update(
+        T0 + 30 * S,
+        OrderUpdate::Done {
+            tag: o1.tag,
+            reason: DoneReason::Canceled,
+            filled_sz: None,
+        },
+    );
+    assert!(placed(&tick_full(&mut s, long_view(T0 + 40 * S, 100.1), true)).is_empty());
+    let st = tick_full(&mut s, long_view(T0 + 30 * S + AWAIT_FILLS_MS, 100.1), true);
+    assert!(placed(&st).is_empty());
+    assert!(st.events.iter().any(|e| matches!(
+        e,
+        Event::EntryAborted {
+            reason: AbortReason::FillsUnconfirmed
+        }
+    )));
+    assert_eq!(s.phase().kind(), PhaseKind::Flat);
+}
+
+/// An IOC `Filled` answer before its fills: no second IOC until they come.
+#[test]
+fn exit_waits_for_ioc_fills_reported_by_done() {
+    let mut s = strat();
+    short_in_position(&mut s);
+    let deadline = T0 + S + params().max_hold_ms;
+    let t = deadline - params().taker_fallback_window_ms;
+    tick(&mut s, t - 1, 60.0); // maker exit
+    let st = tick(&mut s, t, 60.0); // taker time: cancel the ALO
+    let alo = cancels(&st)[0];
+    done(&mut s, t, alo, DoneReason::Canceled);
+    let ioc = placed(&tick(&mut s, t + 2 * S, 60.0))[0];
+    assert_eq!(ioc.kind, OrderKind::Ioc);
+    s.on_order_update(
+        t + 2 * S,
+        OrderUpdate::Done {
+            tag: ioc.tag,
+            reason: DoneReason::Filled,
+            filled_sz: Some(ioc.sz),
+        },
+    );
+    assert!(placed(&tick(&mut s, t + 4 * S, 60.0)).is_empty());
+    let st = fill(&mut s, t + 5 * S, &ioc, ioc.px, ioc.sz);
+    assert!(closed(&st).is_some());
+}
+
+#[test]
+fn suspended_strategy_issues_no_commands() {
+    let mut s = strat();
+    let o = placed(&tick(&mut s, T0, 60.0))[0];
+    s.suspend();
+    // Shutdown cancels the entry: no re-quote, nothing left working.
+    let st = done(&mut s, T0 + S, o.tag, DoneReason::Canceled);
+    assert!(st.commands.is_empty(), "{st:?}");
+    assert!(s.working().is_none());
+    assert!(tick(&mut s, T0 + 2 * S, 60.0).commands.is_empty());
+    assert!(s.on_kill(T0 + 3 * S, true, "k").commands.is_empty());
+    // Resumed from the persisted state: quotes again.
+    let mut r = Strategy::from_state(params(), s.state().clone());
+    r.resume(T0 + 4 * S);
+}
+
+#[test]
+fn stale_data_past_the_deadline_still_exits_with_ioc() {
+    let mut s = strat();
+    short_in_position(&mut s);
+    let deadline = T0 + S + params().max_hold_ms;
+    let mut v = view(deadline - 2 * H, Some(60.0), BID, ASK);
+    v.stale = true;
+    // Stale before the deadline: wait.
+    assert!(tick_full(&mut s, v, true).commands.is_empty());
+    v.now_ms = deadline - 60 * S;
+    assert!(tick_full(&mut s, v, true).commands.is_empty());
+    // Last fresh data hours old: hold, but warn.
+    v.now_ms = deadline + S;
+    let st = tick_full(&mut s, v, true);
+    assert!(st.commands.is_empty(), "{st:?}");
+    assert!(st
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::Warning(w) if w.contains("no recent book"))));
+    // Fresh data returns briefly: IOC, which expires unfilled.
+    let st = tick(&mut s, deadline + 2 * S, 60.0);
+    let o = placed(&st)[0];
+    assert_eq!(o.kind, OrderKind::Ioc);
+    done(&mut s, deadline + 2 * S, o.tag, DoneReason::IocExpired);
+    // Stale again shortly after: IOC on the last book (the warning is
+    // throttled to one per 5 min).
+    v.now_ms = deadline + 60 * S;
+    let st = tick_full(&mut s, v, true);
+    let o = placed(&st);
+    assert_eq!(o.len(), 1, "{st:?}");
+    assert_eq!(o[0].kind, OrderKind::Ioc);
+    assert!(o[0].reduce_only && o[0].is_buy);
+    assert!(st.events.is_empty(), "{st:?}");
+    done(&mut s, deadline + 60 * S, o[0].tag, DoneReason::IocExpired);
+    v.now_ms = deadline + 5 * M + 2 * S;
+    let st = tick_full(&mut s, v, true);
+    assert_eq!(placed(&st).len(), 1, "{st:?}");
+    assert!(st.events.iter().any(
+        |e| matches!(e, Event::Warning(w) if w.contains("closing with IOC on the last known book"))
+    ));
 }

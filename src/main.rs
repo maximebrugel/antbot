@@ -208,6 +208,16 @@ fn reset_kill(cfg: &Config, data_dir: Option<PathBuf>, confirm: bool) -> anyhow:
             k.message
         );
     }
+    // A running bot keeps its kill in memory and rewrites the risk state:
+    // a reset now would be silently undone.
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    if let Some(l) = antbot::runlock::held(dir, antbot::hl::market::now_ms()) {
+        anyhow::bail!(
+            "antbot is running on this data dir (pid {}, mode {}): stop it before reset-kill",
+            l.pid,
+            l.mode
+        );
+    }
     let cleared = antbot::risk::kill::reset_state(&mut st);
     st.save(&path)?;
     if let Some(k) = cleared {

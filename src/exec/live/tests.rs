@@ -21,6 +21,8 @@ struct Fake {
     funding: Mutex<Vec<(u64, f64)>>,
     /// Coin of the fake position (default xyz:ANT).
     pos_coin: Mutex<Option<String>>,
+    /// Filled size reported by orderStatus, by cloid.
+    filled: Mutex<HashMap<String, f64>>,
 }
 
 impl LiveApi for Fake {
@@ -96,14 +98,18 @@ impl LiveApi for Fake {
     async fn user_fills(&self) -> anyhow::Result<Vec<Fill>> {
         Ok(self.fills.lock().unwrap().clone())
     }
-    async fn order_status(&self, cloid: Cloid) -> anyhow::Result<RemoteStatus> {
-        Ok(self
-            .statuses
-            .lock()
-            .unwrap()
-            .get(&cloid.to_string())
-            .cloned()
-            .unwrap_or(RemoteStatus::Unknown))
+    async fn order_status(&self, cloid: Cloid) -> anyhow::Result<RemoteOrder> {
+        let key = cloid.to_string();
+        Ok(RemoteOrder {
+            status: self
+                .statuses
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .unwrap_or(RemoteStatus::Unknown),
+            filled_sz: self.filled.lock().unwrap().get(&key).copied(),
+        })
     }
     async fn funding_since(&self, start_ms: u64) -> anyhow::Result<Vec<(u64, f64)>> {
         Ok(self
@@ -165,7 +171,7 @@ fn m() -> MarketState {
 fn dones(ev: &[ExecEvent]) -> Vec<(u64, DoneReason)> {
     ev.iter()
         .filter_map(|e| match e {
-            ExecEvent::Order(OrderUpdate::Done { tag, reason }) => Some((*tag, reason.clone())),
+            ExecEvent::Order(OrderUpdate::Done { tag, reason, .. }) => Some((*tag, reason.clone())),
             _ => None,
         })
         .collect()
@@ -566,4 +572,223 @@ async fn other_coin_position_on_the_dex_is_ignored() {
     assert_eq!(e.venue_position(), Some(0.0));
     // Flat on our coin: isolated leverage is set.
     assert_eq!(*e.api().leverage_calls.lock().unwrap(), vec![1]);
+}
+
+// ------------------------------------------- review: shutdown / unknown tags
+
+mod shutdown_regression {
+    use super::*;
+    use crate::engine::{Engine, EngineParams};
+    use crate::exec::state::Ledger;
+    use crate::exec::OrderView;
+    use crate::risk::{RiskManager, RiskParams, RiskState};
+    use crate::strategy::premium::Side;
+    use crate::strategy::signal::{
+        MarketView, Phase, Strategy, StrategyParams, StrategyState, TickInput,
+    };
+
+    fn sparams() -> StrategyParams {
+        StrategyParams::from_config(&Config::default(), 2, 10)
+    }
+
+    fn engine(state: Option<StrategyState>) -> Engine {
+        let cfg = Config::default();
+        let strat = match state {
+            Some(s) => Strategy::from_state(sparams(), s),
+            None => Strategy::new(sparams()),
+        };
+        Engine::new(
+            EngineParams::from_config(&cfg),
+            strat,
+            RiskManager::new(RiskParams::from(&cfg.risk), RiskState::default()),
+            Ledger::default(),
+            0,
+        )
+    }
+
+    fn view(now: u64, prem: f64) -> TickInput {
+        TickInput {
+            view: MarketView {
+                now_ms: now,
+                premium_bps: Some(prem),
+                best_bid: Some(100.0),
+                best_ask: Some(100.02),
+                stale: false,
+            },
+            entries_allowed: true,
+            available_margin_usd: None,
+        }
+    }
+
+    /// Run commands through the executor until quiet (like runner::pump).
+    async fn pump(e: &mut Engine, x: &mut LiveExecutor<Fake>, now: u64, mut cmds: Vec<Command>) {
+        for _ in 0..10 {
+            if cmds.is_empty() {
+                return;
+            }
+            let evs = x.execute(now, std::mem::take(&mut cmds), &m()).await;
+            for ev in evs {
+                cmds.extend(e.on_exec(now, ev));
+            }
+        }
+        panic!("did not settle");
+    }
+
+    /// Review finding 1: shutdown while exiting, restart, kill -> the
+    /// flatten orders are sent (the strategy is not left waiting).
+    #[tokio::test]
+    async fn shutdown_while_exiting_then_restart_and_kill_flattens() {
+        let mut e = engine(None);
+        e.strategy
+            .adopt_position(Side::Short, 24.0, 100.0, T0)
+            .unwrap();
+        let fake = Fake::default();
+        *fake.szi.lock().unwrap() = -24.0;
+        let mut x = exec(fake);
+        // Converged: reduce-only maker exit resting.
+        let st = e.strategy.on_tick(view(T0 + 60_000, 2.0));
+        assert_eq!(st.commands.len(), 1, "{st:?}");
+        pump(&mut e, &mut x, T0 + 60_000, st.commands).await;
+        assert!(matches!(e.strategy.phase(), Phase::Exiting { .. }));
+        let tag = e.strategy.working().unwrap().intent.tag;
+        let cloid = x.state().orders[0].cloid.to_string();
+        x.api
+            .statuses
+            .lock()
+            .unwrap()
+            .insert(cloid.clone(), RemoteStatus::Canceled("canceled".into()));
+        x.api.filled.lock().unwrap().insert(cloid, 0.0);
+
+        // Graceful shutdown: cancel, the strategy must not re-quote.
+        let now = T0 + 120_000;
+        e.suspend();
+        let evs = x.shutdown(now, &m()).await;
+        assert_eq!(dones(&evs), vec![(tag, DoneReason::Canceled)]);
+        for ev in evs {
+            assert!(
+                e.on_exec(now, ev).is_empty(),
+                "suspended strategy issued commands"
+            );
+        }
+        assert!(e.strategy.working().is_none());
+        let saved_strategy = e.strategy.state().clone();
+        let saved_exec = x.save_state();
+
+        // Restart.
+        let fake = Fake::default();
+        *fake.szi.lock().unwrap() = -24.0;
+        let mut x = LiveExecutor::new(params(), fake, Some(saved_exec), now + 1_000).unwrap();
+        let mut e = engine(Some(saved_strategy));
+        let evs = x.startup(now + 1_000).await.unwrap();
+        let mut cmds = Vec::new();
+        for ev in evs {
+            cmds.extend(e.on_exec(now + 1_000, ev));
+        }
+        cmds.extend(e.startup(now + 1_000));
+        pump(&mut e, &mut x, now + 1_000, cmds).await;
+        assert!(heal_working_cmds(&mut e, &x, now + 1_000).is_empty());
+
+        // Kill with flatten: orders go out, IOC after the maker timeout.
+        let placed_before = x.api.placed.lock().unwrap().len();
+        let cmds = e.manual_kill_with(now + 2_000, "test", true);
+        pump(&mut e, &mut x, now + 2_000, cmds).await;
+        let mut t = now + 2_000;
+        while t < now + 10 * 60_000 {
+            t += 1_000;
+            let st = e.strategy.on_tick(view(t, 60.0));
+            let cmds = st.commands;
+            pump(&mut e, &mut x, t, cmds).await;
+        }
+        let placed = x.api.placed.lock().unwrap();
+        assert!(
+            placed.len() > placed_before,
+            "no flatten order after restart"
+        );
+        assert!(placed[placed_before..].iter().all(|r| r.reduce_only));
+    }
+
+    /// A state persisted by the old code: the working order was never sent
+    /// and its cancel is already "requested". The runner's self-healing
+    /// resolves it and the kill flatten proceeds.
+    #[tokio::test]
+    async fn unknown_working_order_is_healed() {
+        let mut e = engine(None);
+        e.strategy
+            .adopt_position(Side::Short, 24.0, 100.0, T0)
+            .unwrap();
+        let st = e.strategy.on_tick(view(T0 + 60_000, 2.0));
+        assert_eq!(st.commands.len(), 1); // dropped: never executed
+        e.strategy.on_kill(T0 + 61_000, true, "test");
+        // Taker time after the kill's maker window: cancel the maker exit
+        // (dropped as well).
+        let st = e.strategy.on_tick(view(T0 + 200_000, 60.0));
+        assert_eq!(st.commands.len(), 1, "{st:?}");
+        assert!(e.strategy.working().unwrap().cancel_requested);
+        let tag = e.strategy.working().unwrap().intent.tag;
+
+        let fake = Fake::default();
+        *fake.szi.lock().unwrap() = -24.0;
+        let mut x = exec(fake);
+        assert_eq!(x.order_view(tag), OrderView::Unknown);
+        // A cancel for an unknown tag is answered too.
+        let evs = x
+            .execute(T0 + 201_000, vec![Command::Cancel { tag }], &m())
+            .await;
+        assert!(matches!(&dones(&evs)[..], [(t, DoneReason::Rejected(_))] if *t == tag));
+        assert!(x.api.canceled.lock().unwrap().is_empty());
+
+        // The runner's healing settles the strategy order; the next tick
+        // flattens with an IOC.
+        let cmds = heal_working_cmds(&mut e, &x, T0 + 201_000);
+        assert!(e.strategy.working().is_none() || !cmds.is_empty());
+        pump(&mut e, &mut x, T0 + 201_000, cmds).await;
+        let mut t = T0 + 201_000;
+        while t < T0 + 10 * 60_000 {
+            t += 1_000;
+            let st = e.strategy.on_tick(view(t, 60.0));
+            let cmds = st.commands;
+            pump(&mut e, &mut x, t, cmds).await;
+        }
+        assert!(
+            !x.api.placed.lock().unwrap().is_empty(),
+            "kill flatten never ran"
+        );
+    }
+
+    fn heal_working_cmds(e: &mut Engine, x: &LiveExecutor<Fake>, now: u64) -> Vec<Command> {
+        crate::runner::heal_working(e, x, now)
+    }
+
+    /// Cancel of a finished order repeats its terminal state.
+    #[tokio::test]
+    async fn cancel_of_a_finished_order_repeats_done() {
+        let mut x = exec(Fake::default());
+        x.execute(T0, vec![Command::Place(alo(1))], &m()).await;
+        let cloid = x.state().orders[0].cloid.to_string();
+        x.api.filled.lock().unwrap().insert(cloid, 0.4);
+        let evs = x
+            .execute(T0 + 1, vec![Command::Cancel { tag: 1 }], &m())
+            .await;
+        assert!(evs.contains(&ExecEvent::Order(OrderUpdate::Done {
+            tag: 1,
+            reason: DoneReason::Canceled,
+            filled_sz: Some(0.4),
+        })));
+        assert_eq!(
+            x.order_view(1),
+            OrderView::Done {
+                reason: DoneReason::Canceled,
+                filled_sz: Some(0.4)
+            }
+        );
+        let evs = x
+            .execute(T0 + 2, vec![Command::Cancel { tag: 1 }], &m())
+            .await;
+        assert_eq!(dones(&evs), vec![(1, DoneReason::Canceled)]);
+        assert_eq!(
+            x.api.canceled.lock().unwrap().len(),
+            1,
+            "no second cancel sent"
+        );
+    }
 }

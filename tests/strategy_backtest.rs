@@ -116,6 +116,7 @@ fn replay(params: StrategyParams, px_at: &HashMap<u64, f64>) -> Vec<TradeRecord>
                 OrderUpdate::Done {
                     tag: o.tag,
                     reason: DoneReason::Filled,
+                    filled_sz: None,
                 },
             ] {
                 let st = s.on_order_update(h, upd);
@@ -290,6 +291,7 @@ fn kill_order_drives_strategy_cancel_and_flatten() {
         OrderUpdate::Done {
             tag: o.tag,
             reason: DoneReason::Filled,
+            filled_sz: None,
         },
     );
     risk.on_equity(t0, 0.0);

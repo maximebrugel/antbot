@@ -12,16 +12,22 @@
 //!   - a public trade prints *through* our price (a trade below our bid /
 //!     above our ask): filled up to the trade size;
 //!   - a public trade prints exactly *at* our price with the aggressor on the
-//!     other side (`fill_on_touch`, default true): filled up to the trade
-//!     size. With `fill_on_touch = false` only trades through count
-//!     (pessimistic: assumes we are last in the queue).
+//!     other side (`fill_on_touch`, default true). With `queue_model`
+//!     (default true) the order joins the back of its price level: the size
+//!     shown at our price when we placed is ahead of us, trades at our price
+//!     consume that queue first and only the excess fills us. The queue also
+//!     shrinks to the level's current size when the level gets smaller
+//!     (cancels ahead of us are assumed). With `fill_on_touch = false` only
+//!     trades through count (pessimistic: always last in the queue).
 //!
 //!   Only trades stamped at or after the order's placement are used, and
 //!   trades are de-duplicated by `tid` (the ws re-sends a snapshot of
 //!   recent trades on every resubscription).
 //! * **IOC (taker)**: walks the current book depth up to the limit price,
 //!   one fill per level at the level price, taker fee; the unfilled
-//!   remainder ends as `IocExpired`.
+//!   remainder ends as `IocExpired`. Depth taken by an IOC is remembered
+//!   until the next book update, so a retry does not fill twice against the
+//!   same liquidity.
 //! * **Reduce-only**: capped to the open position; with no position to
 //!   reduce the order is canceled (like the exchange's reduceOnlyCanceled).
 //! * **Funding**: settled at each UTC hour boundary on the open position at
@@ -36,7 +42,7 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ExecEvent, Executor};
+use super::{ExecEvent, Executor, OrderView};
 use crate::config::Config;
 use crate::hl::market::MarketState;
 use crate::hl::types::{Level, WsTrade};
@@ -53,6 +59,8 @@ pub struct PaperParams {
     pub maker_rate: f64,
     pub taker_rate: f64,
     pub fill_on_touch: bool,
+    /// Track the queue ahead of a resting order at its price level.
+    pub queue_model: bool,
     pub sz_decimals: u32,
     pub initial_balance_usd: f64,
     pub leverage: u32,
@@ -66,6 +74,7 @@ impl PaperParams {
             maker_rate: cfg.fees.maker_rate,
             taker_rate: cfg.fees.taker_rate,
             fill_on_touch: cfg.paper.fill_on_touch,
+            queue_model: cfg.paper.queue_model,
             sz_decimals,
             initial_balance_usd: cfg.paper.initial_balance_usd,
             leverage: cfg.sizing.leverage.max(1),
@@ -84,6 +93,9 @@ pub struct PaperOrder {
     pub filled: f64,
     pub reduce_only: bool,
     pub placed_ms: u64,
+    /// Size ahead of us at our price level (queue model).
+    #[serde(default)]
+    pub queue_ahead: f64,
 }
 
 impl PaperOrder {
@@ -170,14 +182,30 @@ pub struct PaperSim {
     /// Receive time of the last book used for cross fills (a book is used
     /// once, so ctx-only updates do not re-fill against the same depth).
     last_book_recv_ms: Option<u64>,
+    /// Depth already taken by IOCs from the book received at `.0`:
+    /// (is a buy, level px, size taken).
+    ioc_taken: (Option<u64>, Vec<(bool, f64, f64)>),
 }
 
 fn same_px(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0)
 }
 
-fn done(tag: u64, reason: DoneReason) -> ExecEvent {
-    ExecEvent::Order(OrderUpdate::Done { tag, reason })
+fn done(tag: u64, reason: DoneReason, filled_sz: f64) -> ExecEvent {
+    ExecEvent::Order(OrderUpdate::Done {
+        tag,
+        reason,
+        filled_sz: Some(filled_sz),
+    })
+}
+
+/// Size shown on our side of the book at exactly `px`.
+fn level_size(m: &MarketState, is_buy: bool, px: f64) -> f64 {
+    let side = if is_buy { &m.bids } else { &m.asks };
+    side.iter()
+        .filter(|l| same_px(l.px, px))
+        .map(|l| l.sz)
+        .sum()
 }
 
 impl PaperSim {
@@ -190,6 +218,7 @@ impl PaperSim {
             p,
             s,
             last_book_recv_ms: None,
+            ioc_taken: (None, Vec::new()),
         }
     }
 
@@ -275,11 +304,28 @@ impl PaperSim {
     pub fn cancel(&mut self, tag: u64) -> Vec<ExecEvent> {
         match self.s.orders.iter().position(|o| o.tag == tag) {
             Some(i) => {
-                self.s.orders.remove(i);
-                vec![done(tag, DoneReason::Canceled)]
+                let o = self.s.orders.remove(i);
+                vec![done(tag, DoneReason::Canceled, o.filled)]
             }
-            // Already filled / done: the Done was sent then.
-            None => Vec::new(),
+            // Never placed, or already finished (its Done was sent then and
+            // fills are synchronous here): answer anyway so a strategy that
+            // missed the Done cannot wait forever. A duplicate is ignored.
+            None => vec![done(
+                tag,
+                DoneReason::Rejected("order unknown to the executor".into()),
+                0.0,
+            )],
+        }
+    }
+
+    /// The executor's view of an order (see [`OrderView`]).
+    pub fn order_view(&self, tag: u64) -> OrderView {
+        if self.s.orders.iter().any(|o| o.tag == tag) {
+            OrderView::Active {
+                cancel_requested: false,
+            }
+        } else {
+            OrderView::Unknown
         }
     }
 
@@ -289,6 +335,7 @@ impl PaperSim {
             return vec![done(
                 o.tag,
                 DoneReason::Rejected(format!("invalid order {} @ {}", o.sz, o.px)),
+                0.0,
             )];
         }
         let mut sz = o.sz;
@@ -298,6 +345,7 @@ impl PaperSim {
                 return vec![done(
                     o.tag,
                     DoneReason::Rejected("reduce-only order with nothing to reduce".into()),
+                    0.0,
                 )];
             }
             sz = sz.min(cap);
@@ -305,10 +353,10 @@ impl PaperSim {
         match o.kind {
             OrderKind::Alo => {
                 let (Some(bid), Some(ask)) = (m.best_bid, m.best_ask) else {
-                    return vec![done(o.tag, DoneReason::Rejected("no book".into()))];
+                    return vec![done(o.tag, DoneReason::Rejected("no book".into()), 0.0)];
                 };
                 if !m.book_fresh(now_ms, self.p.stale_ms) {
-                    return vec![done(o.tag, DoneReason::Rejected("book stale".into()))];
+                    return vec![done(o.tag, DoneReason::Rejected("book stale".into()), 0.0)];
                 }
                 let crosses = if o.is_buy {
                     o.px >= ask.px
@@ -316,8 +364,13 @@ impl PaperSim {
                     o.px <= bid.px
                 };
                 if crosses {
-                    return vec![done(o.tag, DoneReason::PostOnlyRejected)];
+                    return vec![done(o.tag, DoneReason::PostOnlyRejected, 0.0)];
                 }
+                let queue_ahead = if self.p.queue_model {
+                    level_size(m, o.is_buy, o.px)
+                } else {
+                    0.0
+                };
                 self.s.orders.push(PaperOrder {
                     tag: o.tag,
                     is_buy: o.is_buy,
@@ -326,6 +379,7 @@ impl PaperSim {
                     filled: 0.0,
                     reduce_only: o.reduce_only,
                     placed_ms: now_ms,
+                    queue_ahead,
                 });
                 vec![ExecEvent::Order(OrderUpdate::Resting { tag: o.tag })]
             }
@@ -335,6 +389,9 @@ impl PaperSim {
                 } else {
                     m.bids.clone()
                 };
+                if self.ioc_taken.0 != m.book_recv_ms {
+                    self.ioc_taken = (m.book_recv_ms, Vec::new());
+                }
                 let mut out = Vec::new();
                 let mut rem = sz;
                 for l in levels {
@@ -346,11 +403,19 @@ impl PaperSim {
                     if !ok || rem < eps {
                         break;
                     }
-                    let q = l.sz.min(rem);
+                    let taken: f64 = self
+                        .ioc_taken
+                        .1
+                        .iter()
+                        .filter(|(b, px, _)| *b == o.is_buy && same_px(*px, l.px))
+                        .map(|(_, _, q)| q)
+                        .sum();
+                    let q = (l.sz - taken).max(0.0).min(rem);
                     if q < eps {
                         continue;
                     }
                     rem -= q;
+                    self.ioc_taken.1.push((o.is_buy, l.px, q));
                     out.push(self.fill_events(o.tag, o.is_buy, l.px, q, true, now_ms));
                 }
                 let reason = if rem < eps {
@@ -358,7 +423,7 @@ impl PaperSim {
                 } else {
                     DoneReason::IocExpired
                 };
-                out.push(done(o.tag, reason));
+                out.push(done(o.tag, reason, sz - rem));
                 out
             }
         }
@@ -381,12 +446,13 @@ impl PaperSim {
             out.push(self.fill_events(tag, is_buy, px, q, false, time_ms));
         }
         let o = &self.s.orders[i];
+        let filled = o.filled;
         if o.remaining() < eps {
             self.s.orders.remove(i);
-            out.push(done(tag, DoneReason::Filled));
+            out.push(done(tag, DoneReason::Filled, filled));
         } else if reduce_only && self.reduce_cap(is_buy) < eps {
             self.s.orders.remove(i);
-            out.push(done(tag, DoneReason::Canceled));
+            out.push(done(tag, DoneReason::Canceled, filled));
         }
     }
 
@@ -398,6 +464,15 @@ impl PaperSim {
             return out;
         }
         self.last_book_recv_ms = m.book_recv_ms;
+        if self.p.queue_model {
+            // The queue ahead cannot exceed what the level now shows.
+            for k in 0..self.s.orders.len() {
+                let (is_buy, px) = (self.s.orders[k].is_buy, self.s.orders[k].px);
+                let shown = level_size(m, is_buy, px);
+                let q = &mut self.s.orders[k].queue_ahead;
+                *q = q.min(shown);
+            }
+        }
         let mut i = 0;
         while i < self.s.orders.len() {
             let o = &self.s.orders[i];
@@ -448,19 +523,25 @@ impl PaperSim {
             let mut i = 0;
             while i < self.s.orders.len() && avail > 0.0 {
                 let o = &self.s.orders[i];
-                let hits = t.time >= o.placed_ms
-                    && if o.is_buy {
-                        t.px < o.px
-                            || (self.p.fill_on_touch && same_px(t.px, o.px) && !t.buyer_aggressor())
-                    } else {
-                        t.px > o.px
-                            || (self.p.fill_on_touch && same_px(t.px, o.px) && t.buyer_aggressor())
-                    };
+                let through = if o.is_buy { t.px < o.px } else { t.px > o.px };
+                let touch = self.p.fill_on_touch
+                    && same_px(t.px, o.px)
+                    && (t.buyer_aggressor() != o.is_buy);
+                let hits = t.time >= o.placed_ms && (through || touch);
                 let before = self.s.orders.len();
                 if hits {
-                    let q = avail.min(o.remaining());
-                    avail -= q;
-                    self.fill_resting(i, q, t.time, &mut out);
+                    if !through && self.p.queue_model {
+                        // A print at our price serves the queue ahead first.
+                        let o = &mut self.s.orders[i];
+                        let eat = avail.min(o.queue_ahead);
+                        o.queue_ahead -= eat;
+                        avail -= eat;
+                    }
+                    let q = avail.min(self.s.orders[i].remaining());
+                    if q > 0.0 {
+                        avail -= q;
+                        self.fill_resting(i, q, t.time, &mut out);
+                    }
                 }
                 if self.s.orders.len() == before {
                     i += 1;
@@ -499,7 +580,7 @@ impl PaperSim {
         self.s
             .orders
             .drain(..)
-            .map(|o| done(o.tag, DoneReason::Canceled))
+            .map(|o| done(o.tag, DoneReason::Canceled, o.filled))
             .collect()
     }
 }
@@ -576,6 +657,10 @@ impl Executor for PaperExecutor {
 
     fn venue_position(&self) -> Option<f64> {
         Some(self.sim.account().position_sz)
+    }
+
+    fn order_view(&self, tag: u64) -> OrderView {
+        self.sim.order_view(tag)
     }
 
     fn save_state(&self) -> serde_json::Value {

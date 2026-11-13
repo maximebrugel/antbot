@@ -8,7 +8,8 @@
 //!
 //! Per market update ([`Engine::on_market`]):
 //! 1. build the [`MarketView`] (configured premium source, staleness);
-//! 2. optional rolling mean of the premium (`premium_avg_secs`);
+//! 2. rolling mean of the premium (`premium_avg_secs`, the backtest's hourly
+//!    signal by default); no premium until the window is warm;
 //! 3. risk: persistent-premium rule (fresh data only), equity (daily loss,
 //!    drawdown); a kill order is forwarded to the strategy (`on_kill`);
 //! 4. strategy tick with `entries_allowed` from the risk manager.
@@ -70,6 +71,8 @@ pub struct Engine {
     averager: PremiumAverager,
     last_mark: Option<f64>,
     last_view: Option<MarketView>,
+    /// Instantaneous (not averaged) premium of the last fresh view.
+    last_raw_premium_bps: Option<f64>,
     notices: Vec<Notice>,
 }
 
@@ -89,6 +92,7 @@ impl Engine {
             averager: PremiumAverager::new(premium_avg_ms),
             last_mark: None,
             last_view: None,
+            last_raw_premium_bps: None,
             notices: Vec::new(),
         }
     }
@@ -103,6 +107,31 @@ impl Engine {
 
     pub fn last_mark(&self) -> Option<f64> {
         self.last_mark
+    }
+
+    /// Instantaneous premium (bps) behind the last view's averaged value.
+    pub fn last_raw_premium_bps(&self) -> Option<f64> {
+        self.last_raw_premium_bps
+    }
+
+    /// The premium rolling window is covered enough to trade on.
+    pub fn premium_ready(&self) -> bool {
+        self.averager.ready()
+    }
+
+    /// Premium samples to persist (empty without averaging).
+    pub fn premium_samples(&self) -> Vec<(u64, f64)> {
+        self.averager.samples()
+    }
+
+    /// Restore persisted premium samples.
+    pub fn restore_premium_samples(&mut self, now_ms: u64, samples: &[(u64, f64)]) {
+        self.averager.restore(now_ms, samples);
+    }
+
+    /// Graceful shutdown: the strategy records feedback but issues nothing.
+    pub fn suspend(&mut self) {
+        self.strategy.suspend();
     }
 
     /// Strategy-level equity: realized ledger + open position mark-to-market
@@ -157,9 +186,15 @@ impl Engine {
         available_margin_usd: Option<f64>,
     ) -> Vec<Command> {
         if !view.stale {
+            self.last_raw_premium_bps = view.premium_bps;
             if let Some(p) = view.premium_bps {
-                view.premium_bps = Some(self.averager.push(now_ms, p));
+                let avg = self.averager.push(now_ms, p);
+                // Until the window is covered the mean is not the signal.
+                view.premium_bps = self.averager.ready().then_some(avg);
             }
+        } else if self.averager.window_ms() > 0 {
+            // Stale: keep the last mean (never the raw value) for records.
+            view.premium_bps = self.averager.mean().filter(|_| self.averager.ready());
         }
         self.last_view = Some(*view);
         let mut cmds = Vec::new();
@@ -296,13 +331,19 @@ mod tests {
 
     const T0: u64 = 1_800_000_000_000;
 
+    /// Engine on the instantaneous premium (most tests drive single
+    /// snapshots; averaging is covered by `premium_average_warm_up`).
     fn engine(cfg: &Config) -> Engine {
+        engine_avg(cfg, 0)
+    }
+
+    fn engine_avg(cfg: &Config, premium_avg_ms: u64) -> Engine {
         Engine::new(
             EngineParams::from_config(cfg),
             Strategy::new(StrategyParams::from_config(cfg, 2, 10)),
             RiskManager::new(RiskParams::from(&cfg.risk), RiskState::default()),
             Ledger::default(),
-            cfg.strategy.premium_avg_secs * 1000,
+            premium_avg_ms,
         )
     }
 
@@ -481,5 +522,42 @@ mod tests {
             None,
         );
         assert!(e.risk.is_killed());
+    }
+
+    #[test]
+    fn premium_average_warm_up() {
+        // Default config: hourly rolling mean, the backtested signal.
+        let cfg = Config::default();
+        assert_eq!(cfg.strategy.premium_avg_secs, 3600);
+        let mut e = engine_avg(&cfg, cfg.strategy.premium_avg_secs * 1000);
+        // +100 bps for 10 minutes: window not covered, no signal, no order.
+        let mut now = T0;
+        for _ in 0..120 {
+            let cmds = e.on_market(now, &market(now, 100.99, 101.01, 100.0), None);
+            assert!(cmds.is_empty(), "entered before the window was warm");
+            assert!(e.last_view().unwrap().premium_bps.is_none());
+            assert!(e.last_raw_premium_bps().is_some());
+            now += 5_000;
+        }
+        assert!(!e.premium_ready());
+        // Restore a covered hour of samples at +100 bps: ready, entry.
+        let samples: Vec<(u64, f64)> = (0..720)
+            .map(|i| (now - 3_600_000 + i * 5_000, 100.0))
+            .collect();
+        let mut e2 = engine_avg(&cfg, cfg.strategy.premium_avg_secs * 1000);
+        e2.restore_premium_samples(now, &samples);
+        assert!(e2.premium_ready());
+        let cmds = e2.on_market(now, &market(now, 100.99, 101.01, 100.0), None);
+        assert_eq!(cmds.len(), 1);
+        let p = e2.last_view().unwrap().premium_bps.unwrap();
+        assert!((p - 100.0).abs() < 1.0, "{p}");
+        // A single sample at 0 barely moves the hourly mean (no exit flicker).
+        e2.on_market(
+            now + 5_000,
+            &market(now + 5_000, 99.99, 100.01, 100.0),
+            None,
+        );
+        assert!(e2.last_view().unwrap().premium_bps.unwrap() > 90.0);
+        assert!(e2.last_raw_premium_bps().unwrap().abs() < 1.0);
     }
 }

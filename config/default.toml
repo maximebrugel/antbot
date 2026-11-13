@@ -61,10 +61,12 @@ taker_fallback_window_secs = 900      # last 15 min before max_hold
 exit_maker_timeout_secs = 600         # converge-exit: go taker after 10 min resting
 taker_max_slippage_bps = 50.0         # IOC limit px = best +/- this
 # Rolling mean of the premium (one sample per 5 s slot) used by the signal,
-# the convergence exit and the persistent-premium kill rule. 0 = instantaneous
-# ctx premium. fundingHistory.premium (backtest signal) is an hourly figure;
-# a larger window smooths spikes from the thin book at the cost of lag.
-premium_avg_secs = 0
+# the convergence exit and the persistent-premium kill rule. 3600 matches the
+# backtested signal (fundingHistory.premium = hourly mean of 5 s samples),
+# evaluated continuously instead of once per hour. Nothing trades until 80%
+# of the window is sampled (samples persist across restarts). 0 = the
+# instantaneous ctx premium, which is NOT the backtested signal.
+premium_avg_secs = 3600
 # After an entry is abandoned with nothing filled (timeout, signal gone,
 # rejected), wait this long before a new entry.
 entry_retry_cooldown_secs = 60
@@ -82,7 +84,7 @@ margin_mode = "isolated"              # only "isolated" is accepted
 
 [risk]
 # Rolling hit rate over the last N closed trades. A "hit" is a trade whose
-# |premium| moved toward 0 between entry and exit (writeup "taux vers 0"),
+# |premium| moved toward 0 between entry and exit (the writeup's "moved toward 0" rate),
 # or "pnl_positive" for net-PnL > 0.
 hit_rate_window = 20
 hit_rate_min = 0.80
@@ -132,6 +134,11 @@ initial_balance_usd = 10000.0         # simulated account, for available margin
 # cross) or a public trade prints at / through it. fill_on_touch = false only
 # counts trades strictly through our price (pessimistic queue position).
 fill_on_touch = true
+# Queue model for touch fills: the size shown at our price when the order
+# joins the level is ahead of us; prints at our price serve that queue first
+# (it also shrinks with the level). false = we are first in the queue
+# (optimistic).
+queue_model = true
 
 [live]
 # Testnet / mainnet executor.

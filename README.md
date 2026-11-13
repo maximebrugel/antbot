@@ -1,11 +1,15 @@
 # antbot
 
-Bot de mean-reversion du premium HIP-3 `xyz:ANT` sur Hyperliquid (Rust / tokio).
-Mode par défaut : **paper** (données de marché mainnet en direct, fills simulés, aucune clé, aucun appel à `/exchange`).
+Premium mean-reversion bot for the HIP-3 perp `xyz:ANT` on Hyperliquid (Rust / tokio).
+Default mode: **paper** (live mainnet market data, simulated fills, no key, `/exchange` is never called).
 
-> Documentation complète à venir. Ce n'est pas un conseil en investissement.
+> Full documentation to come. This is not investment advice.
 
 ```sh
-cargo run -- check-config            # valide config/default.toml et le garde-fou de mode
-cargo run -- run                     # paper (boucle en cours d'implémentation)
+cargo run -- check-config            # validate config/default.toml and the mode guard
+cargo run -- run                     # paper trading on live mainnet data
+cargo run -- replay --help           # replay / backtest over historical data
 ```
+
+Stop the bot before running `antbot reset-kill --confirm`: a running bot holds
+`<data_dir>/antbot.lock` and the command refuses to run while it is held.

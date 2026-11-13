@@ -3,7 +3,11 @@
 //! The strategy ([`crate::strategy::signal`]) emits [`Command`]s and expects
 //! [`OrderUpdate`]s back, following the executor contract documented there:
 //! every `Place` gets exactly one terminal `Done`, fills may arrive before or
-//! after it, `tag` identifies the order. Both executors honour it:
+//! after it, `tag` identifies the order. A `Cancel` for an order the
+//! executor does not know (never placed) or that already finished is
+//! answered with a terminal `Done` as well (a duplicate is ignored by the
+//! strategy), so the strategy can never wait forever. Both executors honour
+//! it:
 //!
 //! * [`paper::PaperExecutor`]: live mainnet market data, simulated fills,
 //!   never touches `/exchange` and never needs a key;
@@ -18,7 +22,7 @@ pub mod state;
 use crate::hl::market::MarketState;
 use crate::hl::types::WsTrade;
 use crate::hl::ws::UserEvent;
-use crate::strategy::signal::{Command, OrderUpdate};
+use crate::strategy::signal::{Command, DoneReason, OrderUpdate};
 
 /// Something the executor reports back to the engine.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +33,22 @@ pub enum ExecEvent {
     Funding { usd: f64, time_ms: u64 },
     /// Operator-level problem (rate limit, resync, mismatch...): log + alert.
     Alert(String),
+}
+
+/// What an executor knows about one strategy order (used to heal a
+/// strategy that waits for a `Done` that will never come: a command dropped
+/// at shutdown, a lost event...).
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderView {
+    /// Never seen (or long forgotten).
+    Unknown,
+    /// Live / pending; `cancel_requested` once a cancel was sent.
+    Active { cancel_requested: bool },
+    /// Finished: the terminal state already reported.
+    Done {
+        reason: DoneReason,
+        filled_sz: Option<f64>,
+    },
 }
 
 impl From<OrderUpdate> for ExecEvent {
@@ -73,6 +93,9 @@ pub trait Executor {
 
     /// Signed position on the venue (simulated account in paper), if known.
     fn venue_position(&self) -> Option<f64>;
+
+    /// State of the order with strategy tag `tag`.
+    fn order_view(&self, tag: u64) -> OrderView;
 
     /// Executor state to persist (JSON).
     fn save_state(&self) -> serde_json::Value;

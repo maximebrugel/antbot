@@ -1,4 +1,5 @@
 use super::*;
+use crate::exec::OrderView;
 use crate::hl::market::DataSource;
 use crate::hl::types::L2Book;
 use crate::strategy::signal::Purpose;
@@ -10,6 +11,7 @@ fn params() -> PaperParams {
         maker_rate: 0.00003,
         taker_rate: 0.00009,
         fill_on_touch: true,
+        queue_model: false,
         sz_decimals: 2,
         initial_balance_usd: 10_000.0,
         leverage: 1,
@@ -99,7 +101,7 @@ fn fills(ev: &[ExecEvent]) -> Vec<(f64, f64, f64, bool)> {
 fn dones(ev: &[ExecEvent]) -> Vec<(u64, DoneReason)> {
     ev.iter()
         .filter_map(|e| match e {
-            ExecEvent::Order(OrderUpdate::Done { tag, reason }) => Some((*tag, reason.clone())),
+            ExecEvent::Order(OrderUpdate::Done { tag, reason, .. }) => Some((*tag, reason.clone())),
             _ => None,
         })
         .collect()
@@ -199,10 +201,17 @@ fn ioc_walks_the_book_with_taker_fee() {
     assert_eq!((f[1].0, f[1].1), (100.03, 2.0));
     assert!((f[0].2 - 100.02 * 3.0 * 0.00009).abs() < 1e-12);
     assert_eq!(dones(&ev), vec![(1, DoneReason::Filled)]);
-    // Limit allows only the first two levels (7 lots): remainder expires.
+    // Same book again: the 5 lots already taken are not available twice
+    // (only 2 left at 100.03 under the limit), remainder expires.
     let ev = s.place(T0, ioc(2, true, 100.03, 10.0, false), &m);
-    assert_eq!(fills(&ev).iter().map(|f| f.1).sum::<f64>(), 7.0);
+    assert_eq!(fills(&ev).iter().map(|f| f.1).sum::<f64>(), 2.0);
     assert_eq!(dones(&ev), vec![(2, DoneReason::IocExpired)]);
+    // A new book update restores the depth: the limit allows the first two
+    // levels (7 lots).
+    let m = book(T0 + 1);
+    let ev = s.place(T0 + 1, ioc(3, true, 100.03, 10.0, false), &m);
+    assert_eq!(fills(&ev).iter().map(|f| f.1).sum::<f64>(), 7.0);
+    assert_eq!(dones(&ev), vec![(3, DoneReason::IocExpired)]);
 }
 
 #[test]
@@ -268,7 +277,83 @@ fn cancel_and_state_roundtrip() {
     let back: PaperState = serde_json::from_value(json).unwrap();
     assert_eq!(&back, s.state());
     let mut r = PaperSim::from_state(params(), back);
-    assert_eq!(r.cancel(1), vec![done(1, DoneReason::Canceled)]);
-    assert!(r.cancel(1).is_empty(), "second cancel is a no-op");
+    assert_eq!(r.cancel(1), vec![done(1, DoneReason::Canceled, 0.0)]);
+    // A cancel for an order the sim does not hold is answered (the strategy
+    // ignores a duplicate Done but must never wait forever).
+    assert_eq!(
+        dones(&r.cancel(1)),
+        vec![(
+            1,
+            DoneReason::Rejected("order unknown to the executor".into())
+        )]
+    );
+    assert_eq!(r.order_view(1), OrderView::Unknown);
     assert!((r.account().position_sz - 1.0).abs() < 1e-12);
+}
+
+fn pxsz(ev: &[ExecEvent]) -> Vec<(f64, f64)> {
+    fills(ev).into_iter().map(|(p, q, _, _)| (p, q)).collect()
+}
+
+fn queue_params() -> PaperParams {
+    PaperParams {
+        queue_model: true,
+        ..params()
+    }
+}
+
+#[test]
+fn touch_fills_wait_for_the_queue_ahead() {
+    let mut s = PaperSim::new(queue_params());
+    // Join the best bid (99.0, 5 lots shown) with 2 lots: 5 ahead of us.
+    let m = market(T0, vec![lvl(99.0, 5.0)], vec![lvl(99.5, 5.0)]);
+    s.place(T0, alo(1, true, 99.0, 2.0), &m);
+    assert_eq!(s.open_orders()[0].queue_ahead, 5.0);
+    assert_eq!(
+        s.order_view(1),
+        OrderView::Active {
+            cancel_requested: false
+        }
+    );
+    let sell = |sz: f64, tid: u64, px: f64| WsTrade {
+        coin: "xyz:ANT".into(),
+        side: "A".into(),
+        px,
+        sz,
+        time: T0 + tid,
+        tid,
+    };
+    // 4 sold at our price: all served to the queue ahead.
+    assert!(pxsz(&s.on_trades(&[sell(4.0, 1, 99.0)])).is_empty());
+    // The level shrinks to 0.5 (cancels ahead of us): queue capped.
+    let m2 = market(T0 + 10, vec![lvl(99.0, 0.5)], vec![lvl(99.5, 5.0)]);
+    assert!(pxsz(&s.on_book(T0 + 10, &m2)).is_empty());
+    assert_eq!(s.open_orders()[0].queue_ahead, 0.5);
+    // 1.5 more at our price: 0.5 to the queue, 1.0 fills us.
+    let ev = s.on_trades(&[sell(1.5, 2, 99.0)]);
+    assert_eq!(pxsz(&ev), vec![(99.0, 1.0)]);
+    // A print through our price fills regardless of the queue.
+    let ev = s.on_trades(&[sell(3.0, 3, 98.9)]);
+    assert_eq!(pxsz(&ev), vec![(99.0, 1.0)]);
+    assert_eq!(dones(&ev), vec![(1, DoneReason::Filled)]);
+}
+
+#[test]
+fn ioc_retry_does_not_reuse_taken_depth() {
+    let mut s = PaperSim::new(params());
+    let m = market(
+        T0,
+        vec![lvl(99.0, 5.0)],
+        vec![lvl(100.0, 1.0), lvl(100.5, 1.0)],
+    );
+    let ev = s.place(T0, ioc(2, true, 100.2, 2.0, false), &m);
+    assert_eq!(pxsz(&ev), vec![(100.0, 1.0)]);
+    assert_eq!(dones(&ev), vec![(2, DoneReason::IocExpired)]);
+    // Same book again: the 100.0 level is gone.
+    let ev = s.place(T0 + 1, ioc(3, true, 100.2, 2.0, false), &m);
+    assert!(pxsz(&ev).is_empty());
+    // A new book restores the depth.
+    let m2 = market(T0 + 2, vec![lvl(99.0, 5.0)], vec![lvl(100.0, 1.0)]);
+    let ev = s.place(T0 + 2, ioc(4, true, 100.2, 1.0, false), &m2);
+    assert_eq!(pxsz(&ev), vec![(100.0, 1.0)]);
 }

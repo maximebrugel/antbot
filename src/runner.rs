@@ -19,12 +19,13 @@ use std::time::Duration;
 use anyhow::Context;
 use tokio::sync::mpsc;
 
+use crate::config::HARD_CAP_NOTIONAL_USD;
 use crate::config::{Config, Mode};
 use crate::engine::{Engine, EngineParams, Notice};
 use crate::exec::live::{HlApi, LiveExecutor, LiveParams};
 use crate::exec::paper::{PaperExecutor, PaperParams};
 use crate::exec::state::{state_path, BotState, Ledger, STATE_VERSION};
-use crate::exec::{ExecEvent, Executor};
+use crate::exec::{ExecEvent, Executor, OrderView};
 use crate::hl::assets::{self, AssetSpec, ResolveError};
 use crate::hl::exchange::{build_for_mode, AssetRef};
 use crate::hl::info::InfoClient;
@@ -33,8 +34,11 @@ use crate::hl::ws::{FeedConfig, MarketFeed};
 use crate::mode::{Credentials, MainnetConfirmed};
 use crate::risk::kill::risk_state_path;
 use crate::risk::{RiskManager, RiskParams, RiskState};
+use crate::runlock::{RunLock, LOCK_REFRESH_MS};
 use crate::strategy::premium::Side;
-use crate::strategy::signal::{Command, Event, Phase, Strategy, StrategyParams};
+use crate::strategy::signal::{
+    Command, DoneReason, Event, OrderUpdate, Phase, Strategy, StrategyParams,
+};
 use crate::strategy::sizing::lot_epsilon;
 
 /// Upper bound of command -> feedback -> command rounds per input.
@@ -51,6 +55,8 @@ struct Ctx {
     state_file: PathBuf,
     risk_file: PathBuf,
     sz_decimals: u32,
+    /// "Running" marker in the data dir (removed on drop).
+    lock: RunLock,
 }
 
 /// Run the bot until SIGINT / SIGTERM.
@@ -65,6 +71,7 @@ pub async fn run(
     let data_dir = cfg.monitor.data_dir.clone();
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("creating data dir {}", data_dir.display()))?;
+    let lock = RunLock::acquire(&data_dir, &mode.to_string(), now_ms())?;
 
     let spec = assets::resolve_live(&info, &cfg.market.dex, &cfg.market.coin)
         .await
@@ -85,6 +92,7 @@ pub async fn run(
         risk_file: risk_state_path(&data_dir),
         data_dir,
         sz_decimals: spec.sz_decimals,
+        lock,
         cfg,
     };
 
@@ -109,13 +117,14 @@ pub async fn run(
         );
     }
     let sp = StrategyParams::from_config(&ctx.cfg, spec.sz_decimals, spec.max_leverage);
-    let (strategy, ledger, exec_saved) = match saved {
+    let (strategy, ledger, exec_saved, premium_samples) = match saved {
         Some(s) => (
             Strategy::from_state(sp, s.strategy),
             s.ledger,
             Some(s.executor),
+            s.premium_samples,
         ),
-        None => (Strategy::new(sp), Ledger::default(), None),
+        None => (Strategy::new(sp), Ledger::default(), None, Vec::new()),
     };
     let mut engine = Engine::new(
         EngineParams::from_config(&ctx.cfg),
@@ -124,6 +133,15 @@ pub async fn run(
         ledger,
         ctx.cfg.strategy.premium_avg_secs * 1000,
     );
+    engine.restore_premium_samples(now_ms(), &premium_samples);
+    if ctx.cfg.strategy.premium_avg_secs > 0 {
+        tracing::info!(
+            window_secs = ctx.cfg.strategy.premium_avg_secs,
+            restored_samples = premium_samples.len(),
+            ready = engine.premium_ready(),
+            "premium rolling mean (no signal until the window is covered)"
+        );
+    }
     if let Some(k) = engine.risk.kill_record() {
         tracing::error!(kill = %k.message, "kill switch active (persisted): no new entries until `antbot reset-kill --confirm`");
     }
@@ -219,9 +237,20 @@ fn reconcile_position_at_startup<A: crate::exec::live::LiveApi>(
     }
     let flat_ok =
         ours.abs() <= eps && matches!(engine.strategy.phase(), Phase::Flat | Phase::Halted { .. });
-    if flat_ok && ctx.cfg.live.adopt_position {
+    let px = v.entry_px.or(m.mark_px).unwrap_or(0.0);
+    let ref_px = m.mark_px.unwrap_or(px).max(px);
+    let cap = ctx.cfg.sizing.max_notional_usd.min(HARD_CAP_NOTIONAL_USD);
+    let notional = v.szi.abs() * ref_px;
+    if flat_ok && ctx.cfg.live.adopt_position && notional > cap * (1.0 + 1e-9) {
+        let msg = format!(
+            "venue position {} (~{notional:.0} USD) exceeds the {cap} USD cap: not adopting it — halting without trading",
+            v.szi
+        );
+        alert(&msg);
+        return engine.manual_kill_with(now, &msg, false);
+    }
+    if flat_ok && ctx.cfg.live.adopt_position && px > 0.0 {
         let side = if v.szi > 0.0 { Side::Long } else { Side::Short };
-        let px = v.entry_px.or(m.mark_px).unwrap_or(0.0);
         match engine.strategy.adopt_position(side, v.szi.abs(), px, now) {
             Ok(()) => {
                 alert(&format!(
@@ -252,25 +281,69 @@ fn apply_events(engine: &mut Engine, now: u64, evs: Vec<ExecEvent>) -> Vec<Comma
     cmds
 }
 
-/// Execute commands until no more feedback produces new ones.
+/// Execute commands until no more feedback produces new ones. Commands
+/// still pending after [`MAX_PUMP_ROUNDS`] are kept in `carry` and executed
+/// first on the next call (never dropped: the strategy already counts them
+/// as sent).
 async fn pump<E: Executor>(
     engine: &mut Engine,
     exec: &mut E,
     m: &MarketState,
-    mut cmds: Vec<Command>,
+    carry: &mut Vec<Command>,
+    cmds: Vec<Command>,
 ) {
+    let mut pending = std::mem::take(carry);
+    pending.extend(cmds);
     for _ in 0..MAX_PUMP_ROUNDS {
-        if cmds.is_empty() {
+        if pending.is_empty() {
             return;
         }
         let now = now_ms();
-        let evs = exec.execute(now, std::mem::take(&mut cmds), m).await;
-        cmds = apply_events(engine, now, evs);
+        let evs = exec.execute(now, std::mem::take(&mut pending), m).await;
+        pending = apply_events(engine, now, evs);
     }
     tracing::warn!(
-        pending = cmds.len(),
-        "command loop did not settle; continuing next tick"
+        pending = pending.len(),
+        "command loop did not settle; the rest runs next tick"
     );
+    *carry = pending;
+}
+
+/// Self-healing of the strategy's working order against the executor: a
+/// `Done` that never arrived (command lost at shutdown or in a crash, event
+/// dropped) is synthesised from what the executor knows, and a cancel the
+/// executor never received is sent again. Without this the strategy would
+/// wait forever and could neither exit nor flatten on a kill.
+pub fn heal_working<E: Executor>(engine: &mut Engine, exec: &E, now: u64) -> Vec<Command> {
+    let Some(w) = engine.strategy.working() else {
+        return Vec::new();
+    };
+    let (tag, cancel_requested) = (w.intent.tag, w.cancel_requested);
+    let (reason, filled_sz) = match exec.order_view(tag) {
+        OrderView::Active {
+            cancel_requested: false,
+        } if cancel_requested => {
+            tracing::warn!(tag, "re-sending a cancel the executor never received");
+            return vec![Command::Cancel { tag }];
+        }
+        OrderView::Active { .. } => return Vec::new(),
+        OrderView::Done { reason, filled_sz } => (reason, filled_sz),
+        OrderView::Unknown => (
+            DoneReason::Rejected("order unknown to the executor (never sent)".into()),
+            Some(0.0),
+        ),
+    };
+    alert(&format!(
+        "strategy order {tag} was waiting for a terminal state the executor already settled ({reason:?}): resynchronised"
+    ));
+    engine.on_exec(
+        now,
+        ExecEvent::Order(OrderUpdate::Done {
+            tag,
+            reason,
+            filled_sz,
+        }),
+    )
 }
 
 /// Operator alert (Telegram is wired in the monitoring layer).
@@ -391,6 +464,7 @@ fn save_all<E: Executor>(ctx: &Ctx, engine: &Engine, exec: &E) {
         strategy: engine.strategy.state().clone(),
         ledger: engine.ledger.clone(),
         executor: exec.save_state(),
+        premium_samples: engine.premium_samples(),
     };
     if let Err(e) = st.save(&ctx.state_file) {
         tracing::error!(error = %format!("{e:#}"), "saving bot state failed");
@@ -463,7 +537,7 @@ fn every(secs: u64) -> tokio::time::Interval {
 }
 
 async fn main_loop<E: Executor>(
-    ctx: Ctx,
+    mut ctx: Ctx,
     mut engine: Engine,
     mut exec: E,
     mut feed: MarketFeed,
@@ -488,6 +562,8 @@ async fn main_loop<E: Executor>(
     let mut force_resync = false;
     let mut mismatches = 0u32;
     let mut dropped_seen = feed.snapshot().user_events_dropped;
+    let mut carry: Vec<Command> = Vec::new();
+    let mut lock_refreshed_ms = now_ms();
     let stop = shutdown_signal();
     tokio::pin!(stop);
 
@@ -496,7 +572,11 @@ async fn main_loop<E: Executor>(
     let m0 = feed.snapshot();
     let mut cmds = initial_cmds;
     cmds.extend(engine.startup(now_ms()));
-    pump(&mut engine, &mut exec, &m0, cmds).await;
+    pump(&mut engine, &mut exec, &m0, &mut carry, cmds).await;
+    // A working order persisted by the previous run that the executor does
+    // not know (or already settled) must not block the strategy.
+    let cmds = heal_working(&mut engine, &exec, now_ms());
+    pump(&mut engine, &mut exec, &m0, &mut carry, cmds).await;
     log_notices(&mut engine);
     save_all(&ctx, &engine, &exec);
     tracing::info!(
@@ -523,33 +603,43 @@ async fn main_loop<E: Executor>(
                 }
                 let mut cmds = apply_events(&mut engine, now, exec.on_market(now, &m));
                 cmds.extend(engine.on_market(now, &m, exec.available_margin_usd()));
-                pump(&mut engine, &mut exec, &m, cmds).await;
+                pump(&mut engine, &mut exec, &m, &mut carry, cmds).await;
             }
             Some(trades) = feed.trades.recv() => {
                 let now = now_ms();
                 let m = feed.snapshot();
                 let cmds = apply_events(&mut engine, now, exec.on_trades(now, &trades));
-                pump(&mut engine, &mut exec, &m, cmds).await;
+                pump(&mut engine, &mut exec, &m, &mut carry, cmds).await;
             }
             Some(ev) = feed.user_events.recv() => {
                 let now = now_ms();
                 let m = feed.snapshot();
                 let evs = exec.on_user_event(now, ev).await;
                 let cmds = apply_events(&mut engine, now, evs);
-                pump(&mut engine, &mut exec, &m, cmds).await;
+                pump(&mut engine, &mut exec, &m, &mut carry, cmds).await;
             }
             _ = tick.tick() => {
                 // Time-based rules (timeouts, requotes, deadlines, staleness).
                 let now = now_ms();
                 let m = feed.snapshot();
                 let cmds = engine.on_market(now, &m, exec.available_margin_usd());
-                pump(&mut engine, &mut exec, &m, cmds).await;
+                pump(&mut engine, &mut exec, &m, &mut carry, cmds).await;
+                if carry.is_empty() {
+                    let cmds = heal_working(&mut engine, &exec, now_ms());
+                    pump(&mut engine, &mut exec, &m, &mut carry, cmds).await;
+                }
+                if now.saturating_sub(lock_refreshed_ms) >= LOCK_REFRESH_MS {
+                    lock_refreshed_ms = now;
+                    if let Err(e) = ctx.lock.refresh(now) {
+                        tracing::warn!(error = %format!("{e:#}"), "refreshing the run lock failed");
+                    }
+                }
             }
             Some(spec) = meta_rx.recv() => {
                 let now = now_ms();
                 let m = feed.snapshot();
                 let cmds = engine.on_spec(now, spec.as_ref().map_err(|e| e.clone()));
-                pump(&mut engine, &mut exec, &m, cmds).await;
+                pump(&mut engine, &mut exec, &m, &mut carry, cmds).await;
             }
             _ = reconcile.tick(), if is_live => {
                 let now = now_ms();
@@ -571,7 +661,7 @@ async fn main_loop<E: Executor>(
                         mismatches = 0;
                     }
                 }
-                pump(&mut engine, &mut exec, &m, cmds).await;
+                pump(&mut engine, &mut exec, &m, &mut carry, cmds).await;
             }
             _ = persist.tick() => save_all(&ctx, &engine, &exec),
             _ = sample.tick() => {
@@ -579,6 +669,8 @@ async fn main_loop<E: Executor>(
                 let v = engine.last_view().copied();
                 tracing::info!(
                     premium_bps = ?v.and_then(|v| v.premium_bps).map(|p| (p * 100.0).round() / 100.0),
+                    raw_premium_bps = ?engine.last_raw_premium_bps().map(|p| (p * 100.0).round() / 100.0),
+                    avg_ready = engine.premium_ready(),
                     api_premium_bps = ?m.api_premium.map(|p| (p * 1e6).round() / 100.0),
                     oracle = ?m.oracle_px,
                     mark = ?m.mark_px,
@@ -615,9 +707,20 @@ async fn main_loop<E: Executor>(
     };
 
     tracing::info!(%reason, "shutting down");
+    // From here on the strategy only records feedback: an order it decided
+    // to send now could not be executed, and persisting it as "working"
+    // would leave the next run waiting for it.
+    engine.suspend();
+    if !carry.is_empty() {
+        tracing::warn!(dropped = carry.len(), "commands not executed at shutdown");
+    }
     let m = feed.snapshot();
     let evs = exec.shutdown(now_ms(), &m).await;
-    let _ = apply_events(&mut engine, now_ms(), evs); // no new orders now
+    let leftover = apply_events(&mut engine, now_ms(), evs);
+    debug_assert!(
+        leftover.is_empty(),
+        "suspended strategy issued {leftover:?}"
+    );
     log_notices(&mut engine);
     save_all(&ctx, &engine, &exec);
     feed.shutdown().await;

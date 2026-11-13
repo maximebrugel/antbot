@@ -23,12 +23,18 @@
 //! * The mark price is never used. The oracle is the denominator in both
 //!   cases.
 //!
-//! `fundingHistory.premium` is one value per funding hour (an hourly
-//! aggregate), while the bot sees the instantaneous ctx premium about once a
-//! second. `strategy.premium_avg_secs` lets you smooth the live value with a
-//! time-bucketed rolling mean ([`PremiumAverager`]: one sample per 5 s slot,
-//! like the exchange's premium sampling) to get closer to the hourly signal.
-//! 0 (the default) uses the instantaneous value.
+//! `fundingHistory.premium` is one value per funding hour: the mean of the
+//! exchange's 5 s premium samples over the hour. That hourly mean is the
+//! signal the research validated. The bot sees the instantaneous ctx premium
+//! about once a second, so `strategy.premium_avg_secs` (default 3600)
+//! smooths it with a time-bucketed rolling mean ([`PremiumAverager`]: one
+//! sample per 5 s slot, like the exchange's sampling). The signal, the
+//! convergence exit and the persistent-premium kill all use the averaged
+//! value. Deviation from the backtest: the rolling mean is evaluated
+//! continuously, not only at the top of each hour. The mean is only used
+//! once the window is [`AVG_MIN_COVERAGE`] covered (warm-up); the samples
+//! are persisted so a restart does not reset it. 0 uses the instantaneous
+//! value (**not** the backtested signal).
 //!
 //! # Trade arithmetic (backtest.py)
 //!
@@ -37,7 +43,7 @@
 //!   `side * ((1 + p_exit) / (1 + p_entry) - 1)` ([`basis_return`]).
 //! * full mark-to-mark return: `side * (px_exit / px_entry - 1)`
 //!   ([`full_return`]).
-//! * hit ("taux vers 0", `measure_structural.py`): `|p_exit| < |p_entry|`
+//! * hit (the writeup's "moved toward 0" rate, `measure_structural.py`): `|p_exit| < |p_entry|`
 //!   ([`moved_toward_zero`]).
 
 use std::collections::VecDeque;
@@ -160,6 +166,10 @@ pub fn moved_toward_zero(p_entry: f64, p_exit: f64) -> bool {
 /// Width of a sampling slot (HL samples the premium every 5 s for funding).
 pub const PREMIUM_SLOT_MS: u64 = 5_000;
 
+/// Fraction of the window's 5 s slots that must hold a sample before the
+/// rolling mean is trusted.
+pub const AVG_MIN_COVERAGE: f64 = 0.8;
+
 /// Rolling mean of the premium over a time window, one sample per 5 s slot
 /// (the latest value in a slot wins). Gaps are simply not sampled. A window
 /// of 0 passes values through.
@@ -212,6 +222,40 @@ impl PremiumAverager {
 
     pub fn len(&self) -> usize {
         self.samples.len()
+    }
+
+    /// Enough of the window is sampled for the mean to stand for it
+    /// (always true without averaging).
+    pub fn ready(&self) -> bool {
+        if self.window_ms == 0 {
+            return true;
+        }
+        let slots = (self.window_ms / PREMIUM_SLOT_MS).max(1) as f64;
+        self.samples.len() as f64 >= AVG_MIN_COVERAGE * slots
+    }
+
+    /// Samples as (slot start ms, premium), for persistence.
+    pub fn samples(&self) -> Vec<(u64, f64)> {
+        self.samples
+            .iter()
+            .map(|(slot, v)| (slot * PREMIUM_SLOT_MS, *v))
+            .collect()
+    }
+
+    /// Restore persisted samples (those still inside the window at `now_ms`).
+    pub fn restore(&mut self, now_ms: u64, samples: &[(u64, f64)]) {
+        if self.window_ms == 0 {
+            return;
+        }
+        let mut v: Vec<(u64, f64)> = samples
+            .iter()
+            .filter(|(t, p)| p.is_finite() && *t <= now_ms)
+            .map(|(t, p)| (t / PREMIUM_SLOT_MS, *p))
+            .collect();
+        v.sort_by_key(|(s, _)| *s);
+        v.dedup_by_key(|(s, _)| *s);
+        self.samples = v.into_iter().collect();
+        self.evict(now_ms);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -331,5 +375,26 @@ mod tests {
         assert!(a.push(75_000, f64::NAN).is_nan());
         assert_eq!(a.len(), 1);
         assert_eq!(a.window_ms(), 60_000);
+    }
+
+    #[test]
+    fn averager_warm_up_and_restore() {
+        let mut a = PremiumAverager::new(60_000); // 12 slots, ready at >= 9.6
+        for i in 0..9 {
+            a.push(i * 5_000, 0.01);
+        }
+        assert!(!a.ready());
+        a.push(45_000, 0.01);
+        assert!(a.ready());
+        let saved = a.samples();
+        let mut b = PremiumAverager::new(60_000);
+        b.restore(50_000, &saved);
+        assert!(b.ready());
+        assert!((b.mean().unwrap() - 0.01).abs() < 1e-15);
+        // Restored long after: everything is out of the window.
+        let mut c = PremiumAverager::new(60_000);
+        c.restore(1_000_000, &saved);
+        assert!(c.is_empty() && !c.ready());
+        assert!(PremiumAverager::new(0).ready());
     }
 }

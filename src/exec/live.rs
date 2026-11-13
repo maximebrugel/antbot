@@ -26,7 +26,7 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{ExecEvent, Executor};
+use super::{ExecEvent, Executor, OrderView};
 use crate::config::{Config, LiveConfig, StrayOrders};
 use crate::hl::actions::Cloid;
 use crate::hl::exchange::{
@@ -79,6 +79,28 @@ impl RemoteStatus {
         }
     }
 
+    /// Parse an `orderStatus` info response, with the filled size
+    /// (`origSz - sz`, the remaining size) when the order is listed.
+    pub fn order_from_json(v: &Value) -> RemoteOrder {
+        let status = Self::from_order_status_json(v);
+        let num = |p: &str| {
+            v.pointer(p).and_then(|x| match x {
+                Value::String(s) => s.parse::<f64>().ok(),
+                Value::Number(n) => n.as_f64(),
+                _ => None,
+            })
+        };
+        let orig = num("/order/order/origSz");
+        let rem = num("/order/order/sz");
+        let filled_sz = match (&status, orig, rem) {
+            (RemoteStatus::Filled, Some(o), _) => Some(o),
+            (RemoteStatus::Unknown, ..) => None,
+            (_, Some(o), Some(r)) => Some((o - r).max(0.0)),
+            _ => None,
+        };
+        RemoteOrder { status, filled_sz }
+    }
+
     /// Terminal reason for the strategy (`None` while open / unknown).
     fn done_reason(&self, kind: OrderKind) -> Option<DoneReason> {
         match self {
@@ -95,6 +117,13 @@ impl RemoteStatus {
     }
 }
 
+/// `orderStatus` result: status plus the filled size when known.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteOrder {
+    pub status: RemoteStatus,
+    pub filled_sz: Option<f64>,
+}
+
 /// What the live executor needs from Hyperliquid (abstracted for tests).
 #[allow(async_fn_in_trait)]
 pub trait LiveApi {
@@ -104,7 +133,7 @@ pub trait LiveApi {
     async fn clearinghouse(&self) -> anyhow::Result<ClearinghouseState>;
     async fn open_orders(&self) -> anyhow::Result<Vec<OpenOrder>>;
     async fn user_fills(&self) -> anyhow::Result<Vec<Fill>>;
-    async fn order_status(&self, cloid: Cloid) -> anyhow::Result<RemoteStatus>;
+    async fn order_status(&self, cloid: Cloid) -> anyhow::Result<RemoteOrder>;
     /// Funding payments on the coin since `start_ms`: (time ms, usd).
     async fn funding_since(&self, start_ms: u64) -> anyhow::Result<Vec<(u64, f64)>>;
 }
@@ -153,12 +182,12 @@ impl LiveApi for HlApi {
             .filter(|f| f.coin == self.coin)
             .collect())
     }
-    async fn order_status(&self, cloid: Cloid) -> anyhow::Result<RemoteStatus> {
+    async fn order_status(&self, cloid: Cloid) -> anyhow::Result<RemoteOrder> {
         let v = self
             .info
             .order_status(&self.user, Value::String(cloid.to_string()))
             .await?;
-        Ok(RemoteStatus::from_order_status_json(&v))
+        Ok(RemoteStatus::order_from_json(&v))
     }
     async fn funding_since(&self, start_ms: u64) -> anyhow::Result<Vec<(u64, f64)>> {
         let v = self.info.user_funding(&self.user, start_ms).await?;
@@ -207,6 +236,12 @@ pub struct LiveOrder {
     /// the order is still open).
     #[serde(default)]
     pub cancel_requested: bool,
+    /// Terminal state reported to the strategy (re-sent if it asks again).
+    #[serde(default)]
+    pub done_reason: Option<DoneReason>,
+    /// Filled size reported with the terminal state.
+    #[serde(default)]
+    pub done_filled_sz: Option<f64>,
 }
 
 /// Persisted live executor state.
@@ -270,8 +305,12 @@ fn is_listed(o: &LiveOrder, oo: &OpenOrder) -> bool {
     }
 }
 
-fn done(tag: u64, reason: DoneReason) -> ExecEvent {
-    ExecEvent::Order(OrderUpdate::Done { tag, reason })
+fn done(tag: u64, reason: DoneReason, filled_sz: Option<f64>) -> ExecEvent {
+    ExecEvent::Order(OrderUpdate::Done {
+        tag,
+        reason,
+        filled_sz,
+    })
 }
 
 impl<A: LiveApi> LiveExecutor<A> {
@@ -367,14 +406,22 @@ impl<A: LiveApi> LiveExecutor<A> {
         )));
     }
 
-    fn mark_done(&mut self, i: usize, reason: DoneReason, out: &mut Vec<ExecEvent>) {
+    fn mark_done(
+        &mut self,
+        i: usize,
+        reason: DoneReason,
+        filled_sz: Option<f64>,
+        out: &mut Vec<ExecEvent>,
+    ) {
         let o = &mut self.s.orders[i];
         if o.done {
             return;
         }
         o.done = true;
         o.uncertain = false;
-        out.push(done(o.tag, reason));
+        o.done_reason = Some(reason.clone());
+        o.done_filled_sz = filled_sz;
+        out.push(done(o.tag, reason, filled_sz));
     }
 
     async fn place(&mut self, now_ms: u64, o: OrderIntent) -> Vec<ExecEvent> {
@@ -384,6 +431,7 @@ impl<A: LiveApi> LiveExecutor<A> {
             out.push(done(
                 o.tag,
                 DoneReason::Rejected("paused after a rate-limit answer".into()),
+                Some(0.0),
             ));
             return out;
         }
@@ -391,6 +439,7 @@ impl<A: LiveApi> LiveExecutor<A> {
             out.push(done(
                 o.tag,
                 DoneReason::Rejected("local exchange action budget exhausted".into()),
+                Some(0.0),
             ));
             out.push(ExecEvent::Alert(format!(
                 "local action budget ({} / min) exhausted: order {} refused",
@@ -420,7 +469,7 @@ impl<A: LiveApi> LiveExecutor<A> {
         let req = match built {
             Ok(r) => r,
             Err(e) => {
-                out.push(done(o.tag, DoneReason::Rejected(e.to_string())));
+                out.push(done(o.tag, DoneReason::Rejected(e.to_string()), Some(0.0)));
                 return out;
             }
         };
@@ -438,6 +487,8 @@ impl<A: LiveApi> LiveExecutor<A> {
             done: false,
             uncertain: false,
             cancel_requested: false,
+            done_reason: None,
+            done_filled_sz: None,
         });
         let i = self.s.orders.len() - 1;
         self.action_times.push_back(now_ms);
@@ -459,7 +510,8 @@ impl<A: LiveApi> LiveExecutor<A> {
                 } else {
                     DoneReason::Filled
                 };
-                self.mark_done(i, reason, &mut out);
+                let filled = total_sz.is_finite().then_some(total_sz);
+                self.mark_done(i, reason, filled, &mut out);
             }
             Ok(st @ OrderStatus::Error(_)) => {
                 let reason = if st.is_post_only_reject() {
@@ -475,7 +527,7 @@ impl<A: LiveApi> LiveExecutor<A> {
                     };
                     DoneReason::Rejected(m)
                 };
-                self.mark_done(i, reason, &mut out);
+                self.mark_done(i, reason, Some(0.0), &mut out);
             }
             Ok(OrderStatus::Other(v)) => {
                 tracing::warn!(tag = o.tag, status = %v, "unexpected order status, resolving by cloid");
@@ -483,7 +535,7 @@ impl<A: LiveApi> LiveExecutor<A> {
             }
             Err(e) if e.is_rate_limited() => {
                 self.rate_limited(now_ms, "order", &mut out);
-                self.mark_done(i, DoneReason::Rejected(e.to_string()), &mut out);
+                self.mark_done(i, DoneReason::Rejected(e.to_string()), Some(0.0), &mut out);
             }
             Err(e) if e.outcome_unknown() || matches!(e, ExchangeError::Decode(_)) => {
                 self.s.orders[i].uncertain = true;
@@ -492,22 +544,52 @@ impl<A: LiveApi> LiveExecutor<A> {
                     o.tag
                 )));
             }
-            Err(e) => self.mark_done(i, DoneReason::Rejected(e.to_string()), &mut out),
+            Err(e) => self.mark_done(i, DoneReason::Rejected(e.to_string()), Some(0.0), &mut out),
         }
         out
     }
 
     async fn cancel(&mut self, now_ms: u64, tag: u64) -> Vec<ExecEvent> {
         let mut out = Vec::new();
-        let Some(i) = self.s.orders.iter().position(|o| o.tag == tag && !o.done) else {
+        let Some(i) = self.s.orders.iter().rposition(|o| o.tag == tag) else {
+            // Never placed (e.g. a command lost at shutdown): answer so the
+            // strategy stops waiting for it.
+            out.push(done(
+                tag,
+                DoneReason::Rejected("order unknown to the executor".into()),
+                Some(0.0),
+            ));
             return out;
         };
+        if self.s.orders[i].done {
+            // Already finished: repeat the terminal state (a duplicate is
+            // ignored by the strategy).
+            let o = &self.s.orders[i];
+            out.push(done(
+                tag,
+                o.done_reason.clone().unwrap_or(DoneReason::Canceled),
+                o.done_filled_sz,
+            ));
+            return out;
+        }
         self.prune(now_ms);
         self.action_times.push_back(now_ms); // counted, never blocked
         self.s.orders[i].cancel_requested = true;
         let cloid = self.s.orders[i].cloid;
         match self.api.cancel_by_cloid(cloid).await {
-            Ok(CancelStatus::Success) => self.mark_done(i, DoneReason::Canceled, &mut out),
+            Ok(CancelStatus::Success) => {
+                // Fills travel on userFills and may lag the cancel answer:
+                // report how much the order filled so the strategy can wait
+                // for the missing fills instead of re-sizing without them.
+                let filled = match self.api.order_status(cloid).await {
+                    Ok(r) => r.filled_sz,
+                    Err(e) => {
+                        tracing::warn!(tag, error = %format!("{e:#}"), "orderStatus after cancel failed");
+                        None
+                    }
+                };
+                self.mark_done(i, DoneReason::Canceled, filled, &mut out);
+            }
             Ok(other) => {
                 // Already filled / canceled / never placed: ask the exchange.
                 tracing::info!(tag, status = ?other, "cancel not applied, checking order status");
@@ -534,7 +616,10 @@ impl<A: LiveApi> LiveExecutor<A> {
             (o.cloid, o.kind, o.placed_ms, o.tag)
         };
         match self.api.order_status(cloid).await {
-            Ok(RemoteStatus::Open) => {
+            Ok(RemoteOrder {
+                status: RemoteStatus::Open,
+                ..
+            }) => {
                 let o = &mut self.s.orders[i];
                 o.uncertain = false;
                 if !o.acked {
@@ -542,20 +627,24 @@ impl<A: LiveApi> LiveExecutor<A> {
                     out.push(ExecEvent::Order(OrderUpdate::Resting { tag }));
                 }
             }
-            Ok(RemoteStatus::Unknown) => {
+            Ok(RemoteOrder {
+                status: RemoteStatus::Unknown,
+                ..
+            }) => {
                 if now_ms.saturating_sub(placed) >= UNKNOWN_ORDER_GRACE_MS {
                     self.mark_done(
                         i,
                         DoneReason::Rejected("order unknown to the exchange".into()),
+                        Some(0.0),
                         &mut out,
                     );
                 } else {
                     self.s.orders[i].uncertain = true;
                 }
             }
-            Ok(st) => {
-                if let Some(r) = st.done_reason(kind) {
-                    self.mark_done(i, r, &mut out);
+            Ok(RemoteOrder { status, filled_sz }) => {
+                if let Some(r) = status.done_reason(kind) {
+                    self.mark_done(i, r, filled_sz, &mut out);
                 }
             }
             Err(e) => {
@@ -631,7 +720,13 @@ impl<A: LiveApi> LiveExecutor<A> {
                     out.push(ExecEvent::Order(OrderUpdate::Resting { tag: o.tag }));
                 }
             } else if let Some(r) = st.done_reason(self.s.orders[i].kind) {
-                self.mark_done(i, r, &mut out);
+                let filled = match (&st, u.order.orig_sz) {
+                    (RemoteStatus::Filled, Some(o)) => Some(o),
+                    (RemoteStatus::Filled, None) => Some(self.s.orders[i].sz),
+                    (_, Some(o)) => Some((o - u.order.sz).max(0.0)),
+                    _ => None,
+                };
+                self.mark_done(i, r, filled, &mut out);
             }
         }
         out
@@ -719,6 +814,7 @@ impl<A: LiveApi> LiveExecutor<A> {
                 self.mark_done(
                     i,
                     DoneReason::Rejected("not open at startup".into()),
+                    None,
                     &mut out,
                 );
             }
@@ -841,6 +937,19 @@ impl<A: LiveApi> Executor for LiveExecutor<A> {
 
     fn venue_position(&self) -> Option<f64> {
         self.venue.map(|v| v.szi)
+    }
+
+    fn order_view(&self, tag: u64) -> OrderView {
+        match self.s.orders.iter().rev().find(|o| o.tag == tag) {
+            None => OrderView::Unknown,
+            Some(o) if o.done => OrderView::Done {
+                reason: o.done_reason.clone().unwrap_or(DoneReason::Canceled),
+                filled_sz: o.done_filled_sz,
+            },
+            Some(o) => OrderView::Active {
+                cancel_requested: o.cancel_requested,
+            },
+        }
     }
 
     fn save_state(&self) -> Value {
