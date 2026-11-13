@@ -10,7 +10,9 @@
 //! to the existing file. A file whose header differs (older column layout)
 //! is moved aside to `<name>.<unix_ms>.old` and a new one is started, so
 //! columns never get mixed. A row left half-written by a crash is
-//! terminated before the next row is appended.
+//! terminated before the next row is appended; the scan is quote-aware,
+//! so a row cut inside a quoted field (even right after an embedded
+//! newline) gets its quote closed first and cannot swallow later rows.
 //!
 //! Write errors never stop the bot: they are logged (throttled) and the
 //! row is lost. After a failed (possibly partial) write, the next row
@@ -23,7 +25,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::hl::market::MarketState;
@@ -127,9 +129,9 @@ impl CsvAppender {
         let len = file.metadata()?.len();
         if len == 0 {
             writeln!(file, "{header}")?;
-        } else if !ends_with_newline(path, len)? {
+        } else {
             // A row cut by a crash: terminate it so the next row is clean.
-            writeln!(file)?;
+            file.write_all(repair_suffix(path)?.as_bytes())?;
         }
         file.flush()?;
         Ok(Self {
@@ -150,15 +152,8 @@ impl CsvAppender {
         let mut s = String::new();
         if self.check_line_end {
             // A previous write may have stopped mid-row (e.g. ENOSPC).
-            match self.file.metadata().map(|m| m.len()).and_then(|len| {
-                if len == 0 {
-                    Ok(true)
-                } else {
-                    ends_with_newline(&self.path, len)
-                }
-            }) {
-                Ok(true) => {}
-                Ok(false) => s.push('\n'),
+            match repair_suffix(&self.path) {
+                Ok(suffix) => s.push_str(suffix),
                 // Unknown: an empty line is harmless, a glued row is not.
                 Err(_) => s.push('\n'),
             }
@@ -195,12 +190,32 @@ fn first_line(path: &Path) -> std::io::Result<Option<String>> {
     Ok((!l.is_empty()).then_some(l))
 }
 
-fn ends_with_newline(path: &Path, len: u64) -> std::io::Result<bool> {
+/// What to append so the file ends on a complete record: `""` (empty file
+/// or clean end), `"\n"` (a row cut outside quotes) or `"\"\n"` (a row
+/// cut inside a quoted field: close the quote, then end the row).
+///
+/// Quote-aware scan of the whole file (RFC 4180: inside a quoted field an
+/// escaped quote is `""`, so the parity of `"` tells whether the end is
+/// inside quotes). Journals are small (a row every few seconds at most)
+/// and this only runs at open and after a failed write.
+fn repair_suffix(path: &Path) -> std::io::Result<&'static str> {
     let mut f = File::open(path)?;
-    f.seek(SeekFrom::Start(len - 1))?;
-    let mut b = [0u8; 1];
-    f.read_exact(&mut b)?;
-    Ok(b[0] == b'\n')
+    let mut in_quote = false;
+    let mut last = None;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        in_quote ^= buf[..n].iter().filter(|&&b| b == b'"').count() % 2 == 1;
+        last = Some(buf[n - 1]);
+    }
+    Ok(match last {
+        _ if in_quote => "\"\n",
+        None | Some(b'\n') => "",
+        Some(_) => "\n",
+    })
 }
 
 /// One `signals.csv` row.
@@ -698,6 +713,68 @@ mod tests {
         a.check_line_end = true;
         a.append(&["9".into(), "0".into()]);
         assert_eq!(read(&p), vec!["a,b", "1,2", "3,", "5,6", "7,8", "9,0"]);
+    }
+
+    #[test]
+    fn row_cut_inside_a_quoted_field_is_closed() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("x.csv");
+        std::fs::write(&p, "a,b\n1,\"partial").unwrap();
+        let mut a = CsvAppender::open(&p, "a,b").unwrap();
+        a.append(&["2".into(), "valid".into()]);
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "a,b\n1,\"partial\"\n2,valid\n"
+        );
+    }
+
+    #[test]
+    fn row_cut_after_an_embedded_newline_is_closed() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("x.csv");
+        // The file ends with a newline, but inside an open quote.
+        std::fs::write(&p, "a,b\n1,\"line \"\"one\"\"\n").unwrap();
+        let mut a = CsvAppender::open(&p, "a,b").unwrap();
+        a.append(&["2".into(), "valid".into()]);
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "a,b\n1,\"line \"\"one\"\"\n\"\n2,valid\n"
+        );
+    }
+
+    #[test]
+    fn complete_quoted_rows_are_left_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("x.csv");
+        {
+            let mut a = CsvAppender::open(&p, "a,b").unwrap();
+            a.append(&["1".into(), "say \"hi\",\nbye".into()]);
+        }
+        let before = std::fs::read_to_string(&p).unwrap();
+        let mut a = CsvAppender::open(&p, "a,b").unwrap();
+        a.check_line_end = true;
+        a.append(&["2".into(), "x".into()]);
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            format!("{before}2,x\n")
+        );
+    }
+
+    #[test]
+    fn failed_write_inside_a_quoted_field_is_closed() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("x.csv");
+        let mut a = CsvAppender::open(&p, "a,b").unwrap();
+        a.append(&["1".into(), "2".into()]);
+        // Simulate a short write that stopped inside a quoted field.
+        let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b"3,\"rejected: bad\n").unwrap();
+        a.check_line_end = true;
+        a.append(&["5".into(), "6".into()]);
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "a,b\n1,2\n3,\"rejected: bad\n\"\n5,6\n"
+        );
     }
 
     #[test]

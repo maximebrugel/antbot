@@ -39,7 +39,7 @@ use tokio::time::Instant;
 
 use crate::engine::Engine;
 use crate::monitor::alerts::MAX_ALERT_CHARS;
-use crate::monitor::telegram::TelegramConfig;
+use crate::monitor::telegram::{error_chain, sanitize_description, TelegramConfig};
 use crate::risk::kill::utc_day;
 use crate::strategy::premium::Side;
 use crate::strategy::signal::TradeRecord;
@@ -574,14 +574,7 @@ impl Backoff {
     }
 }
 
-/// Remove every occurrence of the token (defence in depth on top of
-/// `reqwest::Error::without_url`).
-pub fn redact(s: &str, token: &str) -> String {
-    if token.is_empty() {
-        return s.to_string();
-    }
-    s.replace(token, "<redacted>")
-}
+pub use crate::monitor::telegram::redact;
 
 // ---------------------------------------------------------------------------
 // Transport
@@ -688,10 +681,7 @@ impl HttpBotApi {
             .and_then(Value::as_str)
             .unwrap_or(if parsed.is_none() { "invalid JSON" } else { "" });
         // Redact before cutting: a token straddling the cut would survive.
-        let desc = redact(desc, &self.token)
-            .chars()
-            .take(200)
-            .collect::<String>();
+        let desc = sanitize_description(desc, &self.token);
         let retry_after = parsed
             .as_ref()
             .and_then(|v| v.pointer("/parameters/retry_after"))
@@ -729,21 +719,6 @@ impl BotApi for HttpBotApi {
             .await
             .map(|_| ())
     }
-}
-
-/// An error with its cause chain.
-fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
-    let mut s = e.to_string();
-    let mut src = e.source();
-    while let Some(c) = src {
-        let c_s = c.to_string();
-        if !s.contains(&c_s) {
-            s.push_str(": ");
-            s.push_str(&c_s);
-        }
-        src = c.source();
-    }
-    s
 }
 
 // ---------------------------------------------------------------------------

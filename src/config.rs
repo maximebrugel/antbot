@@ -249,7 +249,8 @@ pub struct TimingConfig {
 pub struct MonitorConfig {
     pub data_dir: PathBuf,
     pub log_json: bool,
-    /// Daily log files kept in `<data_dir>/logs` (0 = keep all).
+    /// Daily log files kept in `<data_dir>/logs` (0 = keep all; 1 acts
+    /// as 2, see `monitor::logging::MIN_LOG_FILES`).
     pub log_max_files: usize,
     pub telegram_enabled: bool,
     /// Telegram messages per rolling minute (queued alerts are merged).

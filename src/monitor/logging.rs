@@ -14,9 +14,26 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 pub const LOG_FILE_PREFIX: &str = "antbot.log";
 pub const DEFAULT_FILTER: &str = "info";
 
+/// Smallest effective `max_files` (0 aside). `tracing-appender` prunes down
+/// to `max_files - 1` files *before* reopening today's file, so with 1 a
+/// same-day restart would delete the log it is about to append to; with 2
+/// or more, today's file is the newest and always survives.
+pub const MIN_LOG_FILES: usize = 2;
+
+/// `log_max_files` as given to the appender: 0 (keep all) unchanged,
+/// otherwise at least [`MIN_LOG_FILES`].
+pub fn effective_max_files(max_files: usize) -> usize {
+    if max_files == 0 {
+        0
+    } else {
+        max_files.max(MIN_LOG_FILES)
+    }
+}
+
 /// Daily rolling file appender in `<data_dir>/logs` (`max_files` = 0 keeps
-/// every file).
+/// every file; 1 is raised to [`MIN_LOG_FILES`], see there).
 pub fn file_appender(data_dir: &Path, max_files: usize) -> anyhow::Result<RollingFileAppender> {
+    let max_files = effective_max_files(max_files);
     let log_dir = data_dir.join("logs");
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("creating log dir {}", log_dir.display()))?;
@@ -116,6 +133,37 @@ mod tests {
         assert!(n.starts_with("antbot.log."), "{n}");
         // antbot.log.YYYY-MM-DD
         assert_eq!(n.len(), "antbot.log.".len() + 10, "{n}");
+    }
+
+    #[test]
+    fn same_day_restart_keeps_todays_log_even_with_one_file() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let mut a = file_appender(d.path(), 1).unwrap();
+            writeln!(a, "BEFORE_RESTART_SENTINEL").unwrap();
+            a.flush().unwrap();
+        }
+        {
+            let mut a = file_appender(d.path(), 1).unwrap();
+            writeln!(a, "AFTER_RESTART_SENTINEL").unwrap();
+            a.flush().unwrap();
+        }
+        let files: Vec<_> = std::fs::read_dir(d.path().join("logs"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let s = std::fs::read_to_string(&files[0]).unwrap();
+        assert!(s.contains("BEFORE_RESTART_SENTINEL"), "{s}");
+        assert!(s.contains("AFTER_RESTART_SENTINEL"), "{s}");
+    }
+
+    #[test]
+    fn effective_max_files_floor() {
+        assert_eq!(effective_max_files(0), 0);
+        assert_eq!(effective_max_files(1), 2);
+        assert_eq!(effective_max_files(2), 2);
+        assert_eq!(effective_max_files(30), 30);
     }
 
     #[test]

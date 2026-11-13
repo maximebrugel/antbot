@@ -128,7 +128,7 @@ data_dir = "data"
 # Logs go to stdout and to <data_dir>/logs/antbot.log.YYYY-MM-DD (daily
 # rotation). Level / filters from RUST_LOG (default "info").
 log_json = false                      # JSON lines instead of text (both outputs)
-log_max_files = 30                    # daily log files kept (0 = keep all)
+log_max_files = 30                    # daily log files kept (0 = keep all, min 2)
 # Telegram alerts: entries, exits, kill switch, errors, startup / shutdown,
 # daily summary. Needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the env;
 # without them alerts are disabled with a log line.

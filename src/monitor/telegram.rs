@@ -20,8 +20,15 @@
 //! * **Disabled gracefully:** without a token / chat id (or with
 //!   `monitor.telegram_enabled = false`) a single log line says so and
 //!   every call is a no-op.
-//! * The bot token is part of the request URL: errors are logged without
-//!   the URL so it never reaches the logs.
+//! * A `200` answer counts as delivered only when its body decodes as a
+//!   Bot API response with `ok: true`; an unreadable or malformed body is
+//!   retried like a transport error (delivery is unknown, and a duplicate
+//!   is preferred over a loss).
+//! * The bot token is part of the request URL and could be echoed back by
+//!   the API or a proxy: every error string (transport cause chain and API
+//!   `description`) is built without the URL and then has every occurrence
+//!   of the token replaced by `<redacted>` before it is logged, counted or
+//!   truncated, so it never reaches stdout or the log file.
 //!
 //! `TELEGRAM_API_BASE` overrides the API base URL (default
 //! `https://api.telegram.org`), used by the tests with a loopback mock.
@@ -198,7 +205,7 @@ impl Alerter {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(
-                    error = %error_chain(&e),
+                    error = %redact(&error_chain(&e.without_url()), &cfg.token),
                     "telegram alerts disabled: cannot build the HTTP client"
                 );
                 return (Self::disabled(), stats);
@@ -209,6 +216,7 @@ impl Alerter {
         let worker = Worker {
             http,
             url: cfg.send_url(),
+            token: cfg.token,
             chat_id: cfg.chat_id,
             settings,
             rx,
@@ -313,7 +321,10 @@ enum SendError {
 
 struct Worker {
     http: reqwest::Client,
+    /// Holds the token: never logged.
     url: String,
+    /// Redacted from every error string before it is logged.
+    token: String,
     chat_id: String,
     settings: AlertSettings,
     rx: mpsc::Receiver<Msg>,
@@ -409,7 +420,16 @@ impl Worker {
         false
     }
 
+    /// [`Self::post_raw`] with the token redacted from the error (defence
+    /// in depth: `post_raw` already redacts what it builds).
     async fn post(&self, text: &str) -> Result<(), SendError> {
+        self.post_raw(text).await.map_err(|e| match e {
+            SendError::Retry(d, why) => SendError::Retry(d, redact(&why, &self.token)),
+            SendError::Fatal(why) => SendError::Fatal(redact(&why, &self.token)),
+        })
+    }
+
+    async fn post_raw(&self, text: &str) -> Result<(), SendError> {
         let body = serde_json::json!({
             "chat_id": self.chat_id,
             "text": text,
@@ -421,18 +441,44 @@ impl Worker {
             .json(&body)
             .send()
             .await
-            // The URL holds the token: never log it.
-            .map_err(|e| SendError::Retry(Duration::ZERO, error_chain(&e.without_url())))?;
+            // The URL holds the token: strip it, then redact anyway.
+            .map_err(|e| {
+                SendError::Retry(
+                    Duration::ZERO,
+                    redact(&error_chain(&e.without_url()), &self.token),
+                )
+            })?;
         let status = resp.status();
-        let parsed: Option<TgResponse> = resp.json().await.ok();
-        if status.is_success() && parsed.as_ref().is_none_or(|r| r.ok) {
-            return Ok(());
+        // A body cut mid-way (or any read error) leaves delivery unknown:
+        // retried, like a transport error.
+        let raw = resp.text().await.map_err(|e| {
+            SendError::Retry(
+                Duration::ZERO,
+                redact(
+                    &format!(
+                        "HTTP {status}: reading body: {}",
+                        error_chain(&e.without_url())
+                    ),
+                    &self.token,
+                ),
+            )
+        })?;
+        let parsed: Option<TgResponse> = serde_json::from_str(&raw).ok();
+        match &parsed {
+            Some(r) if status.is_success() && r.ok => return Ok(()),
+            None if status.is_success() => {
+                return Err(SendError::Retry(
+                    Duration::ZERO,
+                    format!("HTTP {status}: malformed response body"),
+                ));
+            }
+            _ => {}
         }
         let desc = parsed
             .as_ref()
-            .and_then(|r| r.description.clone())
-            .unwrap_or_default();
-        let why = format!("HTTP {status} {desc}");
+            .and_then(|r| r.description.as_deref())
+            .unwrap_or(if parsed.is_none() { "invalid JSON" } else { "" });
+        let why = format!("HTTP {status} {}", sanitize_description(desc, &self.token));
         if status.as_u16() == 429 {
             let after = parsed
                 .and_then(|r| r.parameters)
@@ -476,9 +522,33 @@ pub fn next_slot(
     at
 }
 
+/// Remove every occurrence of the bot token (defence in depth on top of
+/// `reqwest::Error::without_url`). Shared by the alert worker and the
+/// command client.
+pub fn redact(s: &str, token: &str) -> String {
+    if token.is_empty() {
+        return s.to_string();
+    }
+    s.replace(token, "<redacted>")
+}
+
+/// Longest Bot API `description` kept in an error message.
+pub const MAX_DESCRIPTION_CHARS: usize = 200;
+
+/// A Bot API `description` safe to log: the token redacted first (a token
+/// straddling the cut would otherwise survive), then cut to
+/// [`MAX_DESCRIPTION_CHARS`].
+pub fn sanitize_description(desc: &str, token: &str) -> String {
+    redact(desc, token)
+        .chars()
+        .take(MAX_DESCRIPTION_CHARS)
+        .collect()
+}
+
 /// A reqwest error with its cause chain (timeout, DNS, connection
-/// refused...). Strip the URL first (`without_url`): it holds the token.
-fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+/// refused...). Strip the URL first (`without_url`): it holds the token;
+/// callers redact the result as well.
+pub(crate) fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
     let mut s = e.to_string();
     let mut src = e.source();
     while let Some(c) = src {

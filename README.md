@@ -40,7 +40,7 @@ A premium mean-reversion bot for the HIP-3 perpetual **`xyz:ANT`** on Hyperliqui
 ### Signal
 
 ```
-premium = 0.5 * (impact_bid_px + impact_ask_px) / oracle_px - 1     (in bps)
+premium_bps = (0.5 * (impact_bid_px + impact_ask_px) / oracle_px - 1) * 10_000
 ```
 
 This is the same definition Hyperliquid uses for `fundingHistory.premium` and the research backtest. `activeAssetCtx.impactPxs` provides the impact prices. If `strategy.premium_source = "book_mid"`, the l2Book mid is used instead.
@@ -371,7 +371,7 @@ These rates drive paper fills, replay and PnL accounting. The venue charges its 
 |---|---|---|
 | `data_dir` | `"data"` | state, CSV journals, `logs/` (overridden by `--data-dir` / `ANTBOT_DATA_DIR`) |
 | `log_json` | `false` | JSON lines instead of text on both outputs |
-| `log_max_files` | `30` | daily log files kept (0 = keep all) |
+| `log_max_files` | `30` | daily log files kept (0 = keep all). `1` acts as `2` (today and the previous file), so a same-day restart never erases today's log |
 | `telegram_enabled` | `true` | Telegram alerts (still need the env vars) |
 | `telegram_max_per_min` | `20` | Telegram rate limit (1–30); queued alerts are merged |
 | `telegram_commands_enabled` | `true` | answer the read-only `/pnl`, `/trades`, `/help` commands. Active only with `telegram_enabled`, both env vars set, and `TELEGRAM_CHAT_ID` a private chat (your user id) |
@@ -505,7 +505,7 @@ Everything is written to the data dir (`monitor.data_dir`, `--data-dir` or `ANTB
 | `risk_state.json` | kill state, hit-rate window, equity peak, day start, spec baseline |
 | `antbot.lock` | run marker with a heartbeat. `reset-kill` refuses to run while it is fresh. The Docker healthcheck uses it |
 
-- **CSV journals:** headers are written once and restarts append. If a newer version changes the columns, the old file is renamed `<name>.<unix_ms>.old` and a new one starts. Rows are written synchronously on the main loop and flushed to the OS, not fsynced: they survive a process crash but not necessarily a power loss. After a failed or partial write, the next row starts on a new line.
+- **CSV journals:** headers are written once and restarts append. If a newer version changes the columns, the old file is renamed `<name>.<unix_ms>.old` and a new one starts. Rows are written synchronously on the main loop and flushed to the OS, not fsynced: they survive a process crash but not necessarily a power loss. After a failed or partial write (or a crash mid-row), the next row starts on a new line; a row cut inside a quoted field has its quote closed first, so it cannot swallow the rows after it.
 - **Heartbeat:** a `heartbeat` log line every `timing.heartbeat_secs` with `phase`, `premium_bps` (the signal), `raw_premium_bps`, `position`, `unrealized_usd`, `working_order`, `equity_usd`, `realized_usd`, `trades`, `venue_position`, `killed`, and feed health: `ws_connected`, `ws_connects`, `rest_polls` and `data_age_ms` (age of the older of the last book and the last asset ctx).
 - **Healthy run:** at startup you should see `antbot starting`, `asset resolved`, `websocket connected` and `main loop started`, then heartbeats.
 - **Quick status:** `scripts/paper_status.sh <data_dir>` (or an instance dir containing `data/`) is a read-only summary of a paper run: process alive (from `antbot.lock`), last heartbeat line, latest premium sample and the range seen in `signals.csv`, phase and position, kill state, order and trade counts, and cumulative paper PnL from `trades.csv`. It needs `jq` and `awk` and never touches the network.
@@ -536,9 +536,10 @@ Sending never blocks the trading loop:
 - Alerts go into a bounded queue. A background task sends at most `monitor.telegram_max_per_min` per minute, about one per second, and merges alerts that pile up meanwhile.
 - A merged message never cuts an alert: alerts that do not fit in one message are carried to the next one. Only a single alert longer than the Telegram limit is truncated.
 - A 429 response is retried after its `retry_after`. 5xx and transport errors are retried with backoff.
+- A 200 response counts as delivered only if its body is a valid Bot API answer with `"ok": true`. A cut or malformed body is retried like a transport error: delivery is unknown, and a duplicate is preferred over a lost alert.
 - On queue overflow, alerts are dropped. Alerts that still fail after 3 attempts are given up. Both are counted at the top of the next message ("(N alerts dropped: queue full)", "(N earlier alerts could not be delivered)").
 - The sent and failed counts are logged at shutdown.
-- The token never appears in the logs.
+- The token never appears in the logs: it is part of the request URL, so errors are logged without the URL, and every error string (including an API `description` that echoes the URL) has the token replaced by `<redacted>`. This applies to both alerts and commands.
 
 ### Telegram commands
 
@@ -567,7 +568,7 @@ The bot answers three **read-only** commands in its private chat:
 So `TELEGRAM_CHAT_ID` must be your Telegram **user id**: the chat id of your private chat with the bot, a positive number.
 - With a group or channel id (negative), alerts still work but commands are disabled. Use a private chat if you want both.
 - Everything else is ignored without a reply and logged at debug level at most: other users or chats, groups, supergroups, channels, edited messages, callback queries, messages without a sender, and non-text messages.
-- Messages sent while the bot was down are skipped, so a restart does not answer a backlog. At startup a `getUpdates` call with `offset=-1` forgets the pending updates, and any message dated before the start is ignored anyway.
+- Messages sent while the bot was down are skipped, so a restart does not answer a backlog. At startup a `getUpdates` call with `offset=-1` forgets the pending updates. Messages dated more than 5 seconds before the start are also ignored, a fallback in case that call fails; the 5 s tolerance absorbs clock skew between the host and Telegram, so a message sent in those last seconds before the start can still be answered.
 
 **Read-only guarantee.**
 - The command task only holds a copy of the state snapshot and an HTTP client. It has no handle on the engine, the executor or the kill switch.
