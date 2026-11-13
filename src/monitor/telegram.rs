@@ -8,9 +8,15 @@
 //!   most `max_per_min` in any rolling minute (Telegram allows about one
 //!   message per second per chat, 20 per minute in groups). Alerts already
 //!   queued while waiting are merged into one message (up to the size
-//!   limit), so bursts (kill + exit + warnings) arrive together. A `429`
-//!   answer honours `retry_after`; transport errors and `5xx` are retried
-//!   with backoff; other errors drop the message with a log line.
+//!   limit), so bursts (kill + exit + warnings) arrive together. An alert
+//!   that does not fit is never cut: it is carried over and starts the
+//!   next message (only a single alert longer than the limit is
+//!   truncated). A `429` answer honours `retry_after`; transport errors
+//!   and `5xx` are retried with backoff; other errors drop the message
+//!   with a log line, and the next message says how many alerts were not
+//!   delivered. A retry after a transport timeout can post the same
+//!   message twice (Telegram has no idempotency key): duplicates are
+//!   preferred over losses.
 //! * **Disabled gracefully:** without a token / chat id (or with
 //!   `monitor.telegram_enabled = false`) a single log line says so and
 //!   every call is a no-op.
@@ -112,6 +118,7 @@ enum Msg {
 struct Inner {
     tx: mpsc::Sender<Msg>,
     dropped: Arc<AtomicU64>,
+    stats: Arc<Stats>,
 }
 
 /// Cheap-to-clone handle on the alert queue (no-op when disabled).
@@ -131,8 +138,14 @@ impl std::fmt::Debug for Alerter {
 /// Delivery counters (for tests and the shutdown log).
 #[derive(Debug, Default)]
 pub struct Stats {
+    /// Messages delivered (one message can hold several alerts).
     pub sent: AtomicU64,
+    /// Messages given up after the retries.
     pub failed: AtomicU64,
+    /// Alerts inside the failed messages.
+    pub failed_alerts: AtomicU64,
+    /// Alerts dropped because the queue was full.
+    pub dropped: AtomicU64,
 }
 
 impl Alerter {
@@ -173,27 +186,45 @@ impl Alerter {
 
     /// Start the sender task.
     pub fn spawn(cfg: TelegramConfig, settings: AlertSettings) -> (Self, Arc<Stats>) {
+        let stats = Arc::new(Stats::default());
+        // No `Client::default()` fallback: it panics when TLS cannot be
+        // initialised (the likely reason `build()` failed) and has no
+        // timeout. Alerts are disabled instead.
+        let http = match reqwest::Client::builder()
+            .timeout(settings.http_timeout)
+            .user_agent(concat!("antbot/", env!("CARGO_PKG_VERSION")))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    error = %error_chain(&e),
+                    "telegram alerts disabled: cannot build the HTTP client"
+                );
+                return (Self::disabled(), stats);
+            }
+        };
         let (tx, rx) = mpsc::channel(settings.queue_capacity.max(1));
         let dropped = Arc::new(AtomicU64::new(0));
-        let stats = Arc::new(Stats::default());
         let worker = Worker {
-            http: reqwest::Client::builder()
-                .timeout(settings.http_timeout)
-                .user_agent(concat!("antbot/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .unwrap_or_default(),
+            http,
             url: cfg.send_url(),
             chat_id: cfg.chat_id,
             settings,
             rx,
             dropped: dropped.clone(),
+            undelivered: 0,
             stats: stats.clone(),
             sent_at: VecDeque::new(),
         };
         tokio::spawn(worker.run());
         (
             Self {
-                inner: Some(Arc::new(Inner { tx, dropped })),
+                inner: Some(Arc::new(Inner {
+                    tx,
+                    dropped,
+                    stats: stats.clone(),
+                })),
             },
             stats,
         )
@@ -210,6 +241,7 @@ impl Alerter {
             return;
         };
         if inner.tx.try_send(Msg::Text(text.into())).is_err() {
+            inner.stats.dropped.fetch_add(1, Ordering::Relaxed);
             let n = inner.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if n == 1 || n % 50 == 0 {
                 tracing::warn!(dropped = n, "telegram alert queue full: alert dropped");
@@ -241,6 +273,21 @@ impl Alerter {
         }
         done
     }
+
+    /// Log the delivery counters (at shutdown, after [`Self::flush`]).
+    pub fn log_stats(&self) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let s = &inner.stats;
+        tracing::info!(
+            sent = s.sent.load(Ordering::Relaxed),
+            failed = s.failed.load(Ordering::Relaxed),
+            failed_alerts = s.failed_alerts.load(Ordering::Relaxed),
+            dropped_queue_full = s.dropped.load(Ordering::Relaxed),
+            "telegram alert delivery stats"
+        );
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -271,6 +318,8 @@ struct Worker {
     settings: AlertSettings,
     rx: mpsc::Receiver<Msg>,
     dropped: Arc<AtomicU64>,
+    /// Alerts of messages given up since the last delivered message.
+    undelivered: u64,
     stats: Arc<Stats>,
     /// Send times within the last minute.
     sent_at: VecDeque<Instant>,
@@ -278,36 +327,42 @@ struct Worker {
 
 impl Worker {
     async fn run(mut self) {
-        let mut pending_flush: Option<oneshot::Sender<()>> = None;
-        while let Some(msg) = self.rx.recv().await {
-            let first = match msg {
-                Msg::Flush(ack) => {
-                    let _ = ack.send(());
-                    continue;
-                }
-                Msg::Text(t) => t,
+        // An alert that did not fit in the previous message.
+        let mut carry: Option<String> = None;
+        loop {
+            let first = match carry.take() {
+                Some(t) => t,
+                None => match self.rx.recv().await {
+                    None => break,
+                    Some(Msg::Flush(ack)) => {
+                        let _ = ack.send(());
+                        continue;
+                    }
+                    Some(Msg::Text(t)) => t,
+                },
             };
             self.wait_turn().await;
-            // Merge what queued up meanwhile (stop at a flush marker).
-            let mut texts = vec![first];
-            let mut len = texts[0].chars().count();
-            while len < MAX_ALERT_CHARS {
-                match self.rx.try_recv() {
-                    Ok(Msg::Text(t)) => {
-                        len += t.chars().count() + 2;
-                        texts.push(t);
-                    }
-                    Ok(Msg::Flush(ack)) => {
-                        pending_flush = Some(ack);
-                        break;
-                    }
-                    Err(_) => break,
-                }
-            }
+            // Merge what queued up meanwhile, within the size budget.
             let dropped = self.dropped.swap(0, Ordering::Relaxed);
-            let text = compose(&self.settings.prefix, &texts, dropped);
-            self.deliver(&text).await;
-            if let Some(ack) = pending_flush.take() {
+            let undelivered = self.undelivered;
+            let head = header(&self.settings.prefix, dropped, undelivered);
+            let budget = MAX_ALERT_CHARS.saturating_sub(head.chars().count());
+            let rx = &mut self.rx;
+            let batch = fill_batch(first, budget, || rx.try_recv().ok());
+            carry = batch.carry;
+            let text = compose_with_header(&head, &batch.texts);
+            if self.deliver(&text).await {
+                self.undelivered = 0;
+            } else {
+                // Not delivered: say so in the next message, with the
+                // queue-full drops this message was carrying.
+                self.undelivered += batch.texts.len() as u64;
+                self.dropped.fetch_add(dropped, Ordering::Relaxed);
+                self.stats
+                    .failed_alerts
+                    .fetch_add(batch.texts.len() as u64, Ordering::Relaxed);
+            }
+            if let Some(ack) = batch.flush {
                 let _ = ack.send(());
             }
         }
@@ -327,14 +382,15 @@ impl Worker {
         }
     }
 
-    async fn deliver(&mut self, text: &str) {
+    /// Send one message (with retries). Returns whether it was delivered.
+    async fn deliver(&mut self, text: &str) -> bool {
         let mut backoff = self.settings.retry_backoff;
         for attempt in 1..=SEND_ATTEMPTS {
             self.sent_at.push_back(Instant::now());
             match self.post(text).await {
                 Ok(()) => {
                     self.stats.sent.fetch_add(1, Ordering::Relaxed);
-                    return;
+                    return true;
                 }
                 Err(SendError::Retry(wait, why)) if attempt < SEND_ATTEMPTS => {
                     let wait = if wait.is_zero() { backoff } else { wait };
@@ -346,10 +402,11 @@ impl Worker {
                     // warn, not error: errors are alerted, this must not loop.
                     tracing::warn!(attempt, error = %why, "telegram alert not delivered");
                     self.stats.failed.fetch_add(1, Ordering::Relaxed);
-                    return;
+                    return false;
                 }
             }
         }
+        false
     }
 
     async fn post(&self, text: &str) -> Result<(), SendError> {
@@ -365,7 +422,7 @@ impl Worker {
             .send()
             .await
             // The URL holds the token: never log it.
-            .map_err(|e| SendError::Retry(Duration::ZERO, e.without_url().to_string()))?;
+            .map_err(|e| SendError::Retry(Duration::ZERO, error_chain(&e.without_url())))?;
         let status = resp.status();
         let parsed: Option<TgResponse> = resp.json().await.ok();
         if status.is_success() && parsed.as_ref().is_none_or(|r| r.ok) {
@@ -419,17 +476,92 @@ pub fn next_slot(
     at
 }
 
-/// One Telegram message out of one or more queued alerts.
-pub fn compose(prefix: &str, texts: &[String], dropped: u64) -> String {
+/// A reqwest error with its cause chain (timeout, DNS, connection
+/// refused...). Strip the URL first (`without_url`): it holds the token.
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(c) = src {
+        let c_s = c.to_string();
+        if !s.contains(&c_s) {
+            s.push_str(": ");
+            s.push_str(&c_s);
+        }
+        src = c.source();
+    }
+    s
+}
+
+/// The alerts of one message, and what stopped the merge.
+struct Batch {
+    texts: Vec<String>,
+    /// The next alert, which did not fit: it starts the next message.
+    carry: Option<String>,
+    /// A flush marker reached: ack it once this message is handled.
+    flush: Option<oneshot::Sender<()>>,
+}
+
+/// Merge queued alerts (`next` pops the queue) after `first` while the
+/// message body stays within `budget` characters. An alert is never cut
+/// here: one that does not fit is returned as `carry`. Stops at a flush
+/// marker so the flush is acked only after what was queued before it.
+fn fill_batch(first: String, budget: usize, mut next: impl FnMut() -> Option<Msg>) -> Batch {
+    // Body length as built by `compose_with_header`: "\n" + first, then
+    // "\n\n" + each other alert.
+    let mut len = 1 + first.chars().count();
+    let mut b = Batch {
+        texts: vec![first],
+        carry: None,
+        flush: None,
+    };
+    while len < budget {
+        match next() {
+            Some(Msg::Text(t)) => {
+                let n = 2 + t.chars().count();
+                if len + n > budget {
+                    b.carry = Some(t);
+                    break;
+                }
+                len += n;
+                b.texts.push(t);
+            }
+            Some(Msg::Flush(ack)) => {
+                b.flush = Some(ack);
+                break;
+            }
+            None => break,
+        }
+    }
+    b
+}
+
+/// First line(s) of a message: prefix, then the loss counters.
+pub fn header(prefix: &str, dropped: u64, undelivered: u64) -> String {
     let mut s = String::from(prefix);
     if dropped > 0 {
         s.push_str(&format!("\n({dropped} alerts dropped: queue full)"));
     }
-    for t in texts {
-        s.push_str(if s == prefix { "\n" } else { "\n\n" });
+    if undelivered > 0 {
+        s.push_str(&format!(
+            "\n({undelivered} earlier alerts could not be delivered)"
+        ));
+    }
+    s
+}
+
+fn compose_with_header(head: &str, texts: &[String]) -> String {
+    let mut s = String::from(head);
+    for (i, t) in texts.iter().enumerate() {
+        s.push_str(if i == 0 { "\n" } else { "\n\n" });
         s.push_str(t);
     }
+    // Only cuts a single alert that is too long by itself.
     truncate(&s)
+}
+
+/// One Telegram message out of one or more queued alerts.
+pub fn compose(prefix: &str, texts: &[String], dropped: u64) -> String {
+    compose_with_header(&header(prefix, dropped, 0), texts)
 }
 
 #[cfg(test)]
@@ -520,7 +652,121 @@ mod tests {
         assert_eq!(compose("[antbot]", &["a".into()], 0), "[antbot]\na");
         assert_eq!(
             compose("[antbot]", &["a".into(), "b".into()], 2),
-            "[antbot]\n(2 alerts dropped: queue full)\n\na\n\nb"
+            "[antbot]\n(2 alerts dropped: queue full)\na\n\nb"
         );
+        assert_eq!(
+            compose_with_header(&header("[antbot]", 0, 3), &["a".into()]),
+            "[antbot]\n(3 earlier alerts could not be delivered)\na"
+        );
+    }
+
+    /// Drain `queue` the way the worker does; returns the composed
+    /// messages.
+    fn drain_like_worker(prefix: &str, queue: Vec<String>) -> Vec<String> {
+        let mut q: std::collections::VecDeque<Msg> = queue.into_iter().map(Msg::Text).collect();
+        let mut out = Vec::new();
+        let mut carry: Option<String> = None;
+        loop {
+            let first = match carry.take() {
+                Some(t) => t,
+                None => match q.pop_front() {
+                    Some(Msg::Text(t)) => t,
+                    Some(Msg::Flush(_)) => continue,
+                    None => break,
+                },
+            };
+            let head = header(prefix, 7, 0);
+            let budget = MAX_ALERT_CHARS - head.chars().count();
+            let b = fill_batch(first, budget, || q.pop_front());
+            carry = b.carry;
+            out.push(compose_with_header(&head, &b.texts));
+        }
+        out
+    }
+
+    #[test]
+    fn merged_burst_never_cuts_the_kill_alert() {
+        // ~30 warnings of ~125 chars, then the kill alert, then more.
+        let mut queue: Vec<String> = (0..30)
+            .map(|i| {
+                format!(
+                    "⚠️ userFills resync failed (attempt {i:02}): {}",
+                    "x".repeat(80)
+                )
+            })
+            .collect();
+        let kill = crate::monitor::alerts::kill(
+            &format!("daily loss -151.20 USD <= -150 USD {}", "y".repeat(200)),
+            true,
+        );
+        queue.push(kill.clone());
+        queue.extend((0..40).map(|i| format!("⚠️ rate limited {i}: {}", "z".repeat(100))));
+        let msgs = drain_like_worker("[antbot paper xyz:ANT]", queue.clone());
+        assert!(msgs.len() >= 2);
+        for m in &msgs {
+            assert!(
+                m.chars().count() <= MAX_ALERT_CHARS,
+                "{}",
+                m.chars().count()
+            );
+            assert!(!m.contains("(truncated)"));
+        }
+        // The kill alert arrives whole, exactly once.
+        assert_eq!(msgs.iter().filter(|m| m.contains(&kill)).count(), 1);
+        // Every alert is delivered, in order, exactly once.
+        let all = msgs.join("\n\n");
+        let mut from = 0;
+        for t in &queue {
+            let at = all[from..].find(t.as_str()).expect("alert lost") + from;
+            from = at + t.len();
+        }
+    }
+
+    #[test]
+    fn single_oversized_alert_is_truncated_alone() {
+        let big = "b".repeat(MAX_ALERT_CHARS + 100);
+        let msgs = drain_like_worker("[antbot]", vec!["small".into(), big, "after".into()]);
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs[0].ends_with("small"));
+        assert!(msgs[1].ends_with("(truncated)"));
+        assert!(msgs[1].chars().count() <= MAX_ALERT_CHARS);
+        assert!(msgs[2].ends_with("after"));
+    }
+
+    #[test]
+    fn fill_batch_stops_at_flush_marker() {
+        let (ack, _rx) = oneshot::channel();
+        let mut q: std::collections::VecDeque<Msg> = vec![
+            Msg::Text("b".into()),
+            Msg::Flush(ack),
+            Msg::Text("c".into()),
+        ]
+        .into();
+        let b = fill_batch("a".into(), 1000, || q.pop_front());
+        assert_eq!(b.texts, vec!["a".to_string(), "b".to_string()]);
+        assert!(b.flush.is_some());
+        assert!(b.carry.is_none());
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn error_chain_includes_causes() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error sending request")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let e = Outer(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ));
+        assert_eq!(error_chain(&e), "error sending request: connection refused");
     }
 }

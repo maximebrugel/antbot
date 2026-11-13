@@ -235,3 +235,57 @@ async fn disabled_alerter_is_a_noop() {
     a.send("nothing");
     assert!(a.flush(Duration::from_millis(10)).await);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undelivered_alerts_are_reported_in_the_next_message() {
+    let (base, seen) = spawn_mock(vec![(
+        "400 Bad Request",
+        r#"{"ok":false,"error_code":400,"description":"Bad Request: message is too long"}"#,
+    )])
+    .await;
+    let (a, stats) = Alerter::spawn(cfg(&base), settings());
+    a.send("lost");
+    assert!(a.flush(Duration::from_secs(10)).await);
+    a.send("next");
+    assert!(a.flush(Duration::from_secs(10)).await);
+    let t = texts(&seen);
+    assert_eq!(t.len(), 2);
+    assert_eq!(
+        t[1],
+        "[antbot paper xyz:ANT]\n(1 earlier alerts could not be delivered)\nnext"
+    );
+    assert_eq!(stats.failed.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.failed_alerts.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.sent.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_burst_is_split_without_cutting_alerts() {
+    let (base, seen) = spawn_mock(vec![]).await;
+    let mut s = settings();
+    s.queue_capacity = 256;
+    // Slow pacing so the whole burst is queued before the first send.
+    s.min_interval = Duration::from_millis(300);
+    let (a, _) = Alerter::spawn(cfg(&base), s);
+    a.send("warm-up");
+    let sent: Vec<String> = (0..60)
+        .map(|i| format!("warning {i:02} {}", "w".repeat(120)))
+        .chain(std::iter::once(
+            "⛔ KILL SWITCH: daily loss limit reached".to_string(),
+        ))
+        .collect();
+    for t in &sent {
+        a.send(t.clone());
+    }
+    assert!(a.flush(Duration::from_secs(20)).await);
+    let msgs = texts(&seen);
+    assert!(msgs.len() >= 3, "{}", msgs.len());
+    for m in &msgs {
+        assert!(m.chars().count() <= 3800);
+        assert!(!m.contains("(truncated)"));
+    }
+    let all = msgs.join("\n");
+    for t in &sent {
+        assert_eq!(all.matches(t.as_str()).count(), 1, "{t}");
+    }
+}

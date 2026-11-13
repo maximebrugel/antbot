@@ -31,7 +31,19 @@ pub fn file_appender(data_dir: &Path, max_files: usize) -> anyhow::Result<Rollin
 
 /// `RUST_LOG`, or [`DEFAULT_FILTER`] when unset / invalid.
 pub fn env_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER))
+    parse_filter(std::env::var(EnvFilter::DEFAULT_ENV).ok().as_deref()).0
+}
+
+/// Filter from a `RUST_LOG` value: [`DEFAULT_FILTER`] when unset or
+/// empty, and also when invalid (with the parse error, to be logged).
+pub fn parse_filter(value: Option<&str>) -> (EnvFilter, Option<String>) {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => (EnvFilter::new(DEFAULT_FILTER), None),
+        Some(v) => match EnvFilter::try_new(v) {
+            Ok(f) => (f, None),
+            Err(e) => (EnvFilter::new(DEFAULT_FILTER), Some(e.to_string())),
+        },
+    }
 }
 
 /// Initialise global logging. Keep the returned guard alive for the whole
@@ -74,6 +86,13 @@ pub fn init(data_dir: &Path, json: bool, max_files: usize) -> anyhow::Result<Wor
         .with(stdout_layer)
         .with(file_layer)
         .try_init()?;
+    if let (_, Some(e)) = parse_filter(std::env::var(EnvFilter::DEFAULT_ENV).ok().as_deref()) {
+        tracing::warn!(
+            error = %e,
+            fallback = DEFAULT_FILTER,
+            "invalid RUST_LOG: using the default filter"
+        );
+    }
     Ok(guard)
 }
 
@@ -97,6 +116,16 @@ mod tests {
         assert!(n.starts_with("antbot.log."), "{n}");
         // antbot.log.YYYY-MM-DD
         assert_eq!(n.len(), "antbot.log.".len() + 10, "{n}");
+    }
+
+    #[test]
+    fn rust_log_parsing() {
+        assert!(parse_filter(None).1.is_none());
+        assert!(parse_filter(Some("  ")).1.is_none());
+        assert!(parse_filter(Some("info,antbot=debug")).1.is_none());
+        let (f, err) = parse_filter(Some("info,antbot=loud"));
+        assert!(err.is_some());
+        assert_eq!(f.to_string(), DEFAULT_FILTER);
     }
 
     #[test]

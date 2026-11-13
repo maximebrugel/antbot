@@ -236,7 +236,8 @@ impl DailySummary {
 }
 
 /// Premium range tracker for the current UTC day (signal samples).
-#[derive(Debug, Clone, Default, PartialEq)]
+/// Persisted in the bot state.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DayTracker {
     pub day: Option<u64>,
     pub min_bps: Option<f64>,
@@ -259,6 +260,21 @@ impl DayTracker {
         self.min_bps = Some(self.min_bps.map_or(p, |m| m.min(p)));
         self.max_bps = Some(self.max_bps.map_or(p, |m| m.max(p)));
         self.last_bps = Some(p);
+    }
+
+    /// Resume a persisted tracker at startup. Returns the tracker for
+    /// today (the persisted one if it is for today, so the premium range
+    /// survives a mid-day restart) and, if the persisted day is over, that
+    /// finished day: its summary was never sent (the bot was down at
+    /// midnight UTC). Days the bot never ran are not reported.
+    pub fn resume(saved: Option<DayTracker>, now_ms: u64) -> (DayTracker, Option<DayTracker>) {
+        let today = utc_day(now_ms);
+        match saved {
+            Some(t) if t.day == Some(today) => (t, None),
+            Some(t) if t.day.is_some_and(|d| d < today) => (Self::new(now_ms), Some(t)),
+            // None, no day, or a day in the future (clock change).
+            _ => (Self::new(now_ms), None),
+        }
     }
 
     /// If the UTC day changed, return the finished day (with its premium
@@ -417,5 +433,26 @@ mod tests {
         assert_eq!(tr.day, Some(20_001));
         assert_eq!(tr.min_bps, None);
         assert!(tr.roll(20_001 * DAY + 10).is_none());
+    }
+
+    #[test]
+    fn day_tracker_resume_after_restart() {
+        let mut saved = DayTracker::new(20_000 * DAY + 5);
+        saved.sample(Some(-55.0));
+        // Same day: keep the range.
+        let (t, missed) = DayTracker::resume(Some(saved.clone()), 20_000 * DAY + 9_000_000);
+        assert_eq!(t, saved);
+        assert!(missed.is_none());
+        // Down over midnight: the finished day is reported once.
+        let (t, missed) = DayTracker::resume(Some(saved.clone()), 20_001 * DAY + 300_000);
+        assert_eq!(t.day, Some(20_001));
+        assert_eq!(t.min_bps, None);
+        assert_eq!(missed, Some(saved.clone()));
+        // Several days down: only the last day the bot ran.
+        let (_, missed) = DayTracker::resume(Some(saved.clone()), 20_005 * DAY);
+        assert_eq!(missed.unwrap().day, Some(20_000));
+        // Fresh state or a clock that went backwards: nothing.
+        assert!(DayTracker::resume(None, 20_000 * DAY).1.is_none());
+        assert!(DayTracker::resume(Some(saved), 19_999 * DAY).1.is_none());
     }
 }

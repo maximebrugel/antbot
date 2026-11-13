@@ -106,6 +106,9 @@ enum Command {
     CheckConfig {
         #[command(flatten)]
         mode: ModeArgs,
+        /// Override monitor.data_dir (as `run` does).
+        #[arg(long, env = "ANTBOT_DATA_DIR")]
+        data_dir: Option<PathBuf>,
     },
     /// Show the persisted kill-switch state (<data_dir>/risk_state.json).
     KillStatus {
@@ -143,7 +146,9 @@ async fn main() -> ExitCode {
 async fn real_main(cli: Cli) -> anyhow::Result<()> {
     let cfg = Config::load(&cli.config)?;
     match cli.command {
-        Command::CheckConfig { mode } => check_config(&cfg, &cli.config, &mode),
+        Command::CheckConfig { mode, data_dir } => {
+            check_config(&cfg, &cli.config, &mode, data_dir.as_deref())
+        }
         Command::Run { mode, data_dir } => run(cfg, &mode, data_dir).await,
         Command::Probe {
             secs,
@@ -232,7 +237,12 @@ fn resolve(cfg: &Config, args: &ModeArgs) -> anyhow::Result<(Mode, Option<mode::
     Ok((m, creds))
 }
 
-fn check_config(cfg: &Config, path: &std::path::Path, args: &ModeArgs) -> anyhow::Result<()> {
+fn check_config(
+    cfg: &Config,
+    path: &std::path::Path,
+    args: &ModeArgs,
+    data_dir: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     let (m, creds) = resolve(cfg, args)?;
     let ep = cfg.endpoints(m);
     println!("config:        {} (valid)", path.display());
@@ -300,7 +310,19 @@ fn check_config(cfg: &Config, path: &std::path::Path, args: &ModeArgs) -> anyhow
         r.hit_rate_min, r.hit_rate_window, r.persistent_premium_bps, r.persistent_premium_secs,
         r.daily_loss_limit_usd, r.max_drawdown_usd, r.kill_on_spec_change
     );
-    println!("data dir:      {}", cfg.monitor.data_dir.display());
+    match data_dir {
+        Some(d) => println!(
+            "data dir:      {} (override; config has {})",
+            d.display(),
+            cfg.monitor.data_dir.display()
+        ),
+        None => println!("data dir:      {}", cfg.monitor.data_dir.display()),
+    }
+    if m == Mode::Mainnet {
+        println!(
+            "note:          `run` refuses mainnet in this build (mainnet trading is not wired)"
+        );
+    }
     Ok(())
 }
 

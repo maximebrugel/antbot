@@ -7,8 +7,13 @@
 #   docker compose up -d --build
 #   docker compose logs -f antbot
 #
-# Testnet: set `mode = "testnet"` in the config, or change `command` to
-# ["run", "--mode", "testnet"], and fill HL_PRIVATE_KEY in .env.
+# Requires Docker Compose >= 2.24 (env_file with `required: false`).
+#
+# Testnet: use a config with `mode = "testnet"` (e.g. ./config/local.toml)
+# and a separate data dir, never the paper state in /data. In .env:
+#   ANTBOT_CONFIG=/app/config/local.toml
+#   ANTBOT_DATA_DIR=/data/testnet      # ./data/testnet on the host
+#   HL_PRIVATE_KEY=...                 # plus HL_ACCOUNT_ADDRESS for an API wallet
 services:
   antbot:
     build:

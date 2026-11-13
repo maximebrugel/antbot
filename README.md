@@ -27,7 +27,7 @@ A premium mean-reversion bot for the HIP-3 perpetual **`xyz:ANT`** on Hyperliqui
 ## What it does
 
 - **Resolves the asset at startup.** It reads `perpDexs` and `meta {"dex":"xyz"}` and computes the HIP-3 asset id as `100000 + perp_dex_index * 10000 + index_in_meta`. On mainnet today, `xyz:ANT` resolves to dex index 1 and meta index 138, so asset id 110138. It also reads `szDecimals`, max leverage and the fee/growth-mode fields.
-- **Streams market data** over the websocket: `l2Book`, `activeAssetCtx` (oracle, mark, impact prices), and in paper mode public `trades`. It reconnects with exponential backoff and falls back to REST polling (`metaAndAssetCtxs`) while the websocket is stale.
+- **Streams market data** over the websocket: `l2Book`, `activeAssetCtx` (oracle, mark, impact prices), and in paper mode public `trades`. It reconnects with exponential backoff and falls back to REST polling (`metaAndAssetCtxs` + `l2Book`) while the websocket is stale.
 - **Computes the premium** continuously, averages it over a rolling window (the backtested signal), and runs a state machine: flat → entering → in position → exiting → cooldown.
 - **Places orders.** Entries are maker-only ALO (post-only) limit orders on isolated margin, 1x by default. Exits go maker first, with an IOC taker fallback near the deadline. Prices respect the tick and 5-significant-figure rules, and sizes respect `szDecimals`.
 - **Enforces kill rules:** hit rate, persistent premium, spec change, daily loss and max drawdown. A kill is persisted and needs a manual reset.
@@ -54,7 +54,7 @@ The signal is the rolling mean of the premium over `strategy.premium_avg_secs` (
 | Position | one at a time, isolated margin, 1x |
 | Size | 2,500 USD notional (hard cap 10,000 USD, enforced in code) |
 | Early exit | signal back to ≤ 10 bps on the faded side (or crossed). Can be turned off |
-| Max hold | 8 h. The maker exit starts before the deadline, and IOC taker fallback is used in the last 15 min |
+| Max hold | 8 h. The maker exit starts at 7 h 35 min, and IOC taker fallback is used in the last 15 min |
 | Cooldown | 1 h after an exit (as in the backtest) |
 
 ### Research numbers
@@ -163,22 +163,22 @@ Fills at the touch are reduced by a queue model: the size already resting at our
 
 ## Build and run
 
-Requires stable Rust (CI uses the latest stable; edition 2021).
+Requires Rust 1.85 or newer (`rust-version` in `Cargo.toml`; edition 2021). CI uses the latest stable.
 
 ```sh
 cargo build --release
 cargo test
 
-./target/release/antbot check-config     # validate config/default.toml and the mode guard
+./target/release/antbot check-config     # validate config/default.toml and the mode guard (no request is made)
 ./target/release/antbot probe --secs 30  # read-only: resolve xyz:ANT and print book / oracle / premium
 ./target/release/antbot run              # paper trading on live mainnet data (default)
 ./target/release/antbot kill-status      # show the persisted kill state
 ./target/release/antbot replay --help    # historical replay
 ```
 
-Global option: `-c/--config <file>` (env `ANTBOT_CONFIG`, default `config/default.toml`). `run`, `kill-status` and `reset-kill` accept `--data-dir` (env `ANTBOT_DATA_DIR`) to override `monitor.data_dir`.
+Global option: `-c/--config <file>` (env `ANTBOT_CONFIG`, default `config/default.toml`). `run`, `check-config`, `kill-status` and `reset-kill` accept `--data-dir` (env `ANTBOT_DATA_DIR`) to override `monitor.data_dir`. `check-config` prints the effective data dir.
 
-A `.env` file in the working directory is loaded at startup (`cp .env.example .env`).
+A `.env` file is loaded at startup (`cp .env.example .env`). It is searched in the working directory, then in its parent directories. It never overrides variables that are already set in the environment.
 
 ### Paper
 
@@ -218,19 +218,22 @@ Passing `--mainnet` when the resolved mode is not mainnet is an error. The excha
 
 **On top of that, this development build refuses mainnet trading outright** (`run` exits with "mainnet trading is not available in this build"). Enabling it is a deliberate code change, to be made only after a long paper and testnet track record.
 
+`check-config` only checks the guard conditions above. Its `exchange guard` line does not reflect this build-level refusal: it can print `ok` for mainnet even though `run` refuses it (a `note:` line says so in mainnet mode).
+
 ## Environment variables
 
 | variable | used in | meaning |
 |---|---|---|
-| `HL_PRIVATE_KEY` | testnet / mainnet | signing key, `0x` + 64 hex. **Use an API/agent wallet key, not your main wallet key.** Never read in paper mode |
+| `HL_PRIVATE_KEY` | testnet / mainnet | signing key, 64 hex, with or without `0x`. **Use an API/agent wallet key, not your main wallet key.** Never read in paper mode |
 | `HL_ACCOUNT_ADDRESS` | testnet / mainnet | main account address (`0x` + 40 hex) when `HL_PRIVATE_KEY` is an API wallet. Positions, balances, open orders and fills are queried for this address. Empty = the address derived from the key |
 | `ANTBOT_CONFIRM_MAINNET` | mainnet | must equal `yes-i-understand` (plus the `--mainnet` flag). Leave empty |
 | `TELEGRAM_BOT_TOKEN` | all | Telegram bot token. Alerts are disabled if unset |
 | `TELEGRAM_CHAT_ID` | all | chat id that receives the alerts |
 | `TELEGRAM_API_BASE` | all | optional Bot API base URL (default `https://api.telegram.org`, used by tests) |
-| `RUST_LOG` | all | log filter (tracing `EnvFilter` syntax), e.g. `info,antbot=debug` |
+| `RUST_LOG` | all | log filter (tracing `EnvFilter` syntax). Default and `.env.example`: `info`. `info,antbot=debug` adds the bot's debug lines. An invalid value falls back to `info` with a warning in the log |
 | `ANTBOT_CONFIG` | all | config file path (same as `-c`) |
-| `ANTBOT_DATA_DIR` | `run`, `kill-status`, `reset-kill` | data dir override (same as `--data-dir`). The Docker image sets `/data` |
+| `ANTBOT_DATA_DIR` | `run`, `check-config`, `kill-status`, `reset-kill` | data dir override (same as `--data-dir`). The Docker image sets `/data` |
+| `ANTBOT_UID` / `ANTBOT_GID` | `docker compose` only | uid / gid the container runs as (default `10001`). It must own `./data`. Not read by the bot |
 
 `.env.example` lists them. `.env` is git-ignored and must never be committed.
 
@@ -257,7 +260,7 @@ Notes:
 
 ## Configuration reference
 
-All thresholds live in `config/default.toml`, which is commented key by key. Unknown keys are rejected, and missing keys take the defaults below. The config is validated as a whole at load time: every violation is reported. Amounts are USD, durations seconds, fee rates fractions (0.0001 = 1 bp) unless the key ends in `_bps`/`_ms`.
+All thresholds live in `config/default.toml`, which is commented key by key. Unknown keys are rejected, and missing keys take the defaults below. The config is validated as a whole at load time: every violation is reported (see [Validation](#validation)). Amounts are USD, durations seconds, fee rates fractions (0.0001 = 1 bp) unless the key ends in `_bps`/`_ms`.
 
 ### Top level
 
@@ -305,7 +308,7 @@ At the first start, the live spec is checked against these baseline values and t
 | `requote_interval_secs` | `20` | minimum delay between re-prices of a resting ALO |
 | `requote_drift_bps` | `5.0` | re-price only if our price is this far from the target |
 | `taker_fallback_window_secs` | `900` | IOC taker fallback inside this window before max hold |
-| `exit_maker_timeout_secs` | `600` | convergence exit: go taker after this long resting |
+| `exit_maker_timeout_secs` | `600` | two uses: (1) a convergence exit goes taker after this long resting; (2) the max-hold maker exit starts at deadline − `taker_fallback_window_secs` − this (7 h 35 min by default) |
 | `taker_max_slippage_bps` | `50.0` | IOC limit = best ± this (max 500) |
 | `premium_avg_secs` | `3600` | rolling mean window of the signal (5 s slots). `0` = instantaneous premium (not the backtested signal). Max 14400 |
 | `entry_retry_cooldown_secs` | `60` | wait after an entry abandoned with nothing filled |
@@ -331,8 +334,8 @@ At the first start, the live spec is checked against these baseline values and t
 | `persistent_premium_bps` | `150.0` | kill when \|signal\| stays above this… |
 | `persistent_premium_secs` | `7200` | …for this long (regime change) |
 | `kill_on_spec_change` | `true` | kill on a market spec change |
-| `daily_loss_limit_usd` | `150.0` | kill when the UTC-day PnL (realized + unrealized) is below −this |
-| `max_drawdown_usd` | `300.0` | kill when equity falls this far below its peak |
+| `daily_loss_limit_usd` | `150.0` | kill when the UTC-day PnL (realized + unrealized) is ≤ −this |
+| `max_drawdown_usd` | `300.0` | kill when equity is this far or more below its peak (≥) |
 | `flatten_on_kill` | `true` | close the position on kill (maker, then taker). `false` = cancel orders and keep the position |
 | `kill_flatten_maker_secs` | `120` | maker phase of a kill flatten before IOC (0 = taker at once) |
 
@@ -349,7 +352,7 @@ These rates drive paper fills, replay and PnL accounting. The venue charges its 
 
 | key | default | meaning |
 |---|---|---|
-| `rest_fallback_poll_secs` | `5` | REST `metaAndAssetCtxs` poll period while the ws is stale |
+| `rest_fallback_poll_secs` | `5` | REST `metaAndAssetCtxs` + `l2Book` poll period while the ws is stale |
 | `ws_stale_secs` | `15` | no ws market data for this long → stale (REST fallback, no new entries on stale data) |
 | `ws_ping_secs` | `50` | ws ping interval |
 | `ws_reconnect_initial_ms` | `500` | initial reconnect backoff |
@@ -370,7 +373,7 @@ These rates drive paper fills, replay and PnL accounting. The venue charges its 
 | `log_max_files` | `30` | daily log files kept (0 = keep all) |
 | `telegram_enabled` | `true` | Telegram alerts (still need the env vars) |
 | `telegram_max_per_min` | `20` | Telegram rate limit (1–30); queued alerts are merged |
-| `daily_summary` | `true` | send a summary of the previous UTC day after 00:00 UTC |
+| `daily_summary` | `true` | send a summary of the previous UTC day after 00:00 UTC (also at the next start if it was missed) |
 
 ### `[paper]`
 
@@ -392,6 +395,31 @@ These rates drive paper fills, replay and PnL accounting. The venue charges its 
 | `max_exchange_actions_per_min` | `60` | client-side per-address action budget (cancels always allowed) |
 | `rate_limit_backoff_secs` | `60` | pause new orders after a rate-limit answer |
 | `expires_after_ms` | `30000` | `expiresAfter` on signed actions (0 = off) |
+
+### Validation
+
+Besides the types and the allowed values in the tables above, `validate` checks:
+
+- **Cross-field:**
+  - `market.coin` starts with `<market.dex>:`;
+  - `strategy.exit_converge_bps` < `strategy.entry_threshold_bps` < `risk.persistent_premium_bps`;
+  - `strategy.taker_fallback_window_secs` and `risk.kill_flatten_maker_secs` are each < `strategy.max_hold_secs`;
+  - `sizing.notional_usd` ≤ `sizing.max_notional_usd` ≤ 10,000 (hard cap);
+  - `sizing.leverage` ≤ `market.expected_max_leverage`;
+  - `fees.taker_rate` ≥ `fees.maker_rate`;
+  - `timing.ws_reconnect_max_ms` ≥ `timing.ws_reconnect_initial_ms`;
+  - `network.testnet_exchange_url` ≠ `network.mainnet_exchange_url`.
+- **Ranges:**
+  - `market`: `dex` and `coin` not empty, `expected_funding_multiplier` and `expected_deployer_fee_scale` ≥ 0, `expected_sz_decimals` ≤ 6, `expected_max_leverage` ≥ 1;
+  - `network`: info/exchange URLs start with `https://`, ws URLs with `wss://`; `http_timeout_secs` > 0;
+  - `strategy`: `entry_threshold_bps` > 0; `exit_converge_bps` and `requote_drift_bps` ≥ 0; `max_hold_secs`, `entry_timeout_secs`, `requote_interval_secs` and `exit_maker_timeout_secs` > 0; `taker_max_slippage_bps` in (0, 500]; `premium_avg_secs` ≤ 14400; `min_order_interval_ms` ≤ 60000; `max_order_actions_per_min` in 1..=600;
+  - `sizing`: `notional_usd` and `max_notional_usd` > 0, `leverage` in 1..=2, `margin_mode = "isolated"`;
+  - `risk`: `hit_rate_window` ≥ 1, `hit_rate_min` in (0, 1], `persistent_premium_bps`, `persistent_premium_secs`, `daily_loss_limit_usd` and `max_drawdown_usd` > 0;
+  - `fees`: each rate within [−0.01, 0.01] (a negative maker rate, i.e. a rebate, is allowed);
+  - `timing`: every `*_secs` key and `ws_reconnect_initial_ms` > 0, `ws_ping_secs` < 60, `rest_bucket_capacity` > 0, `rest_refill_per_sec` in (0, 20];
+  - `paper.initial_balance_usd` > 0;
+  - `live`: `reconcile_secs` in 1..=3600, `max_exchange_actions_per_min` ≥ 1, `expires_after_ms` 0 or in 5000..=300000;
+  - `monitor`: `data_dir` not empty, `telegram_max_per_min` in 1..=30.
 
 ## Replay / backtest
 
@@ -425,12 +453,12 @@ The historical premium is hourly (`fundingHistory.premium`). The replay reconstr
 
 The `Dockerfile` is a multi-stage build:
 - **Builder:** Rust on Debian trixie, with BuildKit cache mounts for the cargo registry and target dir.
-- **Runtime:** `debian:trixie-slim` with CA certificates only. It runs as the non-root user `antbot` (uid/gid 10001), with `/data` as a volume and a healthcheck on the run-lock heartbeat.
+- **Runtime:** `debian:trixie-slim` with CA certificates only. It runs as the non-root user `antbot` (uid/gid 10001), with `/data` as a volume and a healthcheck on the run-lock heartbeat (`$ANTBOT_DATA_DIR/antbot.lock`, so it follows a data dir override).
 
-`docker-compose.yml` runs paper mode by default. It reads `env_file: .env`, mounts `./data:/data` and `./config:/app/config:ro`, uses `restart: unless-stopped`, and rotates the json-file logs (10 MB × 5). It allows 30 s on stop for the graceful shutdown.
+`docker-compose.yml` needs **Docker Compose ≥ 2.24** (it uses `env_file` with `required: false`; older versions reject the file). It runs paper mode by default. It reads `env_file: .env`, mounts `./data:/data` and `./config:/app/config:ro`, uses `restart: unless-stopped`, and rotates the json-file logs (10 MB × 5). It allows 30 s on stop for the graceful shutdown.
 
 ```sh
-# On the VPS (Docker Engine + compose plugin installed)
+# On the VPS (Docker Engine + compose plugin >= 2.24 installed)
 git clone <your fork or private repo> antbot && cd antbot
 cp .env.example .env && chmod 600 .env      # fill TELEGRAM_*; HL_* only for testnet
 mkdir -p data && sudo chown 10001:10001 data # or set ANTBOT_UID/ANTBOT_GID in .env to your uid/gid
@@ -447,12 +475,18 @@ docker compose down                               # stop (SIGTERM: cancel orders
 git pull && docker compose up -d --build          # update
 docker compose run --rm antbot kill-status        # kill state
 docker compose stop antbot && docker compose run --rm antbot reset-kill --confirm && docker compose start antbot
-docker compose run --rm antbot check-config
+docker compose run --rm antbot check-config       # also prints the effective data dir
 tail -f data/logs/antbot.log.$(date -u +%F)       # file logs on the host
 ```
 
 - **Config:** edit `config/default.toml` on the host and restart. No rebuild is needed: `./config` is mounted. Alternatively, put a `config/local.toml` and set `ANTBOT_CONFIG=/app/config/local.toml` in `.env`.
-- **Testnet:** use such a local config with `mode = "testnet"`.
+- **Testnet:** never reuse the paper `/data`. `risk_state.json` (spec baseline, hit-rate window, equity peak) is shared between modes, and a testnet coin would fire the spec-change kill at once. Use a local config with `mode = "testnet"` and a separate data dir, in `.env`:
+  ```sh
+  ANTBOT_CONFIG=/app/config/local.toml
+  ANTBOT_DATA_DIR=/data/testnet        # ./data/testnet on the host, created at startup
+  HL_PRIVATE_KEY=...                   # plus HL_ACCOUNT_ADDRESS for an API wallet
+  ```
+  `docker compose up -d`, `run --rm antbot kill-status` / `reset-kill` / `check-config` and the healthcheck then all use `/data/testnet`. Remove both lines to return to paper on `/data`.
 - **Clock:** the VPS clock must be NTP-synced. Signed actions carry millisecond nonces, and the daily rules use UTC days.
 
 ## Monitoring
@@ -461,16 +495,16 @@ Everything is written to the data dir (`monitor.data_dir`, `--data-dir` or `ANTB
 
 | file | content |
 |---|---|
-| `logs/antbot.log.YYYY-MM-DD` | daily rolling log, with the same lines as stdout. `monitor.log_max_files` files are kept. `RUST_LOG` sets the filter, and `monitor.log_json = true` switches both outputs to JSON lines |
+| `logs/antbot.log.YYYY-MM-DD` | daily rolling log, with the same lines as stdout. `monitor.log_max_files` files are kept. `RUST_LOG` sets the filter (an invalid value falls back to `info` with a warning), and `monitor.log_json = true` switches both outputs to JSON lines |
 | `signals.csv` | one premium sample every `timing.signal_sample_secs`: `ts_ms, ts_utc, oracle_px, mark_px, impact_bid_px, impact_ask_px, impact_mid_px, best_bid, best_ask, book_mid_px, premium_bps` (the signal, i.e. the rolling mean), `raw_premium_bps, api_premium_bps, avg_ready, stale, state, position, killed` |
 | `orders.csv` | every order command and its feedback: `ts_ms, ts_utc, mode, event (place / cancel / resting / fill / done), tag, side, kind, purpose, reduce_only, px, sz, fee_usd, crossed, status, filled_sz, detail` |
 | `trades.csv` | one row per round trip: `entry_ts_ms, entry_ts_utc, exit_ts_ms, exit_ts_utc, mode, side, size, entry_px, exit_px, notional_usd, fees_usd, funding_usd, gross_pnl_usd, pnl_usd, pnl_bps, reason, entry_premium_bps, exit_premium_bps, hold_secs, exit_taker_sz, signal_ts_ms` |
-| `state_<mode>.json` | persisted strategy, ledger (equity curve, trade history) and executor state |
+| `state_<mode>.json` | persisted strategy, ledger (equity curve, trade history), executor state and the daily summary tracker |
 | `risk_state.json` | kill state, hit-rate window, equity peak, day start, spec baseline |
 | `antbot.lock` | run marker with a heartbeat. `reset-kill` refuses to run while it is fresh. The Docker healthcheck uses it |
 
-- **CSV journals:** headers are written once and restarts append. If a newer version changes the columns, the old file is renamed `<name>.<unix_ms>.old` and a new one starts.
-- **Heartbeat:** a `heartbeat` log line every `timing.heartbeat_secs` shows state, premium (signal and raw), position, unrealized and realized PnL, equity, kill state and feed health (ws connected, stale, REST polls).
+- **CSV journals:** headers are written once and restarts append. If a newer version changes the columns, the old file is renamed `<name>.<unix_ms>.old` and a new one starts. Rows are written synchronously on the main loop and flushed to the OS, not fsynced: they survive a process crash but not necessarily a power loss. After a failed or partial write, the next row starts on a new line.
+- **Heartbeat:** a `heartbeat` log line every `timing.heartbeat_secs` with `phase`, `premium_bps` (the signal), `raw_premium_bps`, `position`, `unrealized_usd`, `working_order`, `equity_usd`, `realized_usd`, `trades`, `venue_position`, `killed`, and feed health: `ws_connected`, `ws_connects`, `rest_polls` and `data_age_ms` (age of the older of the last book and the last asset ctx).
 - **Healthy run:** at startup you should see `antbot starting`, `asset resolved`, `websocket connected` and `main loop started`, then heartbeats.
 
 ### Telegram setup
@@ -486,15 +520,21 @@ Alerts are prefixed `[antbot <mode> <coin>]`. They cover:
 - startup and shutdown;
 - position opened (entry filled), exit started, taker fallback, and trade closed with PnL;
 - the kill switch and market spec changes;
-- warnings and errors: resyncs, mismatches, rate limits, state save failures, fatal errors;
+- warnings and errors: resyncs, mismatches, rate limits, state save failures, fatal errors, and strategy warnings (fill for an unknown order, closing fill larger than the open size, entry refused by the hard cap, giving up waiting for fills, entry sizing failures, stale data past the hold deadline). A strategy warning is always logged, and sent to Telegram at most once per 15 min for the same kind of message (numbers ignored);
 - a daily summary of the previous UTC day (`monitor.daily_summary`).
 
 Entry signals and aborted entries are log-only, because they can repeat every minute around the threshold.
 
+The daily summary tracker (current UTC day, premium min / max / last) is persisted in `state_<mode>.json`:
+- a summary missed while the bot was down over midnight UTC is sent at the next start. It covers the last day the bot was running, and its premium range covers only the time the bot was running;
+- a restart in the middle of the day keeps the day's premium range.
+
 Sending never blocks the trading loop:
 - Alerts go into a bounded queue. A background task sends at most `monitor.telegram_max_per_min` per minute, about one per second, and merges alerts that pile up meanwhile.
+- A merged message never cuts an alert: alerts that do not fit in one message are carried to the next one. Only a single alert longer than the Telegram limit is truncated.
 - A 429 response is retried after its `retry_after`. 5xx and transport errors are retried with backoff.
-- On overflow, alerts are dropped and the next message reports how many were lost.
+- On queue overflow, alerts are dropped. Alerts that still fail after 3 attempts are given up. Both are counted at the top of the next message ("(N alerts dropped: queue full)", "(N earlier alerts could not be delivered)").
+- The sent and failed counts are logged at shutdown.
 - The token never appears in the logs.
 
 ## Kill rules
@@ -506,8 +546,8 @@ A kill stops new entries, cancels open orders and, with `risk.flatten_on_kill = 
 | `hit_rate` | hit rate < 80% over the last 20 closed trades (hit = \|premium\| moved toward 0). It fires early, before 20 trades, once the misses make that outcome certain: the 5th miss |
 | `persistent_premium` | \|signal\| > 150 bps continuously for 2 h (fresh data only), i.e. a regime change |
 | `spec_change` | any change versus the baseline in: funding multiplier, oracle updater, deployer, delisted/halted flag, growth mode, deployer fee scale, last fee-scale change time, szDecimals, max leverage, margin mode, only-isolated, asset id. The coin disappearing from meta also triggers it |
-| `daily_loss` | UTC-day PnL (realized + unrealized) below −150 USD |
-| `max_drawdown` | equity 300 USD below its peak |
+| `daily_loss` | UTC-day PnL (realized + unrealized) ≤ −150 USD |
+| `max_drawdown` | equity ≥ 300 USD below its peak |
 
 To resume after investigating:
 
@@ -541,6 +581,6 @@ cargo test
 cargo build --release
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same steps on every push and pull request, plus a Docker image build.
+CI (`.github/workflows/ci.yml`) runs the same steps on pushes to `main` and on pull requests, plus a Docker image build. Third-party actions are pinned by commit SHA.
 
 License: proprietary / unlicensed (private repository).

@@ -73,6 +73,10 @@ struct Ctx {
     mon: Monitor,
     /// The last state save failed (alert once per failure streak).
     save_failed: bool,
+    /// Daily-summary tracker (persisted with the bot state).
+    day: DayTracker,
+    /// Persisted tracker of a day whose summary is still due.
+    missed_day: Option<DayTracker>,
 }
 
 /// Run the bot until SIGINT / SIGTERM.
@@ -98,6 +102,7 @@ pub async fn run(
         alerter.send(alerts::error(&msg));
     }
     alerter.flush(ALERT_FLUSH_TIMEOUT).await;
+    alerter.log_stats();
     res
 }
 
@@ -127,7 +132,7 @@ async fn run_inner(
         "asset resolved"
     );
 
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         mode,
         coin: cfg.market.coin.clone(),
         state_file: state_path(&data_dir, mode),
@@ -142,6 +147,8 @@ async fn run_inner(
         asset_id: spec.asset_id,
         lock,
         save_failed: false,
+        day: DayTracker::new(now_ms()),
+        missed_day: None,
         cfg,
     };
 
@@ -166,15 +173,17 @@ async fn run_inner(
         );
     }
     let sp = StrategyParams::from_config(&ctx.cfg, spec.sz_decimals, spec.max_leverage);
-    let (strategy, ledger, exec_saved, premium_samples) = match saved {
+    let (strategy, ledger, exec_saved, premium_samples, day_saved) = match saved {
         Some(s) => (
             Strategy::from_state(sp, s.strategy),
             s.ledger,
             Some(s.executor),
             s.premium_samples,
+            s.day_tracker,
         ),
-        None => (Strategy::new(sp), Ledger::default(), None, Vec::new()),
+        None => (Strategy::new(sp), Ledger::default(), None, Vec::new(), None),
     };
+    (ctx.day, ctx.missed_day) = DayTracker::resume(day_saved, now_ms());
     let mut engine = Engine::new(
         EngineParams::from_config(&ctx.cfg),
         strategy,
@@ -254,7 +263,6 @@ async fn run_inner(
                 .context("startup reconciliation")?;
             let m = feed.snapshot();
             let mut cmds = first;
-            let mut ctx = ctx;
             cmds.extend(apply_events(&mut engine, &mut ctx.mon, now_ms(), evs));
             let n = now_ms();
             cmds.extend(reconcile_position_at_startup(
@@ -512,7 +520,10 @@ fn log_notices(engine: &mut Engine, mon: &mut Monitor) -> bool {
                     persist = true;
                 }
                 Event::Resumed => tracing::info!("strategy resumed"),
-                Event::Warning(w) => tracing::warn!("{w}"),
+                // Position disagreements (unknown fill, oversized close,
+                // hard-cap refusal, fills never received...) need an
+                // operator, in paper mode too.
+                Event::Warning(w) => mon.alert_throttled(now_ms(), &w),
             },
             Notice::Kill(_, k) => {
                 tracing::error!(
@@ -553,6 +564,7 @@ fn save_all<E: Executor>(ctx: &mut Ctx, engine: &Engine, exec: &E) {
         ledger: engine.ledger.clone(),
         executor: exec.save_state(),
         premium_samples: engine.premium_samples(),
+        day_tracker: Some(ctx.day.clone()),
     };
     let res = st
         .save(&ctx.state_file)
@@ -723,7 +735,13 @@ async fn main_loop<E: Executor>(
         engine.strategy.phase().kind().as_str(),
         engine.risk.kill_record().map(|k| k.message.as_str()),
     ));
-    let mut day = DayTracker::new(now_ms());
+    // A day whose summary was due while the bot was down.
+    if let Some(missed) = ctx.missed_day.take() {
+        if ctx.cfg.monitor.daily_summary {
+            send_daily_summary(&ctx, &engine, &exec, &missed);
+        }
+        save_all(&mut ctx, &engine, &exec);
+    }
 
     let reason = loop {
         tokio::select! {
@@ -767,10 +785,13 @@ async fn main_loop<E: Executor>(
                     let cmds = heal_working(&mut engine, &exec, &mut ctx.mon, now_ms());
                     pump(&mut engine, &mut exec, &mut ctx.mon, &m, &mut carry, cmds).await;
                 }
-                if let Some(done) = day.roll(now) {
+                if let Some(done) = ctx.day.roll(now) {
                     if ctx.cfg.monitor.daily_summary {
                         send_daily_summary(&ctx, &engine, &exec, &done);
                     }
+                    // Persist the new day now: a restart must not send the
+                    // same summary again.
+                    save_all(&mut ctx, &engine, &exec);
                 }
                 if now.saturating_sub(lock_refreshed_ms) >= LOCK_REFRESH_MS {
                     lock_refreshed_ms = now;
@@ -813,7 +834,7 @@ async fn main_loop<E: Executor>(
                 let now = now_ms();
                 let v = engine.last_view().copied();
                 let premium = v.and_then(|v| v.premium_bps);
-                day.sample(premium.or(engine.last_raw_premium_bps()));
+                ctx.day.sample(premium.or(engine.last_raw_premium_bps()));
                 ctx.mon.journal.signal(&SignalRow {
                     premium_bps: premium,
                     raw_premium_bps: engine.last_raw_premium_bps(),

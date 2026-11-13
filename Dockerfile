@@ -47,9 +47,10 @@ ENV ANTBOT_CONFIG=/app/config/default.toml \
 VOLUME ["/data"]
 USER antbot:antbot
 
-# Healthy while the run lock heartbeat (refreshed every 20 s) is fresh.
+# Healthy while the run lock heartbeat (refreshed every 20 s) is fresh. Shell
+# form so the path follows ANTBOT_DATA_DIR (e.g. /data/testnet set in .env).
 HEALTHCHECK --interval=60s --timeout=5s --start-period=60s --retries=3 \
-    CMD test -n "$(find /data/antbot.lock -mmin -2 2>/dev/null)" || exit 1
+    CMD test -n "$(find "${ANTBOT_DATA_DIR:-/data}/antbot.lock" -mmin -2 2>/dev/null)" || exit 1
 
 # antbot handles SIGINT / SIGTERM itself (cancels open orders, saves state,
 # flushes alerts). Default command: paper mode (the config default).

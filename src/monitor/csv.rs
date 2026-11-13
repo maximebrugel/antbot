@@ -13,7 +13,13 @@
 //! terminated before the next row is appended.
 //!
 //! Write errors never stop the bot: they are logged (throttled) and the
-//! row is lost.
+//! row is lost. After a failed (possibly partial) write, the next row
+//! first terminates a half-written line, so two rows are never glued.
+//!
+//! Writes are synchronous on the main loop (rows are rare and small; the
+//! state save blocks the same way) and go straight to the OS with no
+//! user-space buffer, but are not fsynced: rows survive a process crash,
+//! not necessarily a power loss.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -74,6 +80,8 @@ pub struct CsvAppender {
     path: PathBuf,
     file: File,
     errors: u64,
+    /// The last write failed: check the line ending before the next row.
+    check_line_end: bool,
 }
 
 impl CsvAppender {
@@ -113,6 +121,7 @@ impl CsvAppender {
             path: path.to_path_buf(),
             file,
             errors: 0,
+            check_line_end: false,
         })
     }
 
@@ -120,15 +129,32 @@ impl CsvAppender {
         &self.path
     }
 
-    /// Append one row (flushed right away: rows are rare and must survive
-    /// a crash).
+    /// Append one row (unbuffered: it reaches the OS right away and
+    /// survives a process crash).
     pub fn append(&mut self, fields: &[String]) {
-        let mut s = line(fields);
+        let mut s = String::new();
+        if self.check_line_end {
+            // A previous write may have stopped mid-row (e.g. ENOSPC).
+            match self.file.metadata().map(|m| m.len()).and_then(|len| {
+                if len == 0 {
+                    Ok(true)
+                } else {
+                    ends_with_newline(&self.path, len)
+                }
+            }) {
+                Ok(true) => {}
+                Ok(false) => s.push('\n'),
+                // Unknown: an empty line is harmless, a glued row is not.
+                Err(_) => s.push('\n'),
+            }
+        }
+        s.push_str(&line(fields));
         s.push('\n');
         let res = self
             .file
             .write_all(s.as_bytes())
             .and_then(|_| self.file.flush());
+        self.check_line_end = res.is_err();
         if let Err(e) = res {
             self.errors += 1;
             if self.errors == 1 || self.errors % 100 == 0 {
@@ -608,6 +634,26 @@ mod tests {
         let mut a = CsvAppender::open(&p, "a,b").unwrap();
         a.append(&["5".into(), "6".into()]);
         assert_eq!(read(&p), vec!["a,b", "1,2", "3,", "5,6"]);
+    }
+
+    #[test]
+    fn row_after_failed_partial_write_starts_on_a_new_line() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("x.csv");
+        let mut a = CsvAppender::open(&p, "a,b").unwrap();
+        a.append(&["1".into(), "2".into()]);
+        // Simulate a short write that failed mid-row (e.g. ENOSPC).
+        let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b"3,").unwrap();
+        a.check_line_end = true;
+        a.append(&["5".into(), "6".into()]);
+        assert!(!a.check_line_end);
+        a.append(&["7".into(), "8".into()]);
+        assert_eq!(read(&p), vec!["a,b", "1,2", "3,", "5,6", "7,8"]);
+        // A failed write that wrote nothing adds no blank line.
+        a.check_line_end = true;
+        a.append(&["9".into(), "0".into()]);
+        assert_eq!(read(&p), vec!["a,b", "1,2", "3,", "5,6", "7,8", "9,0"]);
     }
 
     #[test]

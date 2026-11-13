@@ -13,6 +13,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Mode;
+use crate::monitor::alerts::DayTracker;
 use crate::strategy::signal::{StrategyState, TradeRecord};
 
 pub const STATE_VERSION: u32 = 1;
@@ -75,6 +76,11 @@ pub struct BotState {
     /// restart does not restart the averaging warm-up.
     #[serde(default)]
     pub premium_samples: Vec<(u64, f64)>,
+    /// Daily-summary tracker (UTC day being tracked and its premium
+    /// range), so a summary missed while the bot was down over midnight
+    /// is sent at the next start and a mid-day restart keeps the range.
+    #[serde(default)]
+    pub day_tracker: Option<DayTracker>,
 }
 
 impl BotState {
@@ -139,6 +145,12 @@ mod tests {
             ledger: Ledger::default(),
             executor: serde_json::json!({"orders": []}),
             premium_samples: vec![(1, 2.0)],
+            day_tracker: Some(DayTracker {
+                day: Some(20_405),
+                min_bps: Some(-70.0),
+                max_bps: Some(-40.0),
+                last_bps: Some(-50.0),
+            }),
         };
         st.ledger.push_equity(5, 1.5);
         st.save(&p).unwrap();
