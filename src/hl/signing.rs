@@ -36,6 +36,20 @@ impl Address {
     pub fn to_hex(&self) -> String {
         format!("0x{}", hex::encode(self.0))
     }
+
+    /// Strict parse: `0x` + exactly 40 hex digits (any case). Unlike
+    /// [`std::str::FromStr`], the prefix is required, so a 32-byte key or a
+    /// bare hex string pasted by mistake is rejected.
+    pub fn from_hex(s: &str) -> Result<Self, SigningError> {
+        let h = s
+            .strip_prefix("0x")
+            .or_else(|| s.strip_prefix("0X"))
+            .ok_or(SigningError::BadAddress)?;
+        if h.len() != 40 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(SigningError::BadAddress);
+        }
+        s.parse()
+    }
 }
 
 impl fmt::Display for Address {

@@ -465,4 +465,25 @@ mod tests {
         );
         assert_eq!(s[3]["subscription"]["type"], "orderUpdates");
     }
+
+    #[test]
+    fn subscriptions_for_native_perps() {
+        let mut cfg = crate::config::Config::default();
+        cfg.market.dex = String::new();
+        cfg.market.coin = "BTC".into();
+        cfg.validate().unwrap();
+        let vault = "0x1719884eb866cb12b2287399b15f7db5e7d775ea";
+        let c = FeedConfig::from_config(&cfg, "wss://x", Some(vault.into()));
+        assert_eq!(c.dex, "");
+        let s = c.subscriptions();
+        assert_eq!(
+            s,
+            vec![
+                json!({"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}),
+                json!({"method":"subscribe","subscription":{"type":"activeAssetCtx","coin":"BTC"}}),
+                json!({"method":"subscribe","subscription":{"type":"userFills","user":vault}}),
+                json!({"method":"subscribe","subscription":{"type":"orderUpdates","user":vault}}),
+            ]
+        );
+    }
 }

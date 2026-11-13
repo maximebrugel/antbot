@@ -17,6 +17,10 @@
 //! Closed trades go to the ledger and to the hit-rate rule. Everything the
 //! operator should see is queued as [`Notice`]s (drained by the caller for
 //! logs, CSV and alerts).
+//!
+//! The engine is generic over the strategy ([`TradingStrategy`]); the
+//! default type parameter is the premium mean-reversion [`Strategy`], so
+//! `Engine` alone keeps meaning what it always did.
 
 use crate::config::{Config, MarketConfig, PremiumSource};
 use crate::exec::state::Ledger;
@@ -28,6 +32,7 @@ use crate::strategy::premium::PremiumAverager;
 use crate::strategy::signal::{
     Command, Event, MarketView, Phase, Step, Strategy, TickInput, TradeRecord,
 };
+use crate::strategy::TradingStrategy;
 
 /// Something to log / alert, with its time.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,9 +68,9 @@ impl EngineParams {
     }
 }
 
-pub struct Engine {
+pub struct Engine<S: TradingStrategy = Strategy> {
     p: EngineParams,
-    pub strategy: Strategy,
+    pub strategy: S,
     pub risk: RiskManager,
     pub ledger: Ledger,
     averager: PremiumAverager,
@@ -76,10 +81,10 @@ pub struct Engine {
     notices: Vec<Notice>,
 }
 
-impl Engine {
+impl<S: TradingStrategy> Engine<S> {
     pub fn new(
         p: EngineParams,
-        strategy: Strategy,
+        strategy: S,
         risk: RiskManager,
         ledger: Ledger,
         premium_avg_ms: u64,

@@ -1,0 +1,184 @@
+{
+  "version": 1,
+  "mode": "mainnet",
+  "coin": "xyz:ANT",
+  "saved_ms": 1800003668000,
+  "strategy": {
+    "phase": {
+      "Entering": {
+        "side": "long",
+        "started_ms": 1800003666000,
+        "timeout_at_ms": 1800004566000,
+        "target_sz": 25.25,
+        "signal_premium_bps": -100.00000000000009,
+        "abort": null
+      }
+    },
+    "cooldown_until_ms": 1800003661000,
+    "position": {
+      "side": "long",
+      "size": 5.0,
+      "entry_sz": 5.0,
+      "entry_notional": 494.95,
+      "exit_sz": 0.0,
+      "exit_notional": 0.0,
+      "exit_taker_sz": 0.0,
+      "fees_usd": 0.0148485,
+      "funding_usd": -0.0123,
+      "signal_ms": 1800003666000,
+      "opened_ms": 1800003667000,
+      "entry_premium_bps": -100.00000000000009
+    },
+    "working": {
+      "intent": {
+        "tag": 3,
+        "is_buy": true,
+        "px": 98.99,
+        "sz": 25.25,
+        "kind": "alo",
+        "reduce_only": false,
+        "purpose": "entry"
+      },
+      "placed_ms": 1800003666000,
+      "filled": 5.0,
+      "acked": true,
+      "cancel_requested": false
+    },
+    "recent_done": [
+      [
+        1,
+        false,
+        "entry"
+      ],
+      [
+        2,
+        true,
+        "exit"
+      ]
+    ],
+    "next_tag": 4,
+    "last_place_ms": 1800003666000,
+    "action_times": [
+      1800003666000
+    ],
+    "last_view": {
+      "now_ms": 1800003666000,
+      "premium_bps": -100.00000000000009,
+      "best_bid": 98.99,
+      "best_ask": 99.01,
+      "stale": false
+    },
+    "entries_allowed": true,
+    "available_margin_usd": null,
+    "kill_reason": null,
+    "awaiting_fills": [],
+    "stale_exit_warned_ms": null,
+    "last_fresh_ms": 1800003666000
+  },
+  "ledger": {
+    "realized_pnl_usd": 24.848250074999775,
+    "trades": [
+      {
+        "side": "short",
+        "size": 24.75,
+        "entry_px": 101.00999999999999,
+        "exit_px": 100.0,
+        "signal_ms": 1800000000000,
+        "opened_ms": 1800000001000,
+        "closed_ms": 1800000061000,
+        "entry_premium_bps": 100.00000000000009,
+        "exit_premium_bps": -1.1102230246251565e-12,
+        "fees_usd": 0.149249925,
+        "funding_usd": 0.0,
+        "gross_pnl_usd": 24.997499999999775,
+        "pnl_usd": 24.848250074999775,
+        "pnl_bps": 99.39309969309879,
+        "exit_reason": "converged",
+        "exit_taker_sz": 0.0
+      }
+    ],
+    "equity_curve": [
+      [
+        1800000000000,
+        0.0
+      ],
+      [
+        1800000060000,
+        24.675000075
+      ],
+      [
+        1800000061000,
+        24.848250074999775
+      ],
+      [
+        1800003666000,
+        24.848250074999775
+      ]
+    ]
+  },
+  "executor": {
+    "last_fill_ms": 1800003667000,
+    "last_funding_ms": 1800003600000,
+    "orders": [
+      {
+        "acked": true,
+        "cancel_requested": false,
+        "cloid": "0x00000000000000000000000000001234",
+        "done": true,
+        "done_filled_sz": 24.75,
+        "done_ms": 1800000001000,
+        "done_reason": "Filled",
+        "fills_seen": 24.75,
+        "is_buy": false,
+        "kind": "alo",
+        "oid": 4242,
+        "placed_ms": 1800000000000,
+        "px": 101.01,
+        "reduce_only": false,
+        "sz": 24.75,
+        "tag": 1,
+        "uncertain": false
+      },
+      {
+        "acked": true,
+        "cancel_requested": false,
+        "cloid": "0x00000000000000000000000000005678",
+        "done": false,
+        "done_filled_sz": null,
+        "done_ms": null,
+        "done_reason": null,
+        "fills_seen": 5.0,
+        "is_buy": true,
+        "kind": "alo",
+        "oid": 4343,
+        "placed_ms": 1800003666000,
+        "px": 98.99,
+        "reduce_only": false,
+        "sz": 25.25,
+        "tag": 4,
+        "uncertain": false
+      }
+    ],
+    "seen_tids": [
+      11,
+      12,
+      13
+    ]
+  },
+  "premium_samples": [
+    [
+      1800003661000,
+      -95.5
+    ],
+    [
+      1800003666000,
+      -101.0
+    ]
+  ],
+  "day_tracker": {
+    "day": 20833,
+    "min_bps": -101.0,
+    "max_bps": 98.2,
+    "last_bps": -101.0
+  }
+}

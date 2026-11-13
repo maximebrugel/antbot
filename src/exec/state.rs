@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Mode;
@@ -61,13 +62,17 @@ impl Ledger {
 }
 
 /// Everything persisted besides the risk state.
+///
+/// Generic over the strategy's persisted state (see
+/// [`crate::strategy::TradingStrategy::State`]); the default is the premium
+/// strategy's [`StrategyState`], whose JSON shape is unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BotState {
+pub struct BotState<St = StrategyState> {
     pub version: u32,
     pub mode: Mode,
     pub coin: String,
     pub saved_ms: u64,
-    pub strategy: StrategyState,
+    pub strategy: St,
     pub ledger: Ledger,
     /// Executor-specific state (paper account and orders / live order map).
     #[serde(default)]
@@ -84,10 +89,18 @@ pub struct BotState {
 }
 
 impl BotState {
-    pub fn load(path: &Path) -> anyhow::Result<Option<BotState>> {
+    /// Load the premium strategy's state file (see [`BotState::load_as`]).
+    pub fn load(path: &Path) -> anyhow::Result<Option<Self>> {
+        Self::load_as(path)
+    }
+}
+
+impl<St: Serialize + DeserializeOwned> BotState<St> {
+    /// Load a state file; `Ok(None)` if it does not exist.
+    pub fn load_as(path: &Path) -> anyhow::Result<Option<Self>> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                let st: BotState = serde_json::from_str(&text)
+                let st: Self = serde_json::from_str(&text)
                     .with_context(|| format!("corrupt state file {}", path.display()))?;
                 if st.version != STATE_VERSION {
                     anyhow::bail!(

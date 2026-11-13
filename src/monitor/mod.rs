@@ -9,11 +9,14 @@
 //! * [`alerts`]: the alert texts (pure functions, unit tested) and the
 //!   daily summary;
 //! * [`commands`]: read-only inbound Telegram commands (`/pnl`, `/trades`,
-//!   `/help`) answered from a state snapshot published by the main loop.
+//!   `/help`) answered from a state snapshot published by the main loop;
+//! * [`health`]: optional loopback `/healthz` + `/metrics` HTTP server and
+//!   the `antbot healthcheck` probe.
 
 pub mod alerts;
 pub mod commands;
 pub mod csv;
+pub mod health;
 pub mod logging;
 pub mod telegram;
 

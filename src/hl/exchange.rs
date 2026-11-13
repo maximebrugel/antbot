@@ -13,7 +13,14 @@
 //! Agent wallets: actions are signed with `HL_PRIVATE_KEY` (the agent / API
 //! wallet). `HL_ACCOUNT_ADDRESS` is the main account, used for info queries
 //! (positions, open orders, fills). It is NOT sent as `vaultAddress`: that
-//! field is only for vaults / sub-accounts and stays `null`.
+//! field is only for vaults / sub-accounts.
+//!
+//! Sub-accounts / vaults: with `HL_VAULT_ADDRESS` (or `[live].vault_address`)
+//! every action is signed over that address (`sign_l1_action(..,
+//! Some(&vault), ..)`) and posted with `"vaultAddress": "0x..."`; queries
+//! target [`ExchangeClient::trading_address`]. Without it `vaultAddress`
+//! stays `null` (payload unchanged). On mainnet the signer must differ from
+//! the vault as well as from the main account.
 //!
 //! Orders are never retried automatically: a transport error after the
 //! request left is ambiguous, so the caller must reconcile by cloid.
@@ -91,6 +98,11 @@ pub enum ExchangeError {
          account): use an API wallet key and set HL_ACCOUNT_ADDRESS to the main account"
     )]
     MainWalletOnMainnet { signer: String },
+    #[error(
+        "refusing to sign for mainnet with the vault / sub-account key (signer {signer} is the \
+         vault): use an API wallet key of the master account"
+    )]
+    VaultKeyOnMainnet { signer: String },
     #[error("credentials: {0}")]
     Credentials(#[from] SigningError),
     #[error("invalid order: {0}")]
@@ -329,6 +341,8 @@ pub struct ExchangeClient {
     is_mainnet: bool,
     wallet: Wallet,
     account: Address,
+    /// Sub-account / vault traded on behalf of (`vaultAddress`).
+    vault: Option<Address>,
     expires_after_window_ms: Option<u64>,
     nonces: NonceGen,
     bucket: Option<Arc<TokenBucket>>,
@@ -341,6 +355,7 @@ impl std::fmt::Debug for ExchangeClient {
             .field("is_mainnet", &self.is_mainnet)
             .field("signer", &self.wallet.address())
             .field("account", &self.account)
+            .field("vault", &self.vault)
             .finish()
     }
 }
@@ -368,6 +383,12 @@ impl ExchangeClient {
                 signer: wallet.address().to_hex(),
             });
         }
+        let vault = creds.vault_address;
+        if is_mainnet && vault == Some(wallet.address()) {
+            return Err(ExchangeError::VaultKeyOnMainnet {
+                signer: wallet.address().to_hex(),
+            });
+        }
         let http = reqwest::Client::builder()
             .timeout(timeout)
             .user_agent(concat!("antbot/", env!("CARGO_PKG_VERSION")))
@@ -379,6 +400,7 @@ impl ExchangeClient {
             is_mainnet,
             wallet,
             account,
+            vault,
             expires_after_window_ms: None,
             nonces: NonceGen::default(),
             bucket: None,
@@ -444,6 +466,16 @@ impl ExchangeClient {
     pub fn is_agent(&self) -> bool {
         self.account != self.wallet.address()
     }
+    /// Sub-account / vault the actions are sent for (`vaultAddress`).
+    pub fn vault_address(&self) -> Option<Address> {
+        self.vault
+    }
+    /// Address whose positions, orders and fills are traded: the vault /
+    /// sub-account when set, else the main account. Use it for every info
+    /// query and user websocket subscription.
+    pub fn trading_address(&self) -> Address {
+        self.vault.unwrap_or(self.account)
+    }
 
     /// Sign an action with an explicit nonce (pure; used by tests).
     pub fn sign_request(&self, action: Action, nonce: u64) -> Result<SignedRequest, ExchangeError> {
@@ -451,7 +483,7 @@ impl ExchangeClient {
         let signature = sign_l1_action(
             &self.wallet,
             &action,
-            None,
+            self.vault.as_ref(),
             nonce,
             expires_after,
             self.is_mainnet,
@@ -460,7 +492,7 @@ impl ExchangeClient {
             action,
             nonce,
             signature,
-            vault_address: None,
+            vault_address: self.vault.map(|v| v.to_hex()),
             expires_after,
         })
     }
@@ -741,6 +773,16 @@ mod tests {
         Credentials {
             private_key: PrivateKey::parse(KEY).unwrap(),
             account_address: account.map(str::to_string),
+            vault_address: None,
+        }
+    }
+
+    const VAULT: &str = "0x1719884eb866cb12b2287399b15f7db5e7d775ea";
+
+    fn vault_creds(account: Option<&str>, vault: &str) -> Credentials {
+        Credentials {
+            vault_address: Some(vault.parse().unwrap()),
+            ..creds(account)
         }
     }
 
@@ -962,6 +1004,112 @@ mod tests {
         let signer =
             recover_l1_signer(&r.action, &r.signature, None, 1000, Some(31_000), false).unwrap();
         assert_eq!(signer, c.signer_address());
+    }
+
+    #[test]
+    fn vault_signs_over_the_vault_and_serializes_it() {
+        let cfg = Config::default();
+        let c = ExchangeClient::new(
+            Mode::Testnet,
+            &cfg.endpoints(Mode::Testnet),
+            &vault_creds(Some(ACCOUNT), VAULT),
+            None,
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .with_expires_after_window(Some(30_000));
+        let vault: Address = VAULT.parse().unwrap();
+        assert_eq!(c.vault_address(), Some(vault));
+        assert_eq!(c.trading_address(), vault);
+        assert_eq!(c.account_address().to_hex(), ACCOUNT);
+        assert!(format!("{c:?}").contains(VAULT));
+        let action = Action::Cancel {
+            cancels: vec![CancelWire { a: 110138, o: 7 }],
+        };
+        let r = c.sign_request(action, 1_000).unwrap();
+        assert_eq!(r.vault_address.as_deref(), Some(VAULT));
+        // Recoverable only with the vault in the hash.
+        let with = recover_l1_signer(
+            &r.action,
+            &r.signature,
+            Some(&vault),
+            r.nonce,
+            Some(31_000),
+            false,
+        )
+        .unwrap();
+        assert_eq!(with, c.signer_address());
+        let without =
+            recover_l1_signer(&r.action, &r.signature, None, r.nonce, Some(31_000), false).unwrap();
+        assert_ne!(without, c.signer_address());
+        // Same hash as the SDK path with the vault.
+        let w = Wallet::from_hex(KEY).unwrap();
+        assert_eq!(
+            r.signature,
+            sign_l1_action(&w, &r.action, Some(&vault), 1_000, Some(31_000), false).unwrap()
+        );
+        let j = serde_json::to_value(&r).unwrap();
+        assert_eq!(j["vaultAddress"], VAULT);
+        assert_eq!(j.as_object().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn no_vault_keeps_the_exact_payload() {
+        // None: vaultAddress null, signature identical to signing with None.
+        let cfg = Config::default();
+        let c = mk(Mode::Testnet, &cfg.endpoints(Mode::Testnet), None).unwrap();
+        assert_eq!(c.vault_address(), None);
+        assert_eq!(c.trading_address(), c.account_address());
+        let a = Action::Cancel {
+            cancels: vec![CancelWire { a: 1, o: 2 }],
+        };
+        let r = c.sign_request(a.clone(), 5).unwrap();
+        let w = Wallet::from_hex(KEY).unwrap();
+        assert_eq!(
+            r.signature,
+            sign_l1_action(&w, &a, None, 5, None, false).unwrap()
+        );
+        let j = serde_json::to_value(&r).unwrap();
+        assert!(j["vaultAddress"].is_null());
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            format!(
+                "{{\"action\":{},\"nonce\":5,\"signature\":{},\"vaultAddress\":null,\"expiresAfter\":null}}",
+                serde_json::to_string(&a).unwrap(),
+                serde_json::to_string(&r.signature).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn mainnet_vault_rules() {
+        let cfg = Config::default();
+        let ep = cfg.endpoints(Mode::Mainnet);
+        let signer = "0x14791697260e4c9a71f18484c9f997b308e59325";
+        let new = |c: Credentials| {
+            ExchangeClient::new(
+                Mode::Mainnet,
+                &ep,
+                &c,
+                Some(token()),
+                Duration::from_secs(5),
+            )
+        };
+        // API wallet, distinct main account and vault: ok.
+        let c = new(vault_creds(Some(ACCOUNT), VAULT)).unwrap();
+        assert_eq!(c.trading_address().to_hex(), VAULT);
+        // Signer == vault: refused.
+        let e = new(vault_creds(Some(ACCOUNT), signer)).unwrap_err();
+        assert!(
+            matches!(&e, ExchangeError::VaultKeyOnMainnet { signer: s } if s == signer),
+            "{e}"
+        );
+        assert!(!e.to_string().contains(&KEY[2..]));
+        // Signer == account still refused with a vault.
+        assert!(matches!(
+            new(vault_creds(Some(signer), VAULT)).unwrap_err(),
+            ExchangeError::MainWalletOnMainnet { .. }
+        ));
     }
 
     #[test]

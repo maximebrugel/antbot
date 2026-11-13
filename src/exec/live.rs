@@ -186,8 +186,32 @@ pub struct HlApi {
     pub asset: AssetRef,
     pub dex: String,
     pub coin: String,
-    /// Account address for queries (not the agent wallet).
+    /// Address for queries: the trading address (vault / sub-account when
+    /// set, else the main account), never the agent wallet.
     pub user: String,
+}
+
+impl HlApi {
+    /// The production wiring: every query targets the client's trading
+    /// address (the sub-account / vault when configured, else the main
+    /// account), never the signer.
+    pub fn new(
+        exchange: ExchangeClient,
+        info: InfoClient,
+        asset: AssetRef,
+        dex: impl Into<String>,
+        coin: impl Into<String>,
+    ) -> Self {
+        let user = exchange.trading_address().to_hex();
+        Self {
+            exchange,
+            info,
+            asset,
+            dex: dex.into(),
+            coin: coin.into(),
+            user,
+        }
+    }
 }
 
 impl LiveApi for HlApi {
@@ -1296,6 +1320,14 @@ impl<A: LiveApi> Executor for LiveExecutor<A> {
 
     fn venue_position(&self) -> Option<f64> {
         self.venue().map(|v| v.szi)
+    }
+
+    fn open_order_count(&self) -> usize {
+        self.active().count()
+    }
+
+    fn reconcile_failures(&self) -> u32 {
+        self.account_read_failures
     }
 
     fn order_view(&self, tag: u64) -> OrderView {

@@ -27,6 +27,7 @@ fn creds(key: &str, account: Option<&str>) -> Credentials {
     Credentials {
         private_key: PrivateKey::parse(key).unwrap(),
         account_address: account.map(str::to_string),
+        vault_address: None,
     }
 }
 

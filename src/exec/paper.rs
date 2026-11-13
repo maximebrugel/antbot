@@ -659,6 +659,10 @@ impl Executor for PaperExecutor {
         Some(self.sim.account().position_sz)
     }
 
+    fn open_order_count(&self) -> usize {
+        self.sim.open_orders().len()
+    }
+
     fn order_view(&self, tag: u64) -> OrderView {
         self.sim.order_view(tag)
     }

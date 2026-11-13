@@ -19,4 +19,5 @@ pub mod replay;
 pub mod risk;
 pub mod runlock;
 pub mod runner;
+pub mod secrets;
 pub mod strategy;

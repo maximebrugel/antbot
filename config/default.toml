@@ -18,10 +18,14 @@ mode = "paper"
 
 [market]
 # HIP-3 builder-deployed perp dex and coin name as used by the info API.
+# Native Hyperliquid perps: dex = "" and a bare coin name (coin = "BTC").
 dex = "xyz"
 coin = "xyz:ANT"
 # Baseline spec snapshot. A live value differing from these triggers the
-# spec-change kill rule (see [risk].kill_on_spec_change).
+# spec-change kill rule (see [risk].kill_on_spec_change). The funding
+# multiplier, growth mode and deployer fee scale only exist on HIP-3 dexs
+# and are not checked on native perps (dex = "").
+# Optional: expected_margin_mode = "strictIsolated" (meta.universe[].marginMode).
 expected_funding_multiplier = 0.005   # perpDexs.assetToFundingMultiplier
 expected_growth_mode = "enabled"      # meta.universe[].growthMode
 expected_deployer_fee_scale = 1.0     # meta.universe[].deployerFeeScale
@@ -120,6 +124,10 @@ signal_sample_secs = 60               # premium sample row in signals.csv
 state_persist_secs = 30
 heartbeat_secs = 300                  # heartbeat log line (state, premium, PnL)
 # REST token bucket (HL budget: 1200 weight/min per IP; info calls weigh 2-20).
+# The 1200 weight/min (= 20 weight/s) budget is per public IP and SHARED by
+# every container / process on the same host: with N bots on one host keep
+# the sum of their rest_refill_per_sec <= 20 (e.g. 2 bots at 10.0, 4 at 5.0).
+# `antbot check-config` prints this instance's share.
 rest_bucket_capacity = 100.0
 rest_refill_per_sec = 10.0
 
@@ -129,7 +137,7 @@ data_dir = "data"
 # Logs go to stdout and to <data_dir>/logs/antbot.log.YYYY-MM-DD (daily
 # rotation). Level / filters from RUST_LOG (default "info").
 log_json = false                      # JSON lines instead of text (both outputs)
-log_max_files = 30                    # daily log files kept (0 = keep all, min 2)
+log_max_files = 7                     # daily log files kept (0 = keep all, min 2)
 # Telegram alerts: entries, exits, kill switch, errors, startup / shutdown,
 # daily summary. Needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the env;
 # without them alerts are disabled with a log line.
@@ -140,6 +148,18 @@ telegram_max_per_min = 20             # rate limit (queued alerts are merged)
 # telegram_enabled and both env vars. Commands never change state or orders.
 telegram_commands_enabled = true
 daily_summary = true                  # summary of the previous UTC day after 00:00 UTC
+# Telegram header of every alert / reply. Default "[antbot <mode> <coin>]"
+# ("MAINNET" in capitals). instance_name replaces "antbot" (one name per
+# container when several bots share a chat); telegram_prefix replaces the
+# whole header verbatim. Env overrides: ANTBOT_INSTANCE_NAME,
+# ANTBOT_TELEGRAM_PREFIX.
+# instance_name = "ant-1"
+# telegram_prefix = "[ant-1 paper]"
+# Internal HTTP server: GET /healthz (200 healthy / 503 not) and GET /metrics
+# (Prometheus text, ?format=json for JSON). Loopback only (127.0.0.1 / ::1);
+# unset = no server (`antbot healthcheck` then checks the run lock). Env
+# override: ANTBOT_HEALTH_LISTEN.
+# health_listen = "127.0.0.1:9100"
 
 [paper]
 # Paper mode: live mainnet market data, simulated fills, never calls /exchange.
@@ -164,3 +184,8 @@ reconcile_secs = 30                   # clearinghouseState / openOrders reconcil
 max_exchange_actions_per_min = 60     # client-side per-address action budget (cancels always allowed; pre-entry updateLeverage counted)
 rate_limit_backoff_secs = 60          # pause new orders after a rate-limit answer
 expires_after_ms = 30000              # expiresAfter window on signed actions (0 = off)
+# Trade a Hyperliquid sub-account / vault (0x + 40 hex): sent as vaultAddress
+# with every signed action; positions, orders and fills are read for it.
+# HL_PRIVATE_KEY stays an API wallet of the master account. Env override:
+# HL_VAULT_ADDRESS (or HL_VAULT_ADDRESS_FILE). Unset = the account itself.
+# vault_address = "0x..."

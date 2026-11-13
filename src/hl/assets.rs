@@ -183,6 +183,12 @@ fn fmt_opt<T: std::fmt::Debug>(v: &Option<T>) -> String {
 
 impl AssetSpec {
     /// Mismatches against the configured baseline (`[market]` expected_*).
+    ///
+    /// On native perps (`m.dex == ""`) the HIP-3-only fields
+    /// (`funding_multiplier`, `growth_mode`, `deployer_fee_scale`) do not
+    /// exist in the API (`perpDexs[0]` is `null`, `meta.universe[]` has no
+    /// growth / fee-scale keys) and are skipped: comparing them with the
+    /// HIP-3 defaults would be a false spec-change kill.
     pub fn check_expected(&self, m: &MarketConfig) -> Vec<String> {
         let mut out = Vec::new();
         if self.coin != m.coin || self.dex != m.dex {
@@ -191,28 +197,39 @@ impl AssetSpec {
                 self.dex, self.coin, m.dex, m.coin
             ));
         }
-        match self.funding_multiplier {
-            Some(x) if feq(x, m.expected_funding_multiplier) => {}
-            other => out.push(format!(
-                "funding multiplier {} != expected {}",
-                fmt_opt(&other),
-                m.expected_funding_multiplier
-            )),
+        if !m.is_native() {
+            match self.funding_multiplier {
+                Some(x) if feq(x, m.expected_funding_multiplier) => {}
+                other => out.push(format!(
+                    "funding multiplier {} != expected {}",
+                    fmt_opt(&other),
+                    m.expected_funding_multiplier
+                )),
+            }
+            if self.growth_mode.as_deref() != Some(m.expected_growth_mode.as_str()) {
+                out.push(format!(
+                    "growthMode {} != expected {:?}",
+                    fmt_opt(&self.growth_mode),
+                    m.expected_growth_mode
+                ));
+            }
+            match self.deployer_fee_scale {
+                Some(x) if feq(x, m.expected_deployer_fee_scale) => {}
+                other => out.push(format!(
+                    "deployerFeeScale {} != expected {}",
+                    fmt_opt(&other),
+                    m.expected_deployer_fee_scale
+                )),
+            }
         }
-        if self.growth_mode.as_deref() != Some(m.expected_growth_mode.as_str()) {
-            out.push(format!(
-                "growthMode {} != expected {:?}",
-                fmt_opt(&self.growth_mode),
-                m.expected_growth_mode
-            ));
-        }
-        match self.deployer_fee_scale {
-            Some(x) if feq(x, m.expected_deployer_fee_scale) => {}
-            other => out.push(format!(
-                "deployerFeeScale {} != expected {}",
-                fmt_opt(&other),
-                m.expected_deployer_fee_scale
-            )),
+        if let Some(want) = m.expected_margin_mode.as_deref().map(str::trim) {
+            let got = self.margin_mode.as_deref().unwrap_or("none");
+            if got != want {
+                out.push(format!(
+                    "marginMode {} != expected {want:?}",
+                    fmt_opt(&self.margin_mode)
+                ));
+            }
         }
         if self.sz_decimals != m.expected_sz_decimals {
             out.push(format!(
@@ -260,6 +277,95 @@ mod tests {
         assert_eq!(perp_asset_id(1, 0), 110_000); // docs: test:ABC on testnet
         assert_eq!(perp_asset_id(1, 138), 110_138);
         assert_eq!(perp_asset_id(3, 7), 130_007);
+    }
+
+    fn native_meta() -> Meta {
+        serde_json::from_value(serde_json::json!({
+            "universe": [
+                {"name": "BTC", "szDecimals": 5, "maxLeverage": 40, "marginTableId": 56},
+                {"name": "ETH", "szDecimals": 4, "maxLeverage": 25, "marginTableId": 55},
+                {"name": "MATIC", "szDecimals": 1, "maxLeverage": 20, "isDelisted": true}
+            ],
+            "marginTables": []
+        }))
+        .unwrap()
+    }
+
+    fn native_market(coin: &str, sz: u32, lev: u32) -> MarketConfig {
+        MarketConfig {
+            dex: String::new(),
+            coin: coin.into(),
+            expected_sz_decimals: sz,
+            expected_max_leverage: lev,
+            // HIP-3 expectations left at their (xyz) defaults on purpose.
+            ..MarketConfig::default()
+        }
+    }
+
+    #[test]
+    fn native_perps_resolve_with_a_null_first_perp_dex() {
+        // Live shape: perpDexs[0] is null (the original dex), then HIP-3 dexs.
+        let pd: Vec<Option<PerpDex>> = serde_json::from_value(serde_json::json!([
+            null,
+            {"name": "xyz", "fullName": "XYZ", "deployer": "0x01",
+             "assetToFundingMultiplier": [["xyz:ANT", "0.005"]]}
+        ]))
+        .unwrap();
+        assert_eq!(perp_dex_index(&pd, ""), Some(0));
+        let meta = native_meta();
+        let btc = resolve_asset(&pd, &meta, "", "BTC").unwrap();
+        assert_eq!((btc.dex_index, btc.index_in_meta, btc.asset_id), (0, 0, 0));
+        assert_eq!(btc.sz_decimals, 5);
+        assert_eq!(btc.max_price_decimals, 1);
+        assert_eq!(btc.max_leverage, 40);
+        // No HIP-3 deployer data on the native dex.
+        assert_eq!(btc.funding_multiplier, None);
+        assert_eq!(btc.growth_mode, None);
+        assert_eq!(btc.deployer_fee_scale, None);
+        assert_eq!(btc.deployer, None);
+        let eth = resolve_asset(&pd, &meta, "", "ETH").unwrap();
+        assert_eq!(eth.asset_id, 1);
+        assert_eq!(
+            resolve_asset(&pd, &meta, "", "DOGE"),
+            Err(ResolveError::CoinNotFound {
+                dex: String::new(),
+                coin: "DOGE".into()
+            })
+        );
+        // Also with an empty perpDexs list.
+        assert_eq!(resolve_asset(&[], &meta, "", "BTC").unwrap().asset_id, 0);
+    }
+
+    #[test]
+    fn native_perps_check_expected_skips_hip3_fields() {
+        let btc = resolve_asset(&[None], &native_meta(), "", "BTC").unwrap();
+        // No false spec-change: the xyz HIP-3 expectations are ignored.
+        assert_eq!(
+            btc.check_expected(&native_market("BTC", 5, 40)),
+            Vec::<String>::new()
+        );
+        // The common fields are still checked.
+        let m = btc.check_expected(&native_market("BTC", 4, 50));
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(m.iter().any(|x| x.contains("szDecimals")));
+        assert!(m.iter().any(|x| x.contains("maxLeverage")));
+        // Margin mode: absent field matched by "none", a value is compared.
+        let mut mc = native_market("BTC", 5, 40);
+        mc.expected_margin_mode = Some("none".into());
+        assert!(btc.check_expected(&mc).is_empty());
+        mc.expected_margin_mode = Some("strictIsolated".into());
+        assert!(btc.check_expected(&mc)[0].contains("marginMode"));
+        // Delisted is reported on native perps too.
+        let matic = resolve_asset(&[None], &native_meta(), "", "MATIC").unwrap();
+        assert!(matic
+            .check_expected(&native_market("MATIC", 1, 20))
+            .iter()
+            .any(|x| x.contains("delisted")));
+        // The same spec checked as a HIP-3 market still flags the
+        // missing HIP-3 fields (behaviour unchanged for dex != "").
+        let mut hip3 = native_market("BTC", 5, 40);
+        hip3.dex = "xyz".into();
+        assert!(btc.check_expected(&hip3).len() >= 4);
     }
 
     #[test]

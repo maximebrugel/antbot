@@ -5,6 +5,7 @@
 //! to the documented defaults. Unknown keys are rejected to catch typos.
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,18 @@ pub const HARD_CAP_NOTIONAL_USD: f64 = 10_000.0;
 pub const MAX_ALLOWED_LEVERAGE: u32 = 2;
 /// Path of the shipped default config, relative to the repo / working dir.
 pub const DEFAULT_CONFIG_PATH: &str = "config/default.toml";
+/// Hyperliquid REST budget per IP: 1200 weight/min = 20 weight/s, shared by
+/// every process (container) behind the same public IP.
+pub const HL_IP_WEIGHT_PER_SEC: f64 = 20.0;
+
+/// Env override of `[monitor].instance_name`.
+pub const ENV_INSTANCE_NAME: &str = "ANTBOT_INSTANCE_NAME";
+/// Env override of `[monitor].telegram_prefix`.
+pub const ENV_TELEGRAM_PREFIX: &str = "ANTBOT_TELEGRAM_PREFIX";
+/// Env override of `[monitor].health_listen`.
+pub const ENV_HEALTH_LISTEN: &str = "ANTBOT_HEALTH_LISTEN";
+/// Longest accepted instance name / Telegram prefix.
+pub const MAX_LABEL_CHARS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -151,18 +164,46 @@ pub struct LiveConfig {
     pub rate_limit_backoff_secs: u64,
     /// `expiresAfter` window for signed actions (ms, 0 = off).
     pub expires_after_ms: u64,
+    /// Hyperliquid sub-account / vault traded on behalf of (`0x` + 40 hex),
+    /// sent as `vaultAddress` with every signed action; info queries and
+    /// user websocket feeds then target this address. `None` (default)
+    /// trades the account itself. `HL_VAULT_ADDRESS` (or
+    /// `HL_VAULT_ADDRESS_FILE`) overrides it when non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_address: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MarketConfig {
+    /// HIP-3 builder dex name (e.g. `"xyz"`), or `""` for Hyperliquid's
+    /// native (original) perp dex (`perpDexs[0]`, asset id = index in meta).
     pub dex: String,
+    /// Coin as named by the info API: `"<dex>:<NAME>"` on a HIP-3 dex
+    /// (`"xyz:ANT"`), the bare name on native perps (`"BTC"`).
     pub coin: String,
+    /// HIP-3 only (`perpDexs.assetToFundingMultiplier`); ignored on
+    /// native perps, where the API has no such field.
     pub expected_funding_multiplier: f64,
+    /// HIP-3 only (`meta.universe[].growthMode`); ignored on native perps.
     pub expected_growth_mode: String,
+    /// HIP-3 only (`meta.universe[].deployerFeeScale`); ignored on native
+    /// perps.
     pub expected_deployer_fee_scale: f64,
     pub expected_sz_decimals: u32,
     pub expected_max_leverage: u32,
+    /// Optional `meta.universe[].marginMode` baseline (e.g. `"strictIsolated"`,
+    /// `"noCross"`); the string `"none"` expects the field to be absent.
+    /// Unset (default): not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_margin_mode: Option<String>,
+}
+
+impl MarketConfig {
+    /// Hyperliquid native perps (`dex = ""`): no HIP-3 deployer fields.
+    pub fn is_native(&self) -> bool {
+        self.dex.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -242,6 +283,11 @@ pub struct TimingConfig {
     pub state_persist_secs: u64,
     pub heartbeat_secs: u64,
     pub rest_bucket_capacity: f64,
+    /// REST token-bucket refill (weight per second). Hyperliquid limits REST
+    /// to 1200 weight/min = [`HL_IP_WEIGHT_PER_SEC`] (20/s) **per IP**, and
+    /// that budget is shared by every container on the same host / public
+    /// IP. With N bots on one host keep the sum of their refill rates at or
+    /// below 20 (e.g. 4 containers at 5.0, 2 at 10.0).
     pub rest_refill_per_sec: f64,
 }
 
@@ -261,6 +307,20 @@ pub struct MonitorConfig {
     pub telegram_commands_enabled: bool,
     /// Send a summary of the previous UTC day after midnight UTC.
     pub daily_summary: bool,
+    /// Name of this bot instance in Telegram headers
+    /// (`[<instance_name> <mode> <coin>]`; default `antbot`). Env override:
+    /// `ANTBOT_INSTANCE_NAME`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_name: Option<String>,
+    /// Full Telegram header used verbatim instead of the default one.
+    /// Env override: `ANTBOT_TELEGRAM_PREFIX`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram_prefix: Option<String>,
+    /// Loopback address of the internal `/healthz` + `/metrics` HTTP server
+    /// (e.g. `"127.0.0.1:9100"`). `None` (default): no server. Only
+    /// loopback IPs are accepted. Env override: `ANTBOT_HEALTH_LISTEN`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_listen: Option<String>,
 }
 
 impl Default for Config {
@@ -291,6 +351,7 @@ impl Default for MarketConfig {
             expected_deployer_fee_scale: 1.0,
             expected_sz_decimals: 2,
             expected_max_leverage: 10,
+            expected_margin_mode: None,
         }
     }
 }
@@ -392,11 +453,14 @@ impl Default for MonitorConfig {
         Self {
             data_dir: PathBuf::from("data"),
             log_json: false,
-            log_max_files: 30,
+            log_max_files: 7,
             telegram_enabled: true,
             telegram_max_per_min: 20,
             telegram_commands_enabled: true,
             daily_summary: true,
+            instance_name: None,
+            telegram_prefix: None,
+            health_listen: None,
         }
     }
 }
@@ -422,6 +486,7 @@ impl Default for LiveConfig {
             max_exchange_actions_per_min: 60,
             rate_limit_backoff_secs: 60,
             expires_after_ms: 30_000,
+            vault_address: None,
         }
     }
 }
@@ -489,16 +554,38 @@ impl Config {
 
         // market
         let m = &self.market;
-        if m.dex.trim().is_empty() {
-            e.push("market.dex must not be empty".into());
+        // dex = "" selects Hyperliquid's native perps; a HIP-3 dex name has
+        // no whitespace or ':'.
+        if m.dex.chars().any(|c| c.is_whitespace() || c == ':') {
+            e.push(format!(
+                "market.dex '{}' must be a dex name without spaces or ':' (\"\" = native perps)",
+                m.dex
+            ));
         }
         if m.coin.trim().is_empty() {
             e.push("market.coin must not be empty".into());
-        } else if !m.dex.is_empty() && !m.coin.starts_with(&format!("{}:", m.dex)) {
+        } else if m.coin.trim() != m.coin {
+            e.push(format!(
+                "market.coin '{}' must not have surrounding spaces",
+                m.coin
+            ));
+        } else if m.is_native() {
+            if m.coin.contains(':') {
+                e.push(format!(
+                    "market.coin '{}' contains ':' but market.dex is \"\" (native perps take a bare name such as \"BTC\"; set market.dex for a HIP-3 coin)",
+                    m.coin
+                ));
+            }
+        } else if !m.coin.starts_with(&format!("{}:", m.dex)) || m.coin.len() <= m.dex.len() + 1 {
             e.push(format!(
                 "market.coin '{}' must be prefixed by the dex name '{}:' (HIP-3 naming)",
                 m.coin, m.dex
             ));
+        }
+        if let Some(mm) = &m.expected_margin_mode {
+            if mm.trim().is_empty() {
+                e.push("market.expected_margin_mode must not be empty when set".into());
+            }
         }
         if !(m.expected_funding_multiplier.is_finite() && m.expected_funding_multiplier >= 0.0) {
             e.push("market.expected_funding_multiplier must be >= 0".into());
@@ -688,9 +775,12 @@ impl Config {
         if !finite_pos(t.rest_bucket_capacity) {
             e.push("timing.rest_bucket_capacity must be > 0".into());
         }
-        if !finite_pos(t.rest_refill_per_sec) || t.rest_refill_per_sec > 20.0 {
-            // 1200 weight/min = 20/s is the HL per-IP budget.
-            e.push("timing.rest_refill_per_sec must be in (0, 20]".into());
+        if !finite_pos(t.rest_refill_per_sec) || t.rest_refill_per_sec > HL_IP_WEIGHT_PER_SEC {
+            // 1200 weight/min = 20/s is the HL per-IP budget (shared by every
+            // container behind the same IP).
+            e.push(format!(
+                "timing.rest_refill_per_sec must be in (0, {HL_IP_WEIGHT_PER_SEC}] (HL per-IP budget, shared across containers on one host)"
+            ));
         }
 
         // paper / live
@@ -707,6 +797,13 @@ impl Config {
         if l.expires_after_ms != 0 && !(5_000..=300_000).contains(&l.expires_after_ms) {
             e.push("live.expires_after_ms must be 0 (off) or in [5000, 300000]".into());
         }
+        if let Some(v) = l.vault_address.as_deref().map(str::trim) {
+            if !v.is_empty() && crate::hl::signing::Address::from_hex(v).is_err() {
+                e.push(format!(
+                    "live.vault_address '{v}' is malformed (expected 0x + 40 hex digits)"
+                ));
+            }
+        }
 
         // monitor
         if self.monitor.data_dir.as_os_str().is_empty() {
@@ -714,6 +811,23 @@ impl Config {
         }
         if !(1..=30).contains(&self.monitor.telegram_max_per_min) {
             e.push("monitor.telegram_max_per_min must be in 1..=30 (Telegram limits)".into());
+        }
+        for (k, v) in [
+            ("instance_name", &self.monitor.instance_name),
+            ("telegram_prefix", &self.monitor.telegram_prefix),
+        ] {
+            if let Some(v) = v {
+                if v.chars().count() > MAX_LABEL_CHARS || v.chars().any(char::is_control) {
+                    e.push(format!(
+                        "monitor.{k} must be at most {MAX_LABEL_CHARS} characters on one line"
+                    ));
+                }
+            }
+        }
+        if let Some(h) = &self.monitor.health_listen {
+            if let Err(why) = parse_health_listen(h) {
+                e.push(format!("monitor.health_listen: {why}"));
+            }
         }
 
         if e.is_empty() {
@@ -757,6 +871,59 @@ impl Config {
             .min(self.sizing.max_notional_usd)
             .clamp(0.0, HARD_CAP_NOTIONAL_USD)
     }
+
+    /// Apply the non-secret env overrides (`ANTBOT_INSTANCE_NAME`,
+    /// `ANTBOT_TELEGRAM_PREFIX`, `ANTBOT_HEALTH_LISTEN`; set and non-empty
+    /// wins over the file) and validate again. The vault address override
+    /// (`HL_VAULT_ADDRESS[_FILE]`) is resolved with the credentials, see
+    /// [`crate::mode::resolve_vault`].
+    pub fn apply_env_overrides(
+        &mut self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), ConfigError> {
+        let get = |k: &str| {
+            env(k)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        if let Some(v) = get(ENV_INSTANCE_NAME) {
+            self.monitor.instance_name = Some(v);
+        }
+        if let Some(v) = get(ENV_TELEGRAM_PREFIX) {
+            self.monitor.telegram_prefix = Some(v);
+        }
+        if let Some(v) = get(ENV_HEALTH_LISTEN) {
+            self.monitor.health_listen = Some(v);
+        }
+        self.validate()
+    }
+
+    /// The health server address, if configured (validated: loopback only).
+    pub fn health_listen_addr(&self) -> Option<SocketAddr> {
+        self.monitor
+            .health_listen
+            .as_deref()
+            .and_then(|h| parse_health_listen(h).ok())
+    }
+}
+
+/// Parse `[monitor].health_listen`: an `ip:port` socket address on a
+/// loopback IP (`127.0.0.0/8` or `::1`), so the server never listens on an
+/// external interface. Host names are refused (no resolution).
+pub fn parse_health_listen(s: &str) -> Result<SocketAddr, String> {
+    let a: SocketAddr = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{s}' is not an ip:port address (e.g. 127.0.0.1:9100)"))?;
+    if !a.ip().is_loopback() {
+        return Err(format!(
+            "'{s}' is not a loopback address: the health server only listens on 127.0.0.1 / ::1"
+        ));
+    }
+    if a.port() == 0 {
+        return Err(format!("'{s}' needs a fixed port (not 0)"));
+    }
+    Ok(a)
 }
 
 #[cfg(test)]
@@ -956,6 +1123,139 @@ mod tests {
         let mut c = Config::default();
         c.market.coin = "ANT".into();
         assert!(invalid_msgs(&c).iter().any(|m| m.contains("prefixed")));
+    }
+
+    #[test]
+    fn native_perps_take_an_empty_dex_and_a_bare_coin() {
+        let mut c = Config::default();
+        c.market.dex = String::new();
+        c.market.coin = "BTC".into();
+        c.validate().unwrap();
+        assert!(c.market.is_native());
+        // From TOML, with the HIP-3 expectations left at their defaults.
+        let cfg = Config::from_toml_str("[market]\ndex = \"\"\ncoin = \"ETH\"\n").unwrap();
+        assert!(cfg.market.is_native());
+        assert_eq!(cfg.market.coin, "ETH");
+        // A HIP-3 coin name on the native dex is refused.
+        c.market.coin = "xyz:ANT".into();
+        assert!(invalid_msgs(&c).iter().any(|m| m.contains("native perps")));
+        // Empty / padded coins and odd dex names are refused.
+        c.market.coin = " ".into();
+        assert!(invalid_msgs(&c)
+            .iter()
+            .any(|m| m.contains("must not be empty")));
+        c.market.coin = " BTC".into();
+        assert!(invalid_msgs(&c).iter().any(|m| m.contains("spaces")));
+        let mut c = Config::default();
+        c.market.dex = " ".into();
+        c.market.coin = "BTC".into();
+        assert!(invalid_msgs(&c).iter().any(|m| m.contains("market.dex")));
+        // HIP-3: the bare dex prefix alone is not a coin.
+        let mut c = Config::default();
+        c.market.coin = "xyz:".into();
+        assert!(invalid_msgs(&c).iter().any(|m| m.contains("prefixed")));
+    }
+
+    #[test]
+    fn vault_address_is_optional_and_validated() {
+        let cfg = Config::from_toml_str(
+            "[live]\nvault_address = \"0x1719884eb866cb12b2287399b15f7db5e7d775ea\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.live.vault_address.as_deref(),
+            Some("0x1719884eb866cb12b2287399b15f7db5e7d775ea")
+        );
+        for bad in [
+            "0x1234",
+            "1719884eb866cb12b2287399b15f7db5e7d775ea",
+            "0xzz19884eb866cb12b2287399b15f7db5e7d775ea",
+        ] {
+            let mut c = Config::default();
+            c.live.vault_address = Some(bad.into());
+            assert!(
+                invalid_msgs(&c).iter().any(|m| m.contains("vault_address")),
+                "{bad}"
+            );
+        }
+        // Empty counts as unset.
+        let mut c = Config::default();
+        c.live.vault_address = Some("  ".into());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn health_listen_must_be_loopback() {
+        for ok in ["127.0.0.1:9100", "[::1]:9100", "127.0.0.2:80"] {
+            let a = parse_health_listen(ok).unwrap();
+            assert!(a.ip().is_loopback(), "{ok}");
+        }
+        for bad in [
+            "0.0.0.0:9100",
+            "10.0.0.5:9100",
+            "[::]:9100",
+            "localhost:9100",
+            "127.0.0.1",
+            "127.0.0.1:0",
+            "",
+        ] {
+            assert!(parse_health_listen(bad).is_err(), "{bad}");
+            let mut c = Config::default();
+            c.monitor.health_listen = Some(bad.into());
+            assert!(
+                invalid_msgs(&c).iter().any(|m| m.contains("health_listen")),
+                "{bad}"
+            );
+        }
+        let mut c = Config::default();
+        assert_eq!(c.health_listen_addr(), None);
+        c.monitor.health_listen = Some("127.0.0.1:9100".into());
+        assert_eq!(c.health_listen_addr().unwrap().port(), 9100);
+    }
+
+    #[test]
+    fn env_overrides_apply_and_revalidate() {
+        let env = |k: &str| match k {
+            ENV_INSTANCE_NAME => Some(" bot-a ".to_string()),
+            ENV_TELEGRAM_PREFIX => Some("".to_string()),
+            ENV_HEALTH_LISTEN => Some("127.0.0.1:9101".to_string()),
+            _ => None,
+        };
+        let mut c = Config::default();
+        c.monitor.telegram_prefix = Some("[from file]".into());
+        c.apply_env_overrides(env).unwrap();
+        assert_eq!(c.monitor.instance_name.as_deref(), Some("bot-a"));
+        // Empty env value: the file value stays.
+        assert_eq!(c.monitor.telegram_prefix.as_deref(), Some("[from file]"));
+        assert_eq!(c.monitor.health_listen.as_deref(), Some("127.0.0.1:9101"));
+        // An external bind from the env is refused.
+        let mut c = Config::default();
+        let err = c
+            .apply_env_overrides(|k: &str| (k == ENV_HEALTH_LISTEN).then(|| "0.0.0.0:9100".into()))
+            .unwrap_err();
+        assert!(err.to_string().contains("loopback"), "{err}");
+        // Overlong / multi-line labels are refused.
+        let mut c = Config::default();
+        c.monitor.instance_name = Some("a\nb".into());
+        assert!(c.validate().is_err());
+        c.monitor.instance_name = Some("x".repeat(MAX_LABEL_CHARS + 1));
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn log_retention_default_is_a_week() {
+        assert_eq!(Config::default().monitor.log_max_files, 7);
+    }
+
+    #[test]
+    fn rest_refill_cannot_exceed_the_per_ip_budget() {
+        let mut c = Config::default();
+        c.timing.rest_refill_per_sec = HL_IP_WEIGHT_PER_SEC;
+        c.validate().unwrap();
+        c.timing.rest_refill_per_sec = HL_IP_WEIGHT_PER_SEC + 0.1;
+        assert!(invalid_msgs(&c)
+            .iter()
+            .any(|m| m.contains("rest_refill_per_sec")));
     }
 
     #[test]

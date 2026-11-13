@@ -30,7 +30,8 @@ struct ModeArgs {
     mode: Option<Mode>,
     /// Required for mainnet (REAL FUNDS), together with --mode mainnet,
     /// ANTBOT_CONFIRM_MAINNET=yes-i-understand, HL_PRIVATE_KEY (API wallet key)
-    /// and HL_ACCOUNT_ADDRESS (main account). An error in any other mode.
+    /// and HL_ACCOUNT_ADDRESS (main account); each HL_* variable may also be
+    /// read from a file named by <VAR>_FILE. An error in any other mode.
     #[arg(long)]
     mainnet: bool,
 }
@@ -120,6 +121,22 @@ enum Command {
         #[arg(long, env = "ANTBOT_DATA_DIR")]
         data_dir: Option<PathBuf>,
     },
+    /// Container healthcheck: exit 0 only if the bot is healthy. With
+    /// [monitor].health_listen (or ANTBOT_HEALTH_LISTEN) it queries
+    /// http://<addr>/healthz and needs a 200; without it, it checks that the
+    /// run lock heartbeat in the data dir is fresh. No network beyond
+    /// loopback, no file written, no curl needed.
+    Healthcheck {
+        /// Override monitor.data_dir (lock fallback).
+        #[arg(long, env = "ANTBOT_DATA_DIR")]
+        data_dir: Option<PathBuf>,
+        /// Give up after this many seconds.
+        #[arg(long, default_value_t = 3)]
+        timeout_secs: u64,
+        /// Print nothing on success.
+        #[arg(long, short)]
+        quiet: bool,
+    },
     /// Clear a persisted kill so the bot may trade again (manual reset).
     /// Also clears the hit-rate window, drawdown peak, daily start and spec
     /// baseline so the same rule does not fire again at once. Stop the bot first.
@@ -150,7 +167,9 @@ async fn main() -> ExitCode {
 }
 
 async fn real_main(cli: Cli) -> anyhow::Result<()> {
-    let cfg = Config::load(&cli.config)?;
+    let mut cfg = Config::load(&cli.config)?;
+    // ANTBOT_INSTANCE_NAME / ANTBOT_TELEGRAM_PREFIX / ANTBOT_HEALTH_LISTEN.
+    cfg.apply_env_overrides(process_env)?;
     match cli.command {
         Command::CheckConfig { mode, data_dir } => {
             check_config(&cfg, &cli.config, &mode, data_dir.as_deref())
@@ -163,6 +182,11 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             rest_only,
         } => probe(&cfg, secs, interval_ms, testnet, rest_only).await,
         Command::KillStatus { data_dir } => kill_status(&cfg, data_dir),
+        Command::Healthcheck {
+            data_dir,
+            timeout_secs,
+            quiet,
+        } => healthcheck(&cfg, data_dir, timeout_secs, quiet).await,
         Command::ResetKill { data_dir, confirm } => reset_kill(&cfg, data_dir, confirm),
         Command::Replay(args) => replay(cfg, args).await,
     }
@@ -237,6 +261,70 @@ fn reset_kill(cfg: &Config, data_dir: Option<PathBuf>, confirm: bool) -> anyhow:
     Ok(())
 }
 
+async fn healthcheck(
+    cfg: &Config,
+    data_dir: Option<PathBuf>,
+    timeout_secs: u64,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    use antbot::monitor::health;
+    let timeout = std::time::Duration::from_secs(timeout_secs.max(1));
+    match cfg.health_listen_addr() {
+        Some(addr) => {
+            let (code, body) = health::probe(addr, timeout).await?;
+            if code != 200 {
+                anyhow::bail!(
+                    "unhealthy: http://{addr}/healthz answered {code}: {}",
+                    problems_of(&body)
+                );
+            }
+            if !quiet {
+                println!("healthy: http://{addr}/healthz answered 200");
+            }
+        }
+        None => {
+            let dir = data_dir.unwrap_or_else(|| cfg.monitor.data_dir.clone());
+            match health::check_lock(&dir, antbot::hl::market::now_ms()) {
+                Ok(d) => {
+                    if !quiet {
+                        println!("healthy: {d} (no health server configured)");
+                    }
+                }
+                Err(why) => anyhow::bail!("unhealthy: {why}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `problems` of a `/healthz` JSON body, for the error line.
+fn problems_of(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v["problems"].as_array().map(|p| {
+                p.iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "see /healthz".to_string())
+}
+
+/// Telegram credentials from TELEGRAM_BOT_TOKEN[_FILE] / TELEGRAM_CHAT_ID[_FILE]:
+/// `Ok(None)` when disabled or unset; an error for a conflicting or
+/// unusable `*_FILE` (never the token).
+fn telegram_check(cfg: &Config) -> anyhow::Result<Option<String>> {
+    if !cfg.monitor.telegram_enabled {
+        return Ok(None);
+    }
+    let t = antbot::monitor::telegram::TelegramConfig::try_from_env(process_env)
+        .map_err(|e| anyhow::anyhow!("telegram: {e}"))?;
+    Ok(t.map(|t| t.chat_id.clone()))
+}
+
 fn check_config(
     cfg: &Config,
     path: &std::path::Path,
@@ -248,14 +336,24 @@ fn check_config(
         // Every condition, independently, so the operator sees all that is
         // missing at once. Same rules as `run` (mode::authorize).
         println!("mainnet guard (REAL FUNDS):");
-        for c in mode::mainnet_guard_report(args.mainnet, process_env) {
+        for c in mode::mainnet_guard_report_with_vault(
+            args.mainnet,
+            cfg.live.vault_address.as_deref(),
+            process_env,
+        ) {
             match &c.result {
                 Ok(d) => println!("  [ok]   {:<28} {d}", c.name),
                 Err(e) => println!("  [FAIL] {:<28} {e}", c.name),
             }
         }
     }
-    let auth = match mode::authorize(cfg.mode, args.mode, args.mainnet, process_env) {
+    let auth = match mode::authorize_with_vault(
+        cfg.mode,
+        args.mode,
+        args.mainnet,
+        cfg.live.vault_address.as_deref(),
+        process_env,
+    ) {
         Ok(a) => a,
         Err(e) => {
             if requested == Mode::Mainnet {
@@ -271,10 +369,17 @@ fn check_config(
     }
     println!("config:        {} (valid)", path.display());
     println!("mode:          {m}");
-    println!(
-        "market:        {} (dex {})",
-        cfg.market.coin, cfg.market.dex
-    );
+    if cfg.market.is_native() {
+        println!(
+            "market:        {} (Hyperliquid native perps; HIP-3 expected_* fields not checked)",
+            cfg.market.coin
+        );
+    } else {
+        println!(
+            "market:        {} (HIP-3 dex {})",
+            cfg.market.coin, cfg.market.dex
+        );
+    }
     println!("info url:      {}", ep.info_url);
     println!("ws url:        {}", ep.ws_url);
     println!(
@@ -292,6 +397,29 @@ fn check_config(
             _ => "MISSING".to_string(),
         }
     );
+    for (var, what) in [
+        (mode::ENV_PRIVATE_KEY, "key"),
+        (mode::ENV_ACCOUNT_ADDRESS, "account"),
+        (mode::ENV_VAULT_ADDRESS, "vault"),
+    ] {
+        if requires_key(m) || var == mode::ENV_VAULT_ADDRESS {
+            if let Some(src) = antbot::secrets::source_label(&process_env, var) {
+                println!("  {what:<8}     from {src}");
+            }
+        }
+    }
+    match (auth.vault, m) {
+        (None, _) => {}
+        (Some(v), Mode::Paper) => println!(
+            "vault:         {v} (valid; ignored in paper mode: nothing is signed)"
+        ),
+        (Some(v), _) => println!(
+            "vault:         {v} (sub-account / vault: sent as vaultAddress; positions, orders and fills are read for it)"
+        ),
+    }
+    if let Some(t) = auth.trading_address() {
+        println!("trading addr:  {t}");
+    }
     if m != Mode::Paper {
         // Guard check only: no request is made. A refusal here means `run`
         // would fail to build the exchange client: exit non-zero too.
@@ -334,6 +462,35 @@ fn check_config(
         r.hit_rate_min, r.hit_rate_window, r.persistent_premium_bps, r.persistent_premium_secs,
         r.daily_loss_limit_usd, r.max_drawdown_usd, r.kill_on_spec_change
     );
+    let t = &cfg.timing;
+    println!(
+        "rest budget:   refill {} weight/s (burst {}) of Hyperliquid's {} weight/s per-IP limit (1200/min), shared by every container on this host: keep the sum across bots <= {}",
+        t.rest_refill_per_sec,
+        t.rest_bucket_capacity,
+        antbot::config::HL_IP_WEIGHT_PER_SEC,
+        antbot::config::HL_IP_WEIGHT_PER_SEC
+    );
+    let prefix = antbot::monitor::alerts::message_prefix(
+        cfg.monitor.instance_name.as_deref(),
+        cfg.monitor.telegram_prefix.as_deref(),
+        m,
+        &cfg.market.coin,
+    );
+    match telegram_check(cfg) {
+        Ok(Some(chat)) => println!("telegram:      enabled, chat {chat}, header {prefix}"),
+        Ok(None) if cfg.monitor.telegram_enabled => println!(
+            "telegram:      disabled (TELEGRAM_BOT_TOKEN[_FILE] / TELEGRAM_CHAT_ID[_FILE] not set)"
+        ),
+        Ok(None) => println!("telegram:      disabled (monitor.telegram_enabled = false)"),
+        Err(e) => {
+            println!("telegram:      ERROR: {e}");
+            return Err(e);
+        }
+    }
+    match cfg.health_listen_addr() {
+        Some(a) => println!("health:        http://{a}/healthz and /metrics (loopback only)"),
+        None => println!("health:        no server (`antbot healthcheck` checks the run lock)"),
+    }
     match data_dir {
         Some(d) => println!(
             "data dir:      {} (override; config has {})",
@@ -352,7 +509,16 @@ async fn run(mut cfg: Config, args: &ModeArgs, data_dir: Option<PathBuf>) -> any
     // The whole mode guard (mainnet: flag, confirmation, API wallet key,
     // main account, key != main wallet) runs before logging, the data dir or
     // any network / exchange client.
-    let auth = mode::authorize(cfg.mode, args.mode, args.mainnet, process_env)?;
+    let auth = mode::authorize_with_vault(
+        cfg.mode,
+        args.mode,
+        args.mainnet,
+        cfg.live.vault_address.as_deref(),
+        process_env,
+    )?;
+    // A conflicting / unreadable TELEGRAM_*_FILE is a startup error, not a
+    // silently disabled alert channel.
+    telegram_check(&cfg)?;
     let _guard = logging::init(
         &cfg.monitor.data_dir,
         cfg.monitor.log_json,
@@ -372,6 +538,12 @@ async fn run(mut cfg: Config, args: &ModeArgs, data_dir: Option<PathBuf>) -> any
             addr(auth.account),
             addr(auth.signer)
         );
+        if let Some(v) = auth.vault {
+            tracing::warn!(
+                vault = %v,
+                "MODE: MAINNET - REAL FUNDS: trading sub-account / vault {v} (vaultAddress)"
+            );
+        }
         tracing::warn!(
             notional_usd = cfg.effective_notional_usd(),
             max_notional_usd = cfg.sizing.max_notional_usd,

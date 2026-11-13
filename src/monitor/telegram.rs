@@ -32,6 +32,11 @@
 //!
 //! `TELEGRAM_API_BASE` overrides the API base URL (default
 //! `https://api.telegram.org`), used by the tests with a loopback mock.
+//!
+//! `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` may instead be read from
+//! files named by `TELEGRAM_BOT_TOKEN_FILE` / `TELEGRAM_CHAT_ID_FILE`
+//! (Docker secrets; see [`crate::secrets`]). The token is wiped from memory
+//! when the config / sender holding it is dropped.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,10 +46,16 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
+use zeroize::{Zeroize, Zeroizing};
+
+use crate::secrets::{env_or_file, SecretError};
 
 use crate::monitor::alerts::{truncate, MAX_ALERT_CHARS};
 
 pub const DEFAULT_API_BASE: &str = "https://api.telegram.org";
+pub const ENV_BOT_TOKEN: &str = "TELEGRAM_BOT_TOKEN";
+pub const ENV_CHAT_ID: &str = "TELEGRAM_CHAT_ID";
+pub const ENV_API_BASE: &str = "TELEGRAM_API_BASE";
 const SEND_ATTEMPTS: u32 = 3;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
@@ -66,28 +77,53 @@ impl std::fmt::Debug for TelegramConfig {
     }
 }
 
+impl Drop for TelegramConfig {
+    fn drop(&mut self) {
+        self.token.zeroize();
+    }
+}
+
 impl TelegramConfig {
-    /// From the environment (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`,
-    /// optional `TELEGRAM_API_BASE`). `None` if token or chat id is unset
-    /// or empty.
-    pub fn from_env(env: impl Fn(&str) -> Option<String>) -> Option<Self> {
-        let get = |k: &str| {
-            env(k)
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
+    /// From the environment (`TELEGRAM_BOT_TOKEN[_FILE]`,
+    /// `TELEGRAM_CHAT_ID[_FILE]`, optional `TELEGRAM_API_BASE`). `Ok(None)`
+    /// if token or chat id is unset or empty; an error if a variable is set
+    /// both directly and as `_FILE`, or its file is missing / unreadable /
+    /// empty (the message names the variable and path, never the value).
+    pub fn try_from_env(env: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, SecretError> {
+        let token = env_or_file(&env, ENV_BOT_TOKEN)?;
+        let chat_id = env_or_file(&env, ENV_CHAT_ID)?;
+        let (Some(mut token), Some(mut chat_id)) = (token, chat_id) else {
+            return Ok(None);
         };
-        Some(Self {
-            token: get("TELEGRAM_BOT_TOKEN")?,
-            chat_id: get("TELEGRAM_CHAT_ID")?,
-            api_base: get("TELEGRAM_API_BASE")
-                .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
-                .trim_end_matches('/')
-                .to_string(),
-        })
+        let api_base = env(ENV_API_BASE)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
+            .trim_end_matches('/')
+            .to_string();
+        // Move the strings out; the emptied Zeroizing shells drop harmlessly.
+        Ok(Some(Self {
+            token: std::mem::take(&mut *token),
+            chat_id: std::mem::take(&mut *chat_id),
+            api_base,
+        }))
     }
 
-    fn send_url(&self) -> String {
-        format!("{}/bot{}/sendMessage", self.api_base, self.token)
+    /// [`Self::try_from_env`], with an error logged (and treated as unset).
+    /// `antbot run` / `check-config` call `try_from_env` first and refuse
+    /// to start on such an error.
+    pub fn from_env(env: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        match Self::try_from_env(env) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "telegram disabled: invalid credentials");
+                None
+            }
+        }
+    }
+
+    fn send_url(&self) -> Zeroizing<String> {
+        Zeroizing::new(format!("{}/bot{}/sendMessage", self.api_base, self.token))
     }
 }
 
@@ -192,7 +228,7 @@ impl Alerter {
     }
 
     /// Start the sender task.
-    pub fn spawn(cfg: TelegramConfig, settings: AlertSettings) -> (Self, Arc<Stats>) {
+    pub fn spawn(mut cfg: TelegramConfig, settings: AlertSettings) -> (Self, Arc<Stats>) {
         let stats = Arc::new(Stats::default());
         // No `Client::default()` fallback: it panics when TLS cannot be
         // initialised (the likely reason `build()` failed) and has no
@@ -216,8 +252,8 @@ impl Alerter {
         let worker = Worker {
             http,
             url: cfg.send_url(),
-            token: cfg.token,
-            chat_id: cfg.chat_id,
+            token: Zeroizing::new(std::mem::take(&mut cfg.token)),
+            chat_id: std::mem::take(&mut cfg.chat_id),
             settings,
             rx,
             dropped: dropped.clone(),
@@ -321,10 +357,10 @@ enum SendError {
 
 struct Worker {
     http: reqwest::Client,
-    /// Holds the token: never logged.
-    url: String,
+    /// Holds the token: never logged (wiped on drop).
+    url: Zeroizing<String>,
     /// Redacted from every error string before it is logged.
-    token: String,
+    token: Zeroizing<String>,
     chat_id: String,
     settings: AlertSettings,
     rx: mpsc::Receiver<Msg>,
@@ -437,7 +473,7 @@ impl Worker {
         });
         let resp = self
             .http
-            .post(&self.url)
+            .post(self.url.as_str())
             .json(&body)
             .send()
             .await
@@ -648,6 +684,59 @@ mod tests {
     }
 
     #[test]
+    fn config_from_secret_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = dir.path().join("tok");
+        let chat = dir.path().join("chat");
+        std::fs::write(&tok, "123456:AAF-secret_token\n").unwrap();
+        std::fs::write(&chat, " 4242 \n").unwrap();
+        let (tok, chat) = (tok.to_str().unwrap(), chat.to_str().unwrap());
+        let c = TelegramConfig::try_from_env(env(&[
+            ("TELEGRAM_BOT_TOKEN_FILE", tok),
+            ("TELEGRAM_CHAT_ID_FILE", chat),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(c.token, "123456:AAF-secret_token");
+        assert_eq!(c.chat_id, "4242");
+        // Redaction covers a token loaded from a file.
+        let leaked = format!("error sending to {}: timeout", c.send_url().as_str());
+        let r = redact(&leaked, &c.token);
+        assert!(!r.contains("AAF-secret_token"), "{r}");
+        assert!(!format!("{c:?}").contains("AAF-secret_token"));
+        // Mixed: token from a file, chat id from the env.
+        let c = TelegramConfig::try_from_env(env(&[
+            ("TELEGRAM_BOT_TOKEN_FILE", tok),
+            ("TELEGRAM_CHAT_ID", "7"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(c.chat_id, "7");
+        // Both forms: explicit error, never the value.
+        let e = TelegramConfig::try_from_env(env(&[
+            ("TELEGRAM_BOT_TOKEN", "123456:AAF-other"),
+            ("TELEGRAM_BOT_TOKEN_FILE", tok),
+            ("TELEGRAM_CHAT_ID", "7"),
+        ]))
+        .unwrap_err();
+        assert!(e.to_string().contains("TELEGRAM_BOT_TOKEN_FILE"), "{e}");
+        assert!(!e.to_string().contains("AAF"), "{e}");
+        // Missing file: explicit error; from_env logs it and disables alerts.
+        let missing = dir.path().join("missing");
+        let bad = [
+            ("TELEGRAM_BOT_TOKEN_FILE", missing.to_str().unwrap()),
+            ("TELEGRAM_CHAT_ID", "7"),
+        ];
+        assert!(matches!(
+            TelegramConfig::try_from_env(env(&bad)),
+            Err(SecretError::Unreadable { .. })
+        ));
+        assert_eq!(TelegramConfig::from_env(env(&bad)), None);
+        // Neither: Ok(None).
+        assert_eq!(TelegramConfig::try_from_env(env(&[])), Ok(None));
+    }
+
+    #[test]
     fn config_from_env() {
         assert_eq!(TelegramConfig::from_env(env(&[])), None);
         assert_eq!(
@@ -668,7 +757,7 @@ mod tests {
         .unwrap();
         assert_eq!(c.api_base, DEFAULT_API_BASE);
         assert_eq!(
-            c.send_url(),
+            c.send_url().as_str(),
             "https://api.telegram.org/bot123:abc/sendMessage"
         );
         let c = TelegramConfig::from_env(env(&[
@@ -677,7 +766,7 @@ mod tests {
             ("TELEGRAM_API_BASE", "http://127.0.0.1:9/"),
         ]))
         .unwrap();
-        assert_eq!(c.send_url(), "http://127.0.0.1:9/bott/sendMessage");
+        assert_eq!(c.send_url().as_str(), "http://127.0.0.1:9/bott/sendMessage");
         assert!(!format!("{c:?}").contains("\"t\""));
         assert!(format!("{c:?}").contains("<redacted>"));
     }

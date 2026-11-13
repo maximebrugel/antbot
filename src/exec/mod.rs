@@ -102,4 +102,16 @@ pub trait Executor {
 
     /// Graceful shutdown: cancel open orders (and flatten if configured).
     async fn shutdown(&mut self, now_ms: u64, market: &MarketState) -> Vec<ExecEvent>;
+
+    /// Orders currently open (resting or in flight) on the venue / in the
+    /// simulation, for monitoring.
+    fn open_order_count(&self) -> usize {
+        0
+    }
+
+    /// Consecutive failed reconciliation account reads (0 = the last one
+    /// worked; always 0 for executors without reconciliation).
+    fn reconcile_failures(&self) -> u32 {
+        0
+    }
 }

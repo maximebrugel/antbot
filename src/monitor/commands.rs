@@ -111,8 +111,8 @@ pub struct StatusSnapshot {
 impl StatusSnapshot {
     /// Copy what the commands need out of the engine (main loop only;
     /// cheap: at most [`TRADES_SHOWN`] trades are cloned).
-    pub fn from_engine(
-        engine: &Engine,
+    pub fn from_engine<S: crate::strategy::TradingStrategy>(
+        engine: &Engine<S>,
         prefix: &str,
         now_ms: u64,
         venue_position: Option<f64>,
@@ -610,8 +610,9 @@ pub trait BotApi: Send + Sync + 'static {
 /// The real Bot API over HTTPS.
 pub struct HttpBotApi {
     http: reqwest::Client,
-    base: String,
-    token: String,
+    /// Holds the token (wiped on drop).
+    base: zeroize::Zeroizing<String>,
+    token: zeroize::Zeroizing<String>,
     chat_id: String,
     send_timeout: Duration,
 }
@@ -626,8 +627,8 @@ impl HttpBotApi {
             .map_err(|e| redact(&error_chain(&e.without_url()), &cfg.token))?;
         Ok(Self {
             http,
-            base: format!("{}/bot{}", cfg.api_base, cfg.token),
-            token: cfg.token.clone(),
+            base: zeroize::Zeroizing::new(format!("{}/bot{}", cfg.api_base, cfg.token)),
+            token: zeroize::Zeroizing::new(cfg.token.clone()),
             chat_id: cfg.chat_id.clone(),
             send_timeout: Duration::from_secs(10),
         })
@@ -648,7 +649,7 @@ impl HttpBotApi {
     ) -> Result<Value, ApiError> {
         let mut req = self
             .http
-            .post(format!("{}/{method}", self.base))
+            .post(format!("{}/{method}", self.base.as_str()))
             .json(&body);
         if let Some(t) = timeout {
             req = req.timeout(t);

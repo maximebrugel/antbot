@@ -95,6 +95,7 @@ fn client(url: &str) -> ExchangeClient {
         &Credentials {
             private_key: antbot::mode::PrivateKey::parse(KEY).unwrap(),
             account_address: Some(ACCOUNT.into()),
+            vault_address: None,
         },
         None,
         Duration::from_secs(5),

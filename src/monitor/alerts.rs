@@ -3,6 +3,7 @@
 //! Pure functions so the wording is unit tested. Plain text (no Telegram
 //! `parse_mode`), so nothing needs escaping.
 
+use crate::config::Mode;
 use crate::monitor::fmt_utc_day;
 use crate::risk::kill::utc_day;
 use crate::strategy::premium::Side;
@@ -65,6 +66,37 @@ pub fn startup(
         s.push_str(&format!("\n⛔ kill switch active: {k}"));
     }
     s
+}
+
+/// Default instance name in message headers.
+pub const DEFAULT_INSTANCE_NAME: &str = "antbot";
+
+/// Header of every Telegram alert and command reply.
+///
+/// * `telegram_prefix` (trimmed, non-empty): used verbatim;
+/// * else `[<name> MAINNET <coin>]` on mainnet (capitals: real funds) and
+///   `[<name> <mode> <coin>]` otherwise, where `<name>` is
+///   `instance_name` (trimmed, non-empty) or `antbot`.
+///
+/// With neither set the header is exactly the historical
+/// `[antbot <mode> <coin>]`.
+pub fn message_prefix(
+    instance_name: Option<&str>,
+    telegram_prefix: Option<&str>,
+    mode: Mode,
+    coin: &str,
+) -> String {
+    if let Some(p) = telegram_prefix.map(str::trim).filter(|p| !p.is_empty()) {
+        return p.to_string();
+    }
+    let name = instance_name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(DEFAULT_INSTANCE_NAME);
+    match mode {
+        Mode::Mainnet => format!("[{name} MAINNET {coin}]"),
+        _ => format!("[{name} {mode} {coin}]"),
+    }
 }
 
 /// Bot stopping.
@@ -311,6 +343,82 @@ mod tests {
     use super::*;
 
     const DAY: u64 = 86_400_000;
+
+    #[test]
+    fn message_prefix_default_is_unchanged() {
+        assert_eq!(
+            message_prefix(None, None, Mode::Mainnet, "xyz:ANT"),
+            "[antbot MAINNET xyz:ANT]"
+        );
+        assert_eq!(
+            message_prefix(None, None, Mode::Paper, "xyz:ANT"),
+            "[antbot paper xyz:ANT]"
+        );
+        assert_eq!(
+            message_prefix(None, None, Mode::Testnet, "BTC"),
+            "[antbot testnet BTC]"
+        );
+        // Blank values count as unset.
+        assert_eq!(
+            message_prefix(Some("  "), Some(" "), Mode::Paper, "xyz:ANT"),
+            "[antbot paper xyz:ANT]"
+        );
+    }
+
+    #[test]
+    fn message_prefix_custom_instance_name() {
+        assert_eq!(
+            message_prefix(Some(" ant-1 "), None, Mode::Mainnet, "xyz:ANT"),
+            "[ant-1 MAINNET xyz:ANT]"
+        );
+        assert_eq!(
+            message_prefix(Some("btc-bot"), None, Mode::Testnet, "BTC"),
+            "[btc-bot testnet BTC]"
+        );
+    }
+
+    #[test]
+    fn message_prefix_custom_telegram_prefix_is_verbatim() {
+        assert_eq!(
+            message_prefix(
+                Some("ignored"),
+                Some(" 🐜 ANT live "),
+                Mode::Mainnet,
+                "xyz:ANT"
+            ),
+            "🐜 ANT live"
+        );
+        assert_eq!(
+            message_prefix(None, Some("[desk-2]"), Mode::Paper, "BTC"),
+            "[desk-2]"
+        );
+    }
+
+    #[test]
+    fn startup_shows_the_vault_identity() {
+        let id = crate::mode::identity_line(
+            "0x00000000000000000000000000000000000000aa"
+                .parse()
+                .unwrap(),
+            "0x00000000000000000000000000000000000000bb"
+                .parse()
+                .unwrap(),
+            Some(
+                "0x00000000000000000000000000000000000000cc"
+                    .parse()
+                    .unwrap(),
+            ),
+        );
+        let s = startup("mainnet", "BTC", 0, 100.0, "flat", None, Some(&id));
+        assert!(
+            s.contains("sub-account / vault 0x00000000000000000000000000000000000000cc"),
+            "{s}"
+        );
+        assert!(
+            s.contains("signer 0x00000000000000000000000000000000000000bb (API wallet)"),
+            "{s}"
+        );
+    }
 
     fn trade(closed_ms: u64, pnl: f64, bps_: f64) -> TradeRecord {
         TradeRecord {

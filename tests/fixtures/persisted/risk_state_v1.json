@@ -1,0 +1,43 @@
+{
+  "kill": {
+    "reason": {
+      "rule": "manual",
+      "note": "position mismatch persists: bot 0 vs exchange 5"
+    },
+    "at_ms": 1800003669000,
+    "message": "KILL SWITCH [manual]: manual kill: position mismatch persists: bot 0 vs exchange 5",
+    "later": [
+      [
+        1800003670000,
+        {
+          "rule": "manual",
+          "note": "second trigger"
+        }
+      ]
+    ]
+  },
+  "outcomes": [
+    true
+  ],
+  "trades_closed": 1,
+  "peak_equity_usd": 24.848250074999775,
+  "day": 20833,
+  "day_start_equity_usd": 0.0,
+  "last_equity_usd": 24.848250074999775,
+  "premium_above_since_ms": null,
+  "baseline_spec": {
+    "coin": "xyz:ANT",
+    "asset_id": 110138,
+    "funding_multiplier": 0.005,
+    "oracle_updater": "0x1234567890545d1df9ee64b35fdd16966e08acec",
+    "deployer": "0x88806a71d74ad0a510b350545c9ae490912f0888",
+    "halted": false,
+    "growth_mode": "enabled",
+    "deployer_fee_scale": 1.0,
+    "last_fee_scale_change_time": "2026-10-01T00:00:00Z",
+    "sz_decimals": 2,
+    "max_leverage": 10,
+    "margin_mode": "strictIsolated",
+    "only_isolated": true
+  }
+}

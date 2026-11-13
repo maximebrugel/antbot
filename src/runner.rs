@@ -20,6 +20,19 @@
 //! Paper mode never builds an exchange client: the executor is chosen from
 //! the mode, and [`crate::hl::exchange::ExchangeClient::new`] refuses paper
 //! mode anyway.
+//!
+//! Live modes query and subscribe for the *trading address*: the
+//! sub-account / vault when `HL_VAULT_ADDRESS` (or `[live].vault_address`)
+//! is set, else the main account.
+//!
+//! With `[monitor].health_listen` set, a loopback HTTP server
+//! ([`crate::monitor::health`]) serves `/healthz` and `/metrics` from a
+//! [`HealthSnapshot`] published with the status snapshot (reconciliation
+//! failures and position mismatches included); it stops with the loop.
+//!
+//! The loop itself is generic over the strategy
+//! ([`crate::strategy::TradingStrategy`]); only [`run_inner`] knows that
+//! the premium mean-reversion strategy is the one being run.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,10 +53,11 @@ use crate::hl::exchange::{build_for_mode, AssetRef};
 use crate::hl::info::InfoClient;
 use crate::hl::market::{now_ms, MarketState};
 use crate::hl::ws::{FeedConfig, MarketFeed};
-use crate::mode::{Authorized, Credentials, MainnetConfirmed};
+use crate::mode::{identity_line, Authorized, Credentials, MainnetConfirmed};
 use crate::monitor::alerts::{self, DailySummary, DayTracker};
 use crate::monitor::commands::{CommandsHandle, StatusSnapshot};
 use crate::monitor::csv::{Journal, SignalRow};
+use crate::monitor::health::{HealthServer, HealthSnapshot};
 use crate::monitor::telegram::{AlertSettings, Alerter};
 use crate::monitor::Monitor;
 use crate::risk::kill::risk_state_path;
@@ -54,6 +68,7 @@ use crate::strategy::signal::{
     Command, DoneReason, Event, OrderUpdate, Phase, Strategy, StrategyParams,
 };
 use crate::strategy::sizing::lot_epsilon;
+use crate::strategy::TradingStrategy;
 
 /// Upper bound of command -> feedback -> command rounds per input.
 const MAX_PUMP_ROUNDS: usize = 32;
@@ -63,6 +78,26 @@ const MISMATCH_TOLERANCE: u32 = 2;
 const ALERT_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long shutdown waits for the Telegram command task.
 const COMMANDS_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long shutdown waits for the health server's accept loop.
+const HEALTH_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Health server and the channel its snapshot is published on.
+struct Health {
+    tx: watch::Sender<Arc<HealthSnapshot>>,
+    server: HealthServer,
+}
+
+/// Start the health server if `[monitor].health_listen` is set. Bind
+/// errors are fatal: the operator asked for it (and a container
+/// healthcheck depends on it).
+async fn start_health(cfg: &Config) -> anyhow::Result<Option<Health>> {
+    let Some(addr) = cfg.health_listen_addr() else {
+        return Ok(None);
+    };
+    let (tx, rx) = watch::channel(Arc::new(HealthSnapshot::default()));
+    let server = HealthServer::bind(addr, rx).await?;
+    Ok(Some(Health { tx, server }))
+}
 
 /// Everything the loop needs besides the executor.
 struct Ctx {
@@ -90,6 +125,12 @@ struct Ctx {
     /// Live modes: traded account and signer addresses (never the key), for
     /// the startup alert.
     identity: Option<String>,
+    /// Header of alerts and command replies (see [`msg_prefix`]).
+    prefix: String,
+    /// Process start (ms), for the health snapshot.
+    started_ms: u64,
+    /// Health server (`None` unless `[monitor].health_listen` is set).
+    health: Option<Health>,
 }
 
 /// Run the bot until SIGINT / SIGTERM. `auth` comes from
@@ -105,7 +146,7 @@ pub async fn run(cfg: Config, auth: Authorized) -> anyhow::Result<()> {
         cfg.monitor.telegram_enabled,
         |k| std::env::var(k).ok(),
         AlertSettings {
-            prefix: msg_prefix(mode, &cfg.market.coin),
+            prefix: msg_prefix(&cfg, mode),
             max_per_min: cfg.monitor.telegram_max_per_min,
             ..AlertSettings::default()
         },
@@ -128,12 +169,16 @@ async fn run_inner(
     mainnet: Option<MainnetConfirmed>,
     alerter: Alerter,
 ) -> anyhow::Result<()> {
+    let started_ms = now_ms();
     let ep = cfg.endpoints(mode);
     let info = InfoClient::from_config(&cfg, &ep.info_url)?;
     let data_dir = cfg.monitor.data_dir.clone();
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("creating data dir {}", data_dir.display()))?;
     let lock = RunLock::acquire(&data_dir, &mode.to_string(), now_ms())?;
+    // Up before the (network) asset resolution: /healthz answers 503
+    // "starting" instead of refusing connections.
+    let health = start_health(&cfg).await?;
 
     let spec = assets::resolve_live(&info, &cfg.market.dex, &cfg.market.coin)
         .await
@@ -166,6 +211,9 @@ async fn run_inner(
         missed_day: None,
         status: None,
         identity: None,
+        prefix: msg_prefix(&cfg, mode),
+        started_ms,
+        health,
         cfg,
     };
 
@@ -248,29 +296,33 @@ async fn run_inner(
             let expires =
                 (ctx.cfg.live.expires_after_ms > 0).then_some(ctx.cfg.live.expires_after_ms);
             let client = client.with_expires_after_window(expires);
-            let user = client.account_address().to_hex();
+            // Every query and user feed targets the traded address: the
+            // vault / sub-account when configured, else the main account.
+            let user = client.trading_address().to_hex();
             let signer = client.signer_address().to_hex();
-            ctx.identity = Some(if client.is_agent() {
-                format!("account {user} (main), signer {signer} (API wallet)")
-            } else {
-                format!("account {user} (signer = account)")
-            });
+            ctx.identity = Some(identity_line(
+                client.account_address(),
+                client.signer_address(),
+                client.vault_address(),
+            ));
             tracing::warn!(
                 mode = %mode,
                 exchange = client.url(),
                 signer = %signer,
-                account = %user,
+                account = %client.account_address(),
+                vault = ?client.vault_address().map(|v| v.to_hex()),
+                trading_address = %user,
                 "LIVE executor: real orders will be sent{}",
                 if client.is_mainnet() { " (MODE: MAINNET - REAL FUNDS)" } else { "" }
             );
-            let api = HlApi {
-                exchange: client,
-                info: info.clone(),
-                asset: AssetRef::from(&spec),
-                dex: ctx.cfg.market.dex.clone(),
-                coin: ctx.coin.clone(),
-                user: user.clone(),
-            };
+            let api = HlApi::new(
+                client,
+                info.clone(),
+                AssetRef::from(&spec),
+                ctx.cfg.market.dex.clone(),
+                ctx.coin.clone(),
+            );
+            debug_assert_eq!(api.user, user);
             let mut exec = LiveExecutor::new(
                 LiveParams::from_config(&ctx.cfg, spec.sz_decimals, spec.max_leverage),
                 api,
@@ -303,9 +355,9 @@ async fn run_inner(
 
 /// Compare the strategy's position with the venue after the startup
 /// reconciliation: adopt an unknown position (config) or halt.
-fn reconcile_position_at_startup<A: crate::exec::live::LiveApi>(
+fn reconcile_position_at_startup<A: crate::exec::live::LiveApi, S: TradingStrategy>(
     ctx: &Ctx,
-    engine: &mut Engine,
+    engine: &mut Engine<S>,
     exec: &LiveExecutor<A>,
     now: u64,
     m: &MarketState,
@@ -357,8 +409,8 @@ fn reconcile_position_at_startup<A: crate::exec::live::LiveApi>(
 
 /// Feed executor events to the engine (order feedback is journaled);
 /// returns the resulting commands.
-fn apply_events(
-    engine: &mut Engine,
+fn apply_events<S: TradingStrategy>(
+    engine: &mut Engine<S>,
     mon: &mut Monitor,
     now: u64,
     evs: Vec<ExecEvent>,
@@ -377,8 +429,8 @@ fn apply_events(
 /// still pending after [`MAX_PUMP_ROUNDS`] are kept in `carry` and executed
 /// first on the next call (never dropped: the strategy already counts them
 /// as sent).
-async fn pump<E: Executor>(
-    engine: &mut Engine,
+async fn pump<E: Executor, S: TradingStrategy>(
+    engine: &mut Engine<S>,
     exec: &mut E,
     mon: &mut Monitor,
     m: &MarketState,
@@ -410,8 +462,8 @@ async fn pump<E: Executor>(
 /// dropped) is synthesised from what the executor knows, and a cancel the
 /// executor never received is sent again. Without this the strategy would
 /// wait forever and could neither exit nor flatten on a kill.
-pub fn heal_working<E: Executor>(
-    engine: &mut Engine,
+pub fn heal_working<E: Executor, S: TradingStrategy>(
+    engine: &mut Engine<S>,
     exec: &E,
     mon: &mut Monitor,
     now: u64,
@@ -460,7 +512,7 @@ fn round_to(v: f64, decimals: i32) -> f64 {
 
 /// Log the engine's notices, journal closed trades and send the alerts.
 /// Returns whether the state should be saved now.
-fn log_notices(engine: &mut Engine, mon: &mut Monitor) -> bool {
+fn log_notices<S: TradingStrategy>(engine: &mut Engine<S>, mon: &mut Monitor) -> bool {
     let mut persist = false;
     for n in engine.drain_notices() {
         match n {
@@ -590,7 +642,7 @@ fn log_notices(engine: &mut Engine, mon: &mut Monitor) -> bool {
     persist
 }
 
-fn save_all<E: Executor>(ctx: &mut Ctx, engine: &Engine, exec: &E) {
+fn save_all<E: Executor, S: TradingStrategy>(ctx: &mut Ctx, engine: &Engine<S>, exec: &E) {
     let st = BotState {
         version: STATE_VERSION,
         mode: ctx.mode,
@@ -683,7 +735,12 @@ async fn shutdown_signal() -> &'static str {
 }
 
 /// Summary of a finished UTC day (trades of that day, current account).
-fn send_daily_summary<E: Executor>(ctx: &Ctx, engine: &Engine, exec: &E, done: &DayTracker) {
+fn send_daily_summary<E: Executor, S: TradingStrategy>(
+    ctx: &Ctx,
+    engine: &Engine<S>,
+    exec: &E,
+    done: &DayTracker,
+) {
     let Some(d) = done.day else {
         return;
     };
@@ -707,23 +764,119 @@ fn send_daily_summary<E: Executor>(ctx: &Ctx, engine: &Engine, exec: &E, done: &
     ctx.mon.notify(s.text(&ctx.mode.to_string(), &ctx.coin));
 }
 
-/// Header of alerts and command replies (`MAINNET` in capitals: real funds).
-fn msg_prefix(mode: Mode, coin: &str) -> String {
-    match mode {
-        Mode::Mainnet => format!("[antbot MAINNET {coin}]"),
-        _ => format!("[antbot {mode} {coin}]"),
-    }
+/// Header of alerts and command replies: `[monitor].telegram_prefix`
+/// verbatim, else `[<instance_name or antbot> <mode> <coin>]` (`MAINNET` in
+/// capitals: real funds). See [`alerts::message_prefix`].
+fn msg_prefix(cfg: &Config, mode: Mode) -> String {
+    alerts::message_prefix(
+        cfg.monitor.instance_name.as_deref(),
+        cfg.monitor.telegram_prefix.as_deref(),
+        mode,
+        &cfg.market.coin,
+    )
 }
 
 /// Publish the state snapshot for the Telegram commands (non-blocking;
 /// no-op when commands are disabled).
-fn publish_status<E: Executor>(ctx: &Ctx, engine: &Engine, exec: &E) {
+fn publish_status<E: Executor, S: TradingStrategy>(ctx: &Ctx, engine: &Engine<S>, exec: &E) {
     if let Some(tx) = &ctx.status {
         tx.send_replace(Arc::new(StatusSnapshot::from_engine(
             engine,
-            &msg_prefix(ctx.mode, &ctx.coin),
+            &ctx.prefix,
             now_ms(),
             exec.venue_position(),
+        )));
+    }
+}
+
+/// Non-engine inputs of [`health_snapshot`].
+#[derive(Debug, Clone, Copy)]
+pub struct HealthInputs<'a> {
+    pub cfg: &'a Config,
+    pub mode: Mode,
+    /// Process start (ms).
+    pub started_ms: u64,
+    /// The last reconciliation found a bot / exchange position mismatch.
+    pub position_mismatch: bool,
+    pub now_ms: u64,
+}
+
+/// Build the health snapshot (pure, for tests).
+pub fn health_snapshot<E: Executor, S: TradingStrategy>(
+    inp: HealthInputs<'_>,
+    engine: &Engine<S>,
+    exec: &E,
+    m: &MarketState,
+) -> HealthSnapshot {
+    let HealthInputs {
+        cfg,
+        mode,
+        started_ms,
+        position_mismatch,
+        now_ms: now,
+    } = inp;
+    let stale_ms = cfg.timing.ws_stale_secs * 1000;
+    let failures = exec.reconcile_failures();
+    let unrealized = match (engine.strategy.position(), engine.last_mark()) {
+        (Some(p), Some(mk)) => p.unrealized_pnl(mk),
+        _ => 0.0,
+    };
+    let kill = engine.risk.kill_record();
+    HealthSnapshot {
+        started_at_ms: started_ms,
+        updated_at_ms: now,
+        instance: cfg
+            .monitor
+            .instance_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .unwrap_or(alerts::DEFAULT_INSTANCE_NAME)
+            .to_string(),
+        mode: mode.to_string(),
+        coin: cfg.market.coin.clone(),
+        phase: engine.strategy.phase().kind().as_str().to_string(),
+        ws_connected: m.ws_connected,
+        ws_stale: m.ws_stale(now, stale_ms),
+        data_age_ms: m.data_age_ms(now),
+        stale_threshold_ms: stale_ms,
+        reconcile_ok: failures == 0,
+        reconcile_failures: failures,
+        position_mismatch,
+        killed: kill.is_some(),
+        kill_rule: kill.map(|k| k.reason.rule().to_string()),
+        equity_usd: engine.equity(),
+        realized_pnl_usd: engine.ledger.realized_pnl_usd,
+        unrealized_pnl_usd: unrealized,
+        position_size: exec.venue_position().unwrap_or(engine.strategy_position()),
+        open_orders: exec.open_order_count(),
+        trades_closed: engine.ledger.trades.len(),
+        premium_bps: engine.last_view().and_then(|v| v.premium_bps),
+        raw_premium_bps: engine.last_raw_premium_bps(),
+        premium_ready: engine.premium_ready(),
+    }
+}
+
+/// Publish the health snapshot (no-op without a health server).
+fn publish_health<E: Executor, S: TradingStrategy>(
+    ctx: &Ctx,
+    engine: &Engine<S>,
+    exec: &E,
+    m: &MarketState,
+    position_mismatch: bool,
+) {
+    if let Some(h) = &ctx.health {
+        h.tx.send_replace(Arc::new(health_snapshot(
+            HealthInputs {
+                cfg: &ctx.cfg,
+                mode: ctx.mode,
+                started_ms: ctx.started_ms,
+                position_mismatch,
+                now_ms: now_ms(),
+            },
+            engine,
+            exec,
+            m,
         )));
     }
 }
@@ -734,9 +887,9 @@ fn every(secs: u64) -> tokio::time::Interval {
     t
 }
 
-async fn main_loop<E: Executor>(
+async fn main_loop<E: Executor, S: TradingStrategy>(
     mut ctx: Ctx,
-    mut engine: Engine,
+    mut engine: Engine<S>,
     mut exec: E,
     mut feed: MarketFeed,
     info: InfoClient,
@@ -780,10 +933,12 @@ async fn main_loop<E: Executor>(
     tracing::info!(
         mode = %ctx.mode,
         executor = exec.kind(),
+        strategy = engine.strategy.name(),
         data_dir = %ctx.data_dir.display(),
         phase = engine.strategy.phase().kind().as_str(),
         "main loop started"
     );
+    publish_health(&ctx, &engine, &exec, &feed.snapshot(), false);
     ctx.mon.notify(alerts::startup(
         &ctx.mode.to_string(),
         &ctx.coin,
@@ -868,6 +1023,7 @@ async fn main_loop<E: Executor>(
                     save_all(&mut ctx, &engine, &exec);
                 }
                 publish_status(&ctx, &engine, &exec);
+                publish_health(&ctx, &engine, &exec, &m, mismatches > 0);
                 if now.saturating_sub(lock_refreshed_ms) >= LOCK_REFRESH_MS {
                     lock_refreshed_ms = now;
                     if let Err(e) = ctx.lock.refresh(now) {
@@ -902,6 +1058,8 @@ async fn main_loop<E: Executor>(
                     }
                 }
                 pump(&mut engine, &mut exec, &mut ctx.mon, &m, &mut carry, cmds).await;
+                // Reconcile failures / mismatches show up in /healthz at once.
+                publish_health(&ctx, &engine, &exec, &m, mismatches > 0);
             }
             _ = persist.tick() => save_all(&mut ctx, &engine, &exec),
             _ = sample.tick() => {
@@ -965,6 +1123,7 @@ async fn main_loop<E: Executor>(
         if log_notices(&mut engine, &mut ctx.mon) {
             save_all(&mut ctx, &engine, &exec);
             publish_status(&ctx, &engine, &exec);
+            publish_health(&ctx, &engine, &exec, &feed.snapshot(), mismatches > 0);
         }
     };
 
@@ -1002,10 +1161,116 @@ async fn main_loop<E: Executor>(
     if let Some(h) = commands {
         h.shutdown(COMMANDS_STOP_TIMEOUT).await;
     }
+    if let Some(h) = ctx.health.take() {
+        h.server.shutdown(HEALTH_STOP_TIMEOUT).await;
+    }
     tracing::info!(
         state = %ctx.state_file.display(),
         phase = engine.strategy.phase().kind().as_str(),
         "state saved, bye"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hl::market::DataSource;
+    use crate::hl::types::{L2Book, Level};
+    use crate::risk::RiskParams;
+    use crate::strategy::signal::StrategyParams;
+
+    const T0: u64 = 1_800_000_000_000;
+
+    fn engine(cfg: &Config) -> Engine {
+        Engine::new(
+            EngineParams::from_config(cfg),
+            Strategy::new(StrategyParams::from_config(cfg, 2, 10)),
+            RiskManager::new(RiskParams::from(&cfg.risk), RiskState::default()),
+            Ledger::default(),
+            0,
+        )
+    }
+
+    fn market(now: u64) -> MarketState {
+        let mut m = MarketState::new("xyz:ANT");
+        let l = |px| Level {
+            px,
+            sz: 100.0,
+            n: 1,
+        };
+        m.apply_book(
+            &L2Book {
+                coin: "xyz:ANT".into(),
+                time: now,
+                levels: (vec![l(100.0)], vec![l(100.02)]),
+            },
+            now,
+            DataSource::Ws,
+        );
+        m.oracle_px = Some(100.0);
+        m.mark_px = Some(100.01);
+        m.impact_bid_px = Some(100.0);
+        m.impact_ask_px = Some(100.02);
+        m.ctx_recv_ms = Some(now);
+        m.ws_connected = true;
+        m.last_ws_market_ms = Some(now);
+        m
+    }
+
+    #[test]
+    fn health_snapshot_reflects_engine_executor_and_feed() {
+        let mut cfg = Config::default();
+        cfg.monitor.instance_name = Some("ant-1".into());
+        let mut e = engine(&cfg);
+        let exec = PaperExecutor::from_saved(PaperParams::from_config(&cfg, 2), None).unwrap();
+        let m = market(T0);
+        e.on_market(T0, &m, exec.available_margin_usd());
+        let inp = HealthInputs {
+            cfg: &cfg,
+            mode: Mode::Paper,
+            started_ms: T0 - 10_000,
+            position_mismatch: false,
+            now_ms: T0 + 1_000,
+        };
+        let s = health_snapshot(inp, &e, &exec, &m);
+        assert_eq!(s.instance, "ant-1");
+        assert_eq!((s.mode.as_str(), s.coin.as_str()), ("paper", "xyz:ANT"));
+        assert_eq!(s.phase, "flat");
+        assert_eq!(s.started_at_ms, T0 - 10_000);
+        assert_eq!(s.updated_at_ms, T0 + 1_000);
+        assert!(s.ws_connected && !s.ws_stale);
+        assert_eq!(s.data_age_ms, Some(1_000));
+        assert_eq!(s.stale_threshold_ms, 15_000);
+        assert!(s.reconcile_ok && s.reconcile_failures == 0);
+        assert!(!s.killed && s.kill_rule.is_none());
+        assert_eq!(s.open_orders, 0);
+        assert!(s.raw_premium_bps.is_some());
+        assert!(s.is_healthy(T0 + 1_000), "{:?}", s.problems(T0 + 1_000));
+        // Mismatch and kill make it unhealthy, with the rule name.
+        e.manual_kill(T0 + 2_000, "test");
+        let s = health_snapshot(
+            HealthInputs {
+                position_mismatch: true,
+                ..inp
+            },
+            &e,
+            &exec,
+            &m,
+        );
+        assert!(s.position_mismatch && s.killed);
+        assert_eq!(s.kill_rule.as_deref(), Some("manual"));
+        assert!(!s.is_healthy(T0 + 1_000));
+    }
+
+    #[test]
+    fn msg_prefix_follows_monitor_config() {
+        let mut cfg = Config::default();
+        assert_eq!(msg_prefix(&cfg, Mode::Paper), "[antbot paper xyz:ANT]");
+        assert_eq!(msg_prefix(&cfg, Mode::Mainnet), "[antbot MAINNET xyz:ANT]");
+        cfg.monitor.instance_name = Some("ant-2".into());
+        assert_eq!(msg_prefix(&cfg, Mode::Testnet), "[ant-2 testnet xyz:ANT]");
+        cfg.monitor.telegram_prefix = Some("[desk]".into());
+        assert_eq!(msg_prefix(&cfg, Mode::Mainnet), "[desk]");
+    }
 }
