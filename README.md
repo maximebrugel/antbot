@@ -506,6 +506,7 @@ Everything is written to the data dir (`monitor.data_dir`, `--data-dir` or `ANTB
 - **CSV journals:** headers are written once and restarts append. If a newer version changes the columns, the old file is renamed `<name>.<unix_ms>.old` and a new one starts. Rows are written synchronously on the main loop and flushed to the OS, not fsynced: they survive a process crash but not necessarily a power loss. After a failed or partial write, the next row starts on a new line.
 - **Heartbeat:** a `heartbeat` log line every `timing.heartbeat_secs` with `phase`, `premium_bps` (the signal), `raw_premium_bps`, `position`, `unrealized_usd`, `working_order`, `equity_usd`, `realized_usd`, `trades`, `venue_position`, `killed`, and feed health: `ws_connected`, `ws_connects`, `rest_polls` and `data_age_ms` (age of the older of the last book and the last asset ctx).
 - **Healthy run:** at startup you should see `antbot starting`, `asset resolved`, `websocket connected` and `main loop started`, then heartbeats.
+- **Quick status:** `scripts/paper_status.sh <data_dir>` (or an instance dir containing `data/`) is a read-only summary of a paper run: process alive (from `antbot.lock`), last heartbeat line, latest premium sample and the range seen in `signals.csv`, phase and position, kill state, order and trade counts, and cumulative paper PnL from `trades.csv`. It needs `jq` and `awk` and never touches the network.
 
 ### Telegram setup
 
