@@ -1,10 +1,13 @@
-target/
-data/
-.git/
-.github/
-.env
-.env.*
-*.log
-Dockerfile
-docker-compose.yml
-.dockerignore
+# Allowlist: only the build inputs reach the build context. Never ships
+# .env files, secrets/ directories, data/, deploy/ or the git history.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!config/default.toml
+# Defence in depth, should anything above ever be widened.
+**/.env
+**/.env.*
+**/secrets
+**/data
+**/*.log

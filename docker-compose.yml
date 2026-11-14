@@ -1,5 +1,9 @@
-# antbot on a VPS. Default: paper mode (live mainnet market data, simulated
-# fills, no key, never calls /exchange).
+# antbot on a VPS, simple single-bot setup. Default: paper mode (live mainnet
+# market data, simulated fills, no key, never calls /exchange).
+#
+# For testnet / mainnet, or several strategies on one host, use the hardened
+# one-stack-per-strategy template instead: deploy/strategy/ (README.md there;
+# secrets as files, read-only root fs, no caps, `antbot-<name>` projects).
 #
 #   cp .env.example .env            # Telegram, and HL_* keys for testnet only
 #   mkdir -p data                   # host dir for state, CSV journals and logs
@@ -9,8 +13,9 @@
 #
 # Requires Docker Compose >= 2.24 (env_file with `required: false`).
 #
-# Testnet: use a config with `mode = "testnet"` (e.g. ./config/local.toml)
-# and a separate data dir, never the paper state in /data. In .env:
+# Testnet (prefer deploy/strategy/): use a config with `mode = "testnet"`
+# (e.g. ./config/local.toml) and a separate data dir, never the paper state
+# in /data. In .env:
 #   ANTBOT_CONFIG=/app/config/local.toml
 #   ANTBOT_DATA_DIR=/data/testnet      # ./data/testnet on the host
 #   HL_PRIVATE_KEY=...                 # plus HL_ACCOUNT_ADDRESS for an API wallet
@@ -29,6 +34,10 @@ services:
     # Run as the owner of ./data (the image default is 10001:10001).
     user: "${ANTBOT_UID:-10001}:${ANTBOT_GID:-10001}"
     command: ["run"]
+    # /healthz + /metrics on the container's loopback only (no port is
+    # published); the image healthcheck `antbot healthcheck` queries it.
+    environment:
+      ANTBOT_HEALTH_LISTEN: 127.0.0.1:9100
     volumes:
       - ./data:/data
       # Edit config/default.toml (or point ANTBOT_CONFIG at another file in
@@ -36,7 +45,11 @@ services:
       - ./config:/app/config:ro
     # Time to cancel open orders, save state and flush alerts on stop.
     stop_signal: SIGTERM
-    stop_grace_period: 30s
+    stop_grace_period: 45s
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     logging:
       driver: json-file
       options:

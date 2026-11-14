@@ -599,9 +599,21 @@ The historical premium is hourly (`fundingHistory.premium`). The replay reconstr
 
 The `Dockerfile` is a multi-stage build:
 - **Builder:** Rust on Debian trixie, with BuildKit cache mounts for the cargo registry and target dir.
-- **Runtime:** `debian:trixie-slim` with CA certificates only. It runs as the non-root user `antbot` (uid/gid 10001), with `/data` as a volume and a healthcheck on the run-lock heartbeat (`$ANTBOT_DATA_DIR/antbot.lock`, so it follows a data dir override).
+- **Runtime:** `debian:trixie-slim` with CA certificates only. It runs as the non-root user `antbot` (uid/gid 10001), with `/data` as a volume, `ENTRYPOINT ["antbot"]`, and OCI labels (`org.opencontainers.image.source`, and `revision` from the `GIT_SHA` build arg).
+- **Healthcheck:** `antbot healthcheck` in exec form (30 s interval, 5 s timeout, 120 s start period, 3 retries). It needs no shell, curl or wget, and writes nothing, so it works with a read-only root filesystem. With `ANTBOT_HEALTH_LISTEN` set, it needs a `200` from the loopback `/healthz`. Without it, it checks the run-lock heartbeat in `$ANTBOT_DATA_DIR`.
+- **Build context:** `.dockerignore` is an allowlist (`Cargo.toml`, `Cargo.lock`, `src/`, `config/default.toml`). `.env` files, `secrets/`, `data/` and `deploy/` never reach the image.
 
-`docker-compose.yml` needs **Docker Compose ≥ 2.24** (it uses `env_file` with `required: false`; older versions reject the file). It runs paper mode by default. It reads `env_file: .env`, mounts `./data:/data` and `./config:/app/config:ro`, uses `restart: unless-stopped`, and rotates the json-file logs (10 MB × 5). It allows 30 s on stop for the graceful shutdown.
+```sh
+docker build --build-arg GIT_SHA=$(git rev-parse --short HEAD) \
+  -t antbot:latest -t antbot:$(git rev-parse --short HEAD) .
+```
+
+There are two ways to run it:
+
+- **One stack per strategy (recommended; required for testnet / mainnet and for several bots per host):** [`deploy/strategy/`](deploy/strategy/README.md). `new-strategy.sh <name> --mode paper|testnet|mainnet` scaffolds `/root/projects/strategies/<name>/`. Each strategy runs as the Compose project `antbot-<name>`, with secrets as `0400` files (`*_FILE` variables, nothing secret in the environment), a read-only root fs, no capabilities, memory / pid limits, no published port, and `paper` / `testnet` profiles. Mainnet needs an explicit opt-in in `.env`. The README there also covers the shared REST budget, one API wallet and sub-account per bot, Dozzle / Beszel, and how to migrate a live bot.
+- **Simple paper run from the repo:** `docker-compose.yml`, described below.
+
+`docker-compose.yml` needs **Docker Compose ≥ 2.24** (it uses `env_file` with `required: false`; older versions reject the file). It runs paper mode by default. It reads `env_file: .env`, mounts `./data:/data` and `./config:/app/config:ro`, runs read-only without capabilities, serves `/healthz` on the container's loopback for the healthcheck, uses `restart: unless-stopped`, and rotates the json-file logs (10 MB × 5). It allows 45 s on stop for the graceful shutdown.
 
 ```sh
 # On the VPS (Docker Engine + compose plugin >= 2.24 installed)
@@ -610,7 +622,7 @@ cp .env.example .env && chmod 600 .env      # fill TELEGRAM_*; HL_* only for tes
 mkdir -p data && sudo chown 10001:10001 data # or set ANTBOT_UID/ANTBOT_GID in .env to your uid/gid
 docker compose up -d --build
 docker compose logs -f antbot               # look for "websocket connected" and "heartbeat"
-docker compose ps                           # health: healthy once the run lock is fresh
+docker compose ps                           # health: healthy once /healthz answers 200
 ```
 
 Operations:
@@ -647,7 +659,7 @@ Everything is written to the data dir (`monitor.data_dir`, `--data-dir` or `ANTB
 | `trades.csv` | one row per round trip: `entry_ts_ms, entry_ts_utc, exit_ts_ms, exit_ts_utc, mode, side, size, entry_px, exit_px, notional_usd, fees_usd, funding_usd, gross_pnl_usd, pnl_usd, pnl_bps, reason, entry_premium_bps, exit_premium_bps, hold_secs, exit_taker_sz, signal_ts_ms` |
 | `state_<mode>.json` | persisted strategy, ledger (equity curve, trade history), executor state and the daily summary tracker |
 | `risk_state.json` | kill state, hit-rate window, equity peak, day start, spec baseline |
-| `antbot.lock` | run marker with a heartbeat. `reset-kill` refuses to run while it is fresh. The Docker healthcheck uses it |
+| `antbot.lock` | run marker with a heartbeat. `reset-kill` refuses to run while it is fresh. `antbot healthcheck` falls back to it when no health server is configured |
 
 - **CSV journals:** headers are written once and restarts append. If a newer version changes the columns, the old file is renamed `<name>.<unix_ms>.old` and a new one starts. Rows are written synchronously on the main loop and flushed to the OS, not fsynced: they survive a process crash but not necessarily a power loss. After a failed or partial write (or a crash mid-row), the next row starts on a new line; a row cut inside a quoted field has its quote closed first, so it cannot swallow the rows after it.
 - **Heartbeat:** a `heartbeat` log line every `timing.heartbeat_secs` with `phase`, `premium_bps` (the signal), `raw_premium_bps`, `position`, `unrealized_usd`, `working_order`, `equity_usd`, `realized_usd`, `trades`, `venue_position`, `killed`, and feed health: `ws_connected`, `ws_connects`, `rest_polls` and `data_age_ms` (age of the older of the last book and the last asset ctx).

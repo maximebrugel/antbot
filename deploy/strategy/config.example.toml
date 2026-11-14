@@ -1,0 +1,68 @@
+# antbot strategy config (Docker stack, see deploy/strategy/README.md).
+#
+# Mounted read-only at /app/config/config.toml (ANTBOT_CONFIG). Non-secret:
+# keys and tokens live in ./secrets/, never here.
+#
+# Every key not set here takes its value from config/default.toml in the repo
+# (Config::default mirrors that file), where each key is documented. Only the
+# keys a strategy usually changes are listed below.
+#
+# Changing `mode` or `[market]` of an existing strategy: start from an empty
+# data dir (risk_state.json holds the spec baseline and the hit-rate window).
+
+# paper | testnet | mainnet. new-strategy.sh sets it from --mode.
+# mainnet (REAL FUNDS) additionally needs ANTBOT_MAINNET_FLAG=--mainnet and
+# ANTBOT_CONFIRM_MAINNET in .env, plus the API wallet secrets.
+mode = "paper"
+
+[market]
+# HIP-3 dex and coin (native perps: dex = "" and a bare coin, e.g. "BTC").
+# The expected_* values are the spec baseline: a live difference triggers the
+# spec-change kill rule. Check them against the info API for a new coin.
+dex = "xyz"
+coin = "xyz:ANT"
+expected_funding_multiplier = 0.005
+expected_growth_mode = "enabled"
+expected_deployer_fee_scale = 1.0
+expected_sz_decimals = 2
+expected_max_leverage = 10
+
+[sizing]
+notional_usd = 2500.0
+max_notional_usd = 10000.0
+leverage = 1
+margin_mode = "isolated"
+
+[risk]
+daily_loss_limit_usd = 150.0
+max_drawdown_usd = 300.0
+
+[timing]
+# The Hyperliquid REST budget (1200 weight/min = 20 weight/s) is per public
+# IP and SHARED by every bot on this host: keep the sum of
+# rest_refill_per_sec over all running containers <= 20 (e.g. 2 bots at
+# 10.0, 4 at 5.0). `antbot check-config` prints this instance's share.
+rest_bucket_capacity = 100.0
+rest_refill_per_sec = 5.0
+
+[monitor]
+# Inside the container. The host directory is ./data, bind-mounted at /data
+# (ANTBOT_DATA_DIR=/data also wins over this value).
+data_dir = "/data"
+log_json = false
+log_max_files = 7
+telegram_enabled = true
+# Only one getUpdates poller per bot token: if several strategies share one
+# Telegram bot, enable commands in at most one of them.
+telegram_commands_enabled = true
+daily_summary = true
+# instance_name comes from ANTBOT_INSTANCE_NAME (.env), health_listen from
+# ANTBOT_HEALTH_LISTEN (compose.yaml, 127.0.0.1:9100).
+
+[live]
+# Trade a sub-account / vault (one per strategy is recommended): its address
+# here, or in ./secrets/hl_vault_address with HL_VAULT_ADDRESS_FILE in .env.
+# HL_PRIVATE_KEY stays an API wallet of the master account.
+# vault_address = "0x..."
+cancel_on_shutdown = true
+flatten_on_shutdown = false

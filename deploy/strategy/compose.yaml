@@ -1,0 +1,178 @@
+# antbot: one Compose stack per strategy (see README.md next to this file).
+#
+# Scaffolded into /root/projects/strategies/<name>/ by new-strategy.sh:
+#
+#   cd /root/projects/strategies/<name>
+#   docker compose -p antbot-<name> up -d          # the mode of config.toml
+#   docker compose -p antbot-<name> logs -f
+#   docker compose -p antbot-<name> stop           # SIGTERM, graceful shutdown
+#
+# .env (root:root 0600) holds NON-SECRET settings only, and the *_FILE paths
+# of the secrets. Secrets are files in ./secrets/ (10001:10001 0400), mounted
+# at /run/secrets/<name>. Standalone Compose bind-mounts them as they are on
+# the host (owner and mode included), hence the ownership set on the host.
+#
+# Only the variables listed under `environment` reach the container: a raw
+# secret mistakenly put in .env is never passed to the bot.
+#
+# Services:
+#   antbot          default: `run` in the mode of config.toml.
+#   antbot-paper    profile "paper": `run --mode paper` (mainnet market data,
+#                   simulated fills, never calls /exchange) in /data/paper.
+#   antbot-testnet  profile "testnet", off by default: `run --mode testnet`
+#                   with ./config.testnet.toml and testnet_* secrets, in
+#                   /data/testnet.
+#
+# Mainnet (REAL FUNDS) is never started by accident: `mode = "mainnet"` in
+# config.toml is refused unless .env also sets ANTBOT_MAINNET_FLAG=--mainnet
+# AND the exact ANTBOT_CONFIRM_MAINNET value (README "Running on mainnet").
+# Neither is ever set by this template.
+#
+# No `ports:`: /healthz and /metrics listen on the container's loopback only
+# (ANTBOT_HEALTH_LISTEN), for the healthcheck and same-namespace probes.
+
+x-antbot-env: &antbot-env
+  ANTBOT_CONFIG: /app/config/config.toml
+  ANTBOT_DATA_DIR: /data
+  ANTBOT_HEALTH_LISTEN: 127.0.0.1:9100
+  ANTBOT_INSTANCE_NAME: ${ANTBOT_INSTANCE_NAME:?set ANTBOT_INSTANCE_NAME in .env}
+  ANTBOT_TELEGRAM_PREFIX: ${ANTBOT_TELEGRAM_PREFIX:-}
+  RUST_LOG: ${RUST_LOG:-info}
+  # Secret file paths (/run/secrets/...), never secret values. Empty = unset.
+  TELEGRAM_BOT_TOKEN_FILE: ${TELEGRAM_BOT_TOKEN_FILE:-}
+  TELEGRAM_CHAT_ID_FILE: ${TELEGRAM_CHAT_ID_FILE:-}
+  TELEGRAM_API_BASE: ${TELEGRAM_API_BASE:-}
+  HL_PRIVATE_KEY_FILE: ${HL_PRIVATE_KEY_FILE:-}
+  HL_ACCOUNT_ADDRESS_FILE: ${HL_ACCOUNT_ADDRESS_FILE:-}
+  HL_VAULT_ADDRESS_FILE: ${HL_VAULT_ADDRESS_FILE:-}
+  # Mainnet confirmation: empty unless the operator sets it in .env.
+  ANTBOT_CONFIRM_MAINNET: ${ANTBOT_CONFIRM_MAINNET:-}
+
+x-antbot: &antbot
+  image: antbot:${ANTBOT_TAG:-latest}
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  user: "10001:10001"
+  # SIGTERM: cancel open orders, save state, flush alerts (< 45 s).
+  stop_signal: SIGTERM
+  stop_grace_period: 45s
+  # Measured (paper, xyz:ANT, warm, 2026-11-14): process peak RSS 15.3 MiB,
+  # cgroup memory.peak 13.9 MiB, 6 threads, 7 pids. ~16x headroom for live
+  # mode (reconciliation, exchange client), websocket bursts and the
+  # growing in-memory trade history.
+  mem_reservation: 64m
+  mem_limit: 256m
+  pids_limit: 128
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "antbot", "healthcheck", "--timeout-secs", "4"]
+    interval: 30s
+    timeout: 5s
+    start_period: 120s
+    retries: 3
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+  labels:
+    dev.dozzle.group: antbot
+  volumes:
+    - type: bind
+      source: ./config.toml
+      target: /app/config/config.toml
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ./data
+      target: /data
+      bind:
+        create_host_path: false
+
+services:
+  antbot:
+    <<: *antbot
+    container_name: antbot-${ANTBOT_INSTANCE_NAME:?set ANTBOT_INSTANCE_NAME in .env}
+    # String form: Compose splits it after interpolation, so an empty
+    # ANTBOT_MAINNET_FLAG adds no argument. `--mainnet` with a non-mainnet
+    # config is refused by the bot.
+    command: run ${ANTBOT_MAINNET_FLAG:-}
+    environment:
+      <<: *antbot-env
+    # Every file must exist (new-strategy.sh creates them). An empty file is
+    # fine while its *_FILE variable stays unset in .env.
+    secrets:
+      - telegram_bot_token
+      - telegram_chat_id
+      - hl_private_key
+      - hl_account_address
+      - hl_vault_address
+
+  antbot-paper:
+    <<: *antbot
+    profiles: [paper]
+    container_name: antbot-${ANTBOT_INSTANCE_NAME:?set ANTBOT_INSTANCE_NAME in .env}-paper
+    command: ["run", "--mode", "paper"]
+    environment:
+      <<: *antbot-env
+      ANTBOT_DATA_DIR: /data/paper
+      ANTBOT_INSTANCE_NAME: ${ANTBOT_INSTANCE_NAME:?set ANTBOT_INSTANCE_NAME in .env}-paper
+      # No keys, no mainnet confirmation, no Telegram (a second getUpdates
+      # poller on the same bot token would conflict with the main service).
+      HL_PRIVATE_KEY_FILE: ""
+      HL_ACCOUNT_ADDRESS_FILE: ""
+      HL_VAULT_ADDRESS_FILE: ""
+      ANTBOT_CONFIRM_MAINNET: ""
+      TELEGRAM_BOT_TOKEN_FILE: ""
+      TELEGRAM_CHAT_ID_FILE: ""
+
+  antbot-testnet:
+    <<: *antbot
+    profiles: [testnet]
+    container_name: antbot-${ANTBOT_INSTANCE_NAME:?set ANTBOT_INSTANCE_NAME in .env}-testnet
+    command: ["run", "--mode", "testnet"]
+    environment:
+      <<: *antbot-env
+      ANTBOT_DATA_DIR: /data/testnet
+      ANTBOT_INSTANCE_NAME: ${ANTBOT_INSTANCE_NAME:?set ANTBOT_INSTANCE_NAME in .env}-testnet
+      HL_PRIVATE_KEY_FILE: /run/secrets/testnet_hl_private_key
+      HL_ACCOUNT_ADDRESS_FILE: /run/secrets/testnet_hl_account_address
+      HL_VAULT_ADDRESS_FILE: ""
+      ANTBOT_CONFIRM_MAINNET: ""
+      TELEGRAM_BOT_TOKEN_FILE: ""
+      TELEGRAM_CHAT_ID_FILE: ""
+    # A testnet coin has its own spec baseline: own config file.
+    volumes:
+      - type: bind
+        source: ./config.testnet.toml
+        target: /app/config/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
+    secrets:
+      - testnet_hl_private_key
+      - testnet_hl_account_address
+
+secrets:
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token
+  telegram_chat_id:
+    file: ./secrets/telegram_chat_id
+  hl_private_key:
+    file: ./secrets/hl_private_key
+  hl_account_address:
+    file: ./secrets/hl_account_address
+  hl_vault_address:
+    file: ./secrets/hl_vault_address
+  testnet_hl_private_key:
+    file: ./secrets/testnet_hl_private_key
+  testnet_hl_account_address:
+    file: ./secrets/testnet_hl_account_address
