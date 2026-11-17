@@ -302,6 +302,20 @@ pub struct MonitorConfig {
     pub telegram_enabled: bool,
     /// Telegram messages per rolling minute (queued alerts are merged).
     pub telegram_max_per_min: u32,
+    /// Timeout of one Telegram `sendMessage` HTTP call (seconds, 1..=120).
+    pub telegram_http_timeout_secs: u64,
+    /// Attempts per Telegram message, the first one included (1..=10).
+    /// Transport errors / timeouts and 5xx are retried; 429 honours
+    /// `retry_after`; other 4xx are not retried.
+    pub telegram_max_attempts: u32,
+    /// First retry delay after a transport error / 5xx (seconds, 1..=60),
+    /// doubled after each failure, capped at 60 s, plus up to 25 % jitter.
+    pub telegram_retry_backoff_secs: u64,
+    /// Hold the "exit started" alert this long (seconds, 0..=120; 0 = send
+    /// it at once): if the trade closes meanwhile, one combined exit
+    /// message is sent instead of two. Never dropped: flushed when the
+    /// window ends and at shutdown.
+    pub telegram_exit_coalesce_secs: u64,
     /// Answer the read-only `/pnl`, `/trades`, `/help` commands from the
     /// configured private chat (needs `telegram_enabled` and the env vars).
     pub telegram_commands_enabled: bool,
@@ -456,6 +470,10 @@ impl Default for MonitorConfig {
             log_max_files: 7,
             telegram_enabled: true,
             telegram_max_per_min: 20,
+            telegram_http_timeout_secs: crate::monitor::telegram::DEFAULT_HTTP_TIMEOUT_SECS,
+            telegram_max_attempts: crate::monitor::telegram::DEFAULT_MAX_ATTEMPTS,
+            telegram_retry_backoff_secs: crate::monitor::telegram::DEFAULT_RETRY_BACKOFF_SECS,
+            telegram_exit_coalesce_secs: crate::monitor::DEFAULT_EXIT_COALESCE_SECS,
             telegram_commands_enabled: true,
             daily_summary: true,
             instance_name: None,
@@ -812,6 +830,18 @@ impl Config {
         if !(1..=30).contains(&self.monitor.telegram_max_per_min) {
             e.push("monitor.telegram_max_per_min must be in 1..=30 (Telegram limits)".into());
         }
+        if !(1..=120).contains(&self.monitor.telegram_http_timeout_secs) {
+            e.push("monitor.telegram_http_timeout_secs must be in 1..=120".into());
+        }
+        if !(1..=10).contains(&self.monitor.telegram_max_attempts) {
+            e.push("monitor.telegram_max_attempts must be in 1..=10".into());
+        }
+        if !(1..=60).contains(&self.monitor.telegram_retry_backoff_secs) {
+            e.push("monitor.telegram_retry_backoff_secs must be in 1..=60".into());
+        }
+        if self.monitor.telegram_exit_coalesce_secs > 120 {
+            e.push("monitor.telegram_exit_coalesce_secs must be in 0..=120".into());
+        }
         for (k, v) in [
             ("instance_name", &self.monitor.instance_name),
             ("telegram_prefix", &self.monitor.telegram_prefix),
@@ -984,6 +1014,44 @@ mod tests {
         assert_eq!(cfg.strategy.entry_threshold_bps, 60.0);
         assert_eq!(cfg.strategy.max_hold_secs, 28_800);
         assert_eq!(cfg.sizing.notional_usd, 2500.0);
+    }
+
+    #[test]
+    fn telegram_delivery_keys_default_when_absent() {
+        // A config written before these keys existed still parses.
+        let old = "[monitor]\ntelegram_enabled = true\ntelegram_max_per_min = 20\n";
+        let c = Config::from_toml_str(old).unwrap();
+        assert_eq!(c.monitor.telegram_http_timeout_secs, 25);
+        assert_eq!(c.monitor.telegram_max_attempts, 6);
+        assert_eq!(c.monitor.telegram_retry_backoff_secs, 2);
+        assert_eq!(c.monitor.telegram_exit_coalesce_secs, 10);
+        assert_eq!(c.monitor, MonitorConfig::default());
+    }
+
+    #[test]
+    fn telegram_delivery_keys_parse_and_validate() {
+        let c = Config::from_toml_str(
+            "[monitor]\ntelegram_max_per_min = 20\ntelegram_http_timeout_secs = 40\ntelegram_max_attempts = 8\ntelegram_retry_backoff_secs = 5\ntelegram_exit_coalesce_secs = 0\n",
+        )
+        .unwrap();
+        assert_eq!(c.monitor.telegram_http_timeout_secs, 40);
+        assert_eq!(c.monitor.telegram_max_attempts, 8);
+        assert_eq!(c.monitor.telegram_retry_backoff_secs, 5);
+        assert_eq!(c.monitor.telegram_exit_coalesce_secs, 0);
+        for (k, v) in [
+            ("telegram_http_timeout_secs", "0"),
+            ("telegram_http_timeout_secs", "121"),
+            ("telegram_max_attempts", "0"),
+            ("telegram_max_attempts", "11"),
+            ("telegram_retry_backoff_secs", "0"),
+            ("telegram_retry_backoff_secs", "61"),
+            ("telegram_exit_coalesce_secs", "121"),
+        ] {
+            let err = Config::from_toml_str(&format!("[monitor]\n{k} = {v}\n")).unwrap_err();
+            assert!(err.to_string().contains(k), "{k} = {v}: {err}");
+        }
+        // Typos are still rejected.
+        assert!(Config::from_toml_str("[monitor]\ntelegram_http_timeout = 5\n").is_err());
     }
 
     #[test]

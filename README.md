@@ -518,6 +518,10 @@ These rates drive paper fills, replay and PnL accounting. The venue charges its 
 | `log_max_files` | `30` | daily log files kept (0 = keep all). `1` acts as `2` (today and the previous file). At startup the newest files are kept, today's included, and a same-day restart neither erases today's log nor the previous one. A process started on a day whose log file already existed keeps one extra old file after its day rollovers, until it is restarted |
 | `telegram_enabled` | `true` | Telegram alerts (still need the env vars) |
 | `telegram_max_per_min` | `20` | Telegram rate limit (1–30); queued alerts are merged |
+| `telegram_http_timeout_secs` | `25` | timeout of one Telegram `sendMessage` call (1–120) |
+| `telegram_max_attempts` | `6` | attempts per Telegram message, the first one included (1–10). Timeouts / transport errors and 5xx are retried, 429 honours `retry_after`, other 4xx are not retried |
+| `telegram_retry_backoff_secs` | `2` | first retry delay after a timeout / transport error / 5xx (1–60), doubled after each failure, capped at 60 s, plus up to 25 % jitter |
+| `telegram_exit_coalesce_secs` | `10` | hold the "exit started" alert this long (0–120, `0` = send at once); if the trade closes meanwhile, one combined exit message is sent. Flushed when the window ends and at shutdown, never dropped |
 | `telegram_commands_enabled` | `true` | answer the read-only `/pnl`, `/trades`, `/help` commands. Active only with `telegram_enabled`, both env vars set, and `TELEGRAM_CHAT_ID` a private chat (your user id) |
 | `daily_summary` | `true` | send a summary of the previous UTC day after 00:00 UTC (also at the next start if it was missed) |
 
@@ -565,7 +569,7 @@ Besides the types and the allowed values in the tables above, `validate` checks:
   - `timing`: every `*_secs` key and `ws_reconnect_initial_ms` > 0, `ws_ping_secs` < 60, `rest_bucket_capacity` > 0, `rest_refill_per_sec` in (0, 20];
   - `paper.initial_balance_usd` > 0;
   - `live`: `reconcile_secs` in 1..=3600, `max_exchange_actions_per_min` ≥ 1, `expires_after_ms` 0 or in 5000..=300000;
-  - `monitor`: `data_dir` not empty, `telegram_max_per_min` in 1..=30.
+  - `monitor`: `data_dir` not empty, `telegram_max_per_min` in 1..=30, `telegram_http_timeout_secs` in 1..=120, `telegram_max_attempts` in 1..=10, `telegram_retry_backoff_secs` in 1..=60, `telegram_exit_coalesce_secs` in 0..=120.
 
 ## Replay / backtest
 
@@ -691,9 +695,11 @@ The daily summary tracker (current UTC day, premium min / max / last) is persist
 Sending never blocks the trading loop:
 - Alerts go into a bounded queue. A background task sends at most `monitor.telegram_max_per_min` per minute, about one per second, and merges alerts that pile up meanwhile.
 - A merged message never cuts an alert: alerts that do not fit in one message are carried to the next one. Only a single alert longer than the Telegram limit is truncated.
-- A 429 response is retried after its `retry_after`. 5xx and transport errors are retried with backoff.
+- A 429 response is retried after its `retry_after` (at most 60 s). 5xx, timeouts and transport errors are retried with exponential backoff: `telegram_retry_backoff_secs` (default 2 s), doubled after each failure, capped at 60 s, plus up to 25 % jitter. Other 4xx are not retried.
+- Worst case with the defaults (25 s timeout, 6 attempts): about 4 minutes per message (6 × 25 s of timeouts + 2+4+8+16+32 s of backoff), 7.5 minutes with 429s. Only the background sender waits; alerts raised meanwhile stay in the queue and go out merged once Telegram answers. Shutdown waits for the queue at most 20 s.
+- "Exit started" is held for `telegram_exit_coalesce_secs` (default 10 s). If the trade closes within that window, a single combined message is sent (the EXIT alert followed by the exit-start reason and premium), so one Telegram failure cannot lose the start of the exit separately. Otherwise "exit started" is sent when the window ends; it is also flushed at shutdown, never dropped.
 - A 200 response counts as delivered only if its body is a valid Bot API answer with `"ok": true`. A cut or malformed body is retried like a transport error: delivery is unknown, and a duplicate is preferred over a lost alert.
-- On queue overflow, alerts are dropped. Alerts that still fail after 3 attempts are given up. Both are counted at the top of the next message ("(N alerts dropped: queue full)", "(N earlier alerts could not be delivered)").
+- On queue overflow, alerts are dropped. Alerts that still fail after `telegram_max_attempts` attempts (default 6) are given up. Both are counted at the top of the next message ("(N alerts dropped: queue full)", "(N earlier alerts could not be delivered)").
 - The sent and failed counts are logged at shutdown.
 - The token never appears in the logs: it is part of the request URL, so errors are logged without the URL, and every error string (including an API `description` that echoes the URL) has the token replaced by `<redacted>`. This applies to both alerts and commands.
 

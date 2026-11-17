@@ -167,6 +167,58 @@ pub fn is_valid_size(sz: f64, sz_decimals: u32) -> bool {
     }
 }
 
+/// Round `x` to `decimals` decimal places, half away from zero, tolerant
+/// of binary floating-point noise: `20.560000000000002` -> `20.56`,
+/// `0.1 + 0.2` -> `0.3`, `2.675` (stored as `2.67499999999999982...`) ->
+/// `2.68`. The result is the `f64` closest to the decimal value, so it
+/// prints without noise. Non-finite values, values too large to carry
+/// `decimals` decimals, and `decimals > 15` are returned unchanged; `-0.0`
+/// becomes `0.0`.
+pub fn round_to_decimals(x: f64, decimals: u32) -> f64 {
+    if !x.is_finite() || decimals > 15 {
+        return x;
+    }
+    let k = 10f64.powi(decimals as i32);
+    let scaled = x.abs() * k;
+    // Already an integer at this scale (or beyond f64 integer precision).
+    if !scaled.is_finite() || scaled >= 2f64.powi(52) {
+        return x;
+    }
+    // Tolerance of a few hundred ulps of `scaled` (the noise of a few f64
+    // operations is ~1 ulp each), capped far below any meaningful digit,
+    // so a decimal half stored a hair under the half still rounds away
+    // from zero.
+    let tol = (scaled.max(1.0) * 1e-13).min(1e-4);
+    let n = (scaled + 0.5 + tol).floor();
+    // n is an exact integer and k an exact power of ten (<= 1e15): the
+    // division is correctly rounded to the nearest f64 of the decimal.
+    (x.signum() * n / k) + 0.0
+}
+
+/// Accounting normalisation of a size accumulated from fills (sums and
+/// differences of lot-sized quantities): snap it to the `szDecimals` lot
+/// grid **only** when it is within float noise of it. Exchange fills are
+/// always whole lots, so this removes noise such as `20.560000000000002`
+/// without ever moving a size by a meaningful amount; a value genuinely
+/// off the grid (never produced by the venue) is returned unchanged.
+pub fn snap_size_noise(sz: f64, sz_decimals: u32) -> f64 {
+    let r = round_to_decimals(sz, sz_decimals);
+    let lot = 10f64.powi(-(sz_decimals.min(15) as i32));
+    let tol = (lot * 1e-3).max(sz.abs() * 1e-12);
+    if (r - sz).abs() <= tol {
+        r
+    } else {
+        sz
+    }
+}
+
+/// A size for display (alerts, logs): rounded to `szDecimals` and printed
+/// with exactly that many decimals (`20.56`, `24.20`, `3`).
+pub fn fmt_size(sz: f64, sz_decimals: u32) -> String {
+    let d = sz_decimals.min(15) as usize;
+    format!("{:.d$}", round_to_decimals(sz, sz_decimals))
+}
+
 /// Size for a USD notional at `px`, rounded down to the lot.
 pub fn size_for_notional(
     notional_usd: f64,
@@ -305,6 +357,109 @@ mod tests {
         assert_eq!(sz, 23.9);
         assert!(sz * 104.57 <= 2500.0);
         assert_eq!(float_to_wire(sz).unwrap(), "23.9");
+    }
+
+    #[test]
+    fn round_to_decimals_removes_float_noise() {
+        // The 2026-11-17 exit: three fills summed in f64.
+        let sum = 20.19 + 0.35 + 0.02;
+        assert_ne!(sum, 20.56); // 20.560000000000002
+        assert_eq!(round_to_decimals(sum, 2), 20.56);
+        assert_eq!(round_to_decimals(0.1 + 0.2, 1), 0.3);
+        assert_eq!(round_to_decimals(0.1 + 0.2, 2), 0.3);
+        assert_eq!(round_to_decimals(1.0 - 0.9, 2), 0.1);
+        assert_eq!(round_to_decimals(23.907430429377452, 2), 23.91);
+        assert_eq!(round_to_decimals(-24.239999999999995, 2), -24.24);
+        // Already on the grid: unchanged.
+        for x in [0.0, 0.01, 0.29, 24.24, 103.11, 2500.0, -7.5] {
+            assert_eq!(round_to_decimals(x, 2), x, "{x}");
+        }
+    }
+
+    #[test]
+    fn round_to_decimals_half_away_from_zero() {
+        assert_eq!(round_to_decimals(0.5, 0), 1.0);
+        assert_eq!(round_to_decimals(1.5, 0), 2.0);
+        assert_eq!(round_to_decimals(2.5, 0), 3.0); // not banker's rounding
+        assert_eq!(round_to_decimals(-2.5, 0), -3.0);
+        assert_eq!(round_to_decimals(0.125, 2), 0.13);
+        assert_eq!(round_to_decimals(-0.125, 2), -0.13);
+        // Decimal halves stored just below the half still round away.
+        assert_eq!(round_to_decimals(2.675, 2), 2.68);
+        assert_eq!(round_to_decimals(1.005, 2), 1.01);
+        assert_eq!(round_to_decimals(0.285, 2), 0.29);
+        // Not a half: nearest.
+        assert_eq!(round_to_decimals(2.674, 2), 2.67);
+        assert_eq!(round_to_decimals(2.4, 0), 2.0);
+        assert_eq!(round_to_decimals(-2.4, 0), -2.0);
+    }
+
+    #[test]
+    fn round_to_decimals_edge_cases() {
+        // sz_decimals 0: whole units.
+        assert_eq!(round_to_decimals(20.000000000000004, 0), 20.0);
+        assert_eq!(round_to_decimals(19.999999999999996, 0), 20.0);
+        assert_eq!(round_to_decimals(3.49, 0), 3.0);
+        // -0.0 and tiny negatives print as 0.
+        assert!(round_to_decimals(-0.0, 2).is_sign_positive());
+        assert!(round_to_decimals(-0.001, 2).is_sign_positive());
+        assert_eq!(round_to_decimals(-0.001, 2), 0.0);
+        // Non-finite / huge / too many decimals: unchanged.
+        assert!(round_to_decimals(f64::NAN, 2).is_nan());
+        assert_eq!(round_to_decimals(f64::INFINITY, 2), f64::INFINITY);
+        assert_eq!(round_to_decimals(1e300, 2), 1e300);
+        assert_eq!(round_to_decimals(0.123, 16), 0.123);
+        // Idempotent on a sweep of values and decimals.
+        let mut x = 0.000137;
+        while x < 1e7 {
+            for d in 0..=6 {
+                let r = round_to_decimals(x, d);
+                assert_eq!(round_to_decimals(r, d), r, "{x} {d}");
+                assert!(
+                    (r - x).abs() <= (0.5 + 2e-4) * 10f64.powi(-(d as i32)),
+                    "{x} {d}"
+                );
+            }
+            x *= 1.37;
+        }
+    }
+
+    #[test]
+    fn snap_size_noise_only_moves_noise() {
+        assert_eq!(snap_size_noise(20.19 + 0.35 + 0.02, 2), 20.56);
+        assert_eq!(snap_size_noise(20.56 - 20.19 - 0.35, 2), 0.02);
+        assert_eq!(snap_size_noise(20.56 - 20.56, 2), 0.0);
+        assert_eq!(snap_size_noise(0.1 + 0.2, 1), 0.3);
+        assert_eq!(snap_size_noise(5.000000000000001, 0), 5.0);
+        // Genuinely off the lot grid: left alone (never moved by up to
+        // half a lot, which could fake a flat position or leave dust).
+        assert_eq!(snap_size_noise(0.004, 2), 0.004);
+        assert_eq!(snap_size_noise(20.567, 2), 20.567);
+        assert_eq!(snap_size_noise(0.4, 0), 0.4);
+        // A long run of partial fills accumulates noise but snaps back.
+        let mut acc = 0.0;
+        for _ in 0..1000 {
+            acc += 0.01;
+        }
+        assert_ne!(acc, 10.0);
+        assert_eq!(snap_size_noise(acc, 2), 10.0);
+        let mut left = 10.0;
+        for _ in 0..999 {
+            left -= 0.01;
+        }
+        assert_eq!(snap_size_noise(left, 2), 0.01);
+    }
+
+    #[test]
+    fn fmt_size_uses_sz_decimals() {
+        assert_eq!(fmt_size(20.19 + 0.35 + 0.02, 2), "20.56");
+        assert_eq!(fmt_size(24.2, 2), "24.20");
+        assert_eq!(fmt_size(-24.24, 2), "-24.24");
+        assert_eq!(fmt_size(0.0, 2), "0.00");
+        assert_eq!(fmt_size(-0.0, 2), "0.00");
+        assert_eq!(fmt_size(20.000000000000004, 0), "20");
+        assert_eq!(fmt_size(3.5, 0), "4");
+        assert_eq!(fmt_size(0.1 + 0.2, 3), "0.300");
     }
 
     #[test]

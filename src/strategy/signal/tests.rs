@@ -971,3 +971,102 @@ fn stale_data_past_the_deadline_still_exits_with_ioc() {
         |e| matches!(e, Event::Warning(w) if w.contains("closing with IOC on the last known book"))
     ));
 }
+
+// ------------------------------------------------- size noise (2026-11-17)
+
+/// Short entry filled 20.19 + 0.35 + 0.02 (f64 sum 20.560000000000002),
+/// ended by the entry timeout.
+fn short_noisy_entry(s: &mut Strategy) -> OrderIntent {
+    let o = placed(&tick(s, T0, 60.0))[0];
+    assert!(o.sz > 20.56);
+    for sz in [20.19, 0.35, 0.02] {
+        fill(s, T0 + 10 * S, &o, o.px, sz);
+    }
+    assert_eq!(s.working().unwrap().filled, 20.56, "no noise in w.filled");
+    let st = tick(s, T0 + 900 * S, 60.0);
+    assert_eq!(cancels(&st), vec![o.tag]);
+    let st = done(s, T0 + 901 * S, o.tag, DoneReason::Canceled);
+    assert!(matches!(st.events[0], Event::PositionOpened { size, .. } if size == 20.56));
+    assert_eq!(s.phase().kind(), PhaseKind::InPosition);
+    o
+}
+
+#[test]
+fn accumulated_fill_sizes_carry_no_float_noise() {
+    assert_ne!(20.19 + 0.35 + 0.02, 20.56);
+    let mut s = strat();
+    short_noisy_entry(&mut s);
+    let p = s.position().unwrap();
+    assert_eq!(p.size, 20.56);
+    assert_eq!(p.entry_sz, 20.56);
+    // The persisted state serialises the clean value.
+    let json = serde_json::to_string(s.state()).unwrap();
+    assert!(json.contains("\"size\":20.56"), "{json}");
+    assert!(!json.contains("20.560000000000002"), "{json}");
+}
+
+#[test]
+fn exit_in_noisy_partials_closes_exactly_without_dust() {
+    let mut s = strat();
+    short_noisy_entry(&mut s);
+    // Converged: the reduce-only close is exactly the position.
+    let st = tick_px(&mut s, T0 + H, 8.0, 99.50, 99.52);
+    let x = placed(&st)[0];
+    assert!(x.reduce_only && x.is_buy);
+    assert_eq!(x.sz, 20.56);
+    // Partial exit fills in a different split.
+    fill(&mut s, T0 + H + S, &x, 99.50, 0.35);
+    assert_eq!(s.position().unwrap().size, 20.21);
+    fill(&mut s, T0 + H + S, &x, 99.50, 20.19);
+    assert_eq!(s.position().unwrap().size, 0.02);
+    assert_eq!(s.position().unwrap().exit_sz, 20.54);
+    let st = fill(&mut s, T0 + H + S, &x, 99.50, 0.02);
+    let r = closed(&st).expect("closed on the last lot, no dust left");
+    assert_eq!(r.size, 20.56);
+    assert!(s.position().is_none());
+    assert!(!st
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::Warning(w) if w.contains("exceeds"))));
+}
+
+#[test]
+fn requoted_exit_after_partial_fill_is_the_exact_remainder() {
+    let mut s = strat();
+    short_noisy_entry(&mut s);
+    let x = placed(&tick_px(&mut s, T0 + H, 5.0, 99.50, 99.52))[0];
+    assert_eq!(x.sz, 20.56);
+    fill(&mut s, T0 + H + S, &x, 99.50, 20.19);
+    // The book moves: the maker exit is requoted for what is left.
+    let st = tick_px(&mut s, T0 + H + 30 * S, 5.0, 99.70, 99.72);
+    assert_eq!(cancels(&st), vec![x.tag]);
+    let st = done(&mut s, T0 + H + 31 * S, x.tag, DoneReason::Canceled);
+    let y = placed(&st)[0];
+    // Raw f64 accounting would hold 20.560000000000002 - 20.19 =
+    // 0.370000000000001 here: the open size is exactly the remaining lot.
+    assert_eq!(s.position().unwrap().size, 0.37);
+    assert_eq!(y.sz, 0.37);
+    assert!(y.reduce_only);
+    let st = fill(&mut s, T0 + H + 32 * S, &y, 99.70, 0.37);
+    assert_eq!(closed(&st).unwrap().size, 20.56);
+}
+
+#[test]
+fn trade_record_size_is_on_the_lot_grid_for_sz_decimals_0() {
+    let mut p = params();
+    p.sz_decimals = 0;
+    let mut s = Strategy::new(p);
+    let o = placed(&tick(&mut s, T0, 60.0))[0];
+    assert_eq!(o.sz, o.sz.round());
+    fill(&mut s, T0 + S, &o, o.px, o.sz);
+    done(&mut s, T0 + S, o.tag, DoneReason::Filled);
+    let x = placed(&tick_px(&mut s, T0 + H, 5.0, 99.50, 99.52))[0];
+    assert_eq!(x.sz, o.sz);
+    let st = fill(&mut s, T0 + H + S, &x, 99.50, x.sz);
+    let r = closed(&st).unwrap();
+    assert_eq!(r.size, o.sz);
+    assert_eq!(
+        crate::hl::rounding::fmt_size(r.size, 0),
+        format!("{}", o.sz)
+    );
+}

@@ -105,7 +105,10 @@ fn settings() -> AlertSettings {
         max_per_min: 20,
         min_interval: Duration::from_millis(10),
         http_timeout: Duration::from_secs(5),
+        // The historical 3 attempts: the tests count requests.
+        max_attempts: 3,
         retry_backoff: Duration::from_millis(50),
+        max_retry_backoff: Duration::from_secs(1),
     }
 }
 
@@ -288,4 +291,179 @@ async fn large_burst_is_split_without_cutting_alerts() {
     for t in &sent {
         assert_eq!(all.matches(t.as_str()).count(), 1, "{t}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rides_out_a_longer_5xx_outage_with_more_attempts() {
+    // The 2026-11-17 incident: several 502s in a row. Three attempts
+    // were not enough; the configured attempts deliver the alert.
+    let (base, seen) = spawn_mock(vec![
+        ("502 Bad Gateway", "bad gateway"),
+        ("502 Bad Gateway", "bad gateway"),
+        ("503 Service Unavailable", "unavailable"),
+        ("502 Bad Gateway", "bad gateway"),
+    ])
+    .await;
+    let mut s = settings();
+    s.max_attempts = 6;
+    s.retry_backoff = Duration::from_millis(20);
+    s.max_retry_backoff = Duration::from_millis(60);
+    let (a, stats) = Alerter::spawn(cfg(&base), s);
+    a.send("↩️ exit started xyz:ANT: converged");
+    assert!(a.flush(Duration::from_secs(10)).await);
+    let reqs = seen.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 5, "4 failures, then delivered");
+    assert!(reqs.iter().all(|r| r.body == reqs[0].body));
+    // Exponential backoff: 20, 40, 60 (capped), 60 ms (+ jitter).
+    let gaps: Vec<Duration> = reqs.windows(2).map(|w| w[1].at - w[0].at).collect();
+    for (g, min) in gaps.iter().zip([20u64, 40, 60, 60]) {
+        assert!(*g >= Duration::from_millis(min - 5), "{gaps:?}");
+    }
+    assert_eq!(stats.sent.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.failed.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gives_up_after_max_attempts_and_reports_it() {
+    let (base, seen) = spawn_mock(vec![("502 Bad Gateway", "x"); 4]).await;
+    let mut s = settings();
+    s.max_attempts = 4;
+    s.retry_backoff = Duration::from_millis(5);
+    let (a, stats) = Alerter::spawn(cfg(&base), s);
+    a.send("lost");
+    assert!(a.flush(Duration::from_secs(10)).await);
+    assert_eq!(seen.lock().unwrap().len(), 4);
+    assert_eq!(stats.failed.load(Ordering::Relaxed), 1);
+    a.send("next");
+    assert!(a.flush(Duration::from_secs(10)).await);
+    let t = texts(&seen);
+    assert_eq!(
+        t.last().unwrap(),
+        "[antbot paper xyz:ANT]\n(1 earlier alerts could not be delivered)\nnext"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retrying_never_blocks_send() {
+    // A mock that never answers: every attempt waits for the HTTP timeout.
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut keep = Vec::new();
+        while let Ok((sock, _)) = l.accept().await {
+            keep.push(sock);
+        }
+    });
+    let mut s = settings();
+    s.queue_capacity = 4;
+    s.http_timeout = Duration::from_millis(300);
+    s.max_attempts = 6;
+    let (a, stats) = Alerter::spawn(cfg(&base), s);
+    a.send("stuck");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let t0 = Instant::now();
+    for i in 0..20 {
+        a.send(format!("alert {i}"));
+    }
+    // The worker is busy retrying: send() still returns at once, and the
+    // overflow is dropped and counted exactly as before.
+    assert!(
+        t0.elapsed() < Duration::from_millis(50),
+        "{:?}",
+        t0.elapsed()
+    );
+    assert_eq!(stats.dropped.load(Ordering::Relaxed), 16);
+    // A bounded flush returns on time even though nothing can be sent.
+    let t1 = Instant::now();
+    assert!(!a.flush(Duration::from_millis(200)).await);
+    assert!(t1.elapsed() < Duration::from_millis(500));
+}
+
+fn closed_trade() -> antbot::strategy::signal::TradeRecord {
+    use antbot::strategy::premium::Side;
+    use antbot::strategy::signal::{ExitReason, TradeRecord};
+    TradeRecord {
+        side: Side::Short,
+        size: 20.19 + 0.35 + 0.02,
+        entry_px: 103.11,
+        exit_px: 102.6,
+        signal_ms: 0,
+        opened_ms: 1_000,
+        closed_ms: 2_701_000,
+        entry_premium_bps: Some(62.3),
+        exit_premium_bps: Some(8.0),
+        fees_usd: 0.13,
+        funding_usd: 0.05,
+        gross_pnl_usd: 10.5,
+        pnl_usd: 10.42,
+        pnl_bps: 49.2,
+        exit_reason: ExitReason::Converged,
+        exit_taker_sz: 0.0,
+    }
+}
+
+fn monitor(a: &Alerter) -> antbot::monitor::Monitor {
+    antbot::monitor::Monitor::new(
+        antbot::monitor::csv::Journal::default(),
+        a.clone(),
+        "xyz:ANT",
+    )
+    .with_sz_decimals(2)
+    .with_exit_coalesce_ms(10_000)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exit_started_and_trade_closed_within_the_window_are_one_message() {
+    use antbot::strategy::signal::ExitReason;
+    let (base, seen) = spawn_mock(vec![]).await;
+    let (a, _) = Alerter::spawn(cfg(&base), settings());
+    let mut m = monitor(&a);
+    let t0 = 1_800_000_000_000;
+    m.exit_started(t0, ExitReason::Converged, Some(8.3));
+    // Nothing goes out while the start is held.
+    m.flush_due(t0 + 2_000);
+    assert!(a.flush(Duration::from_secs(5)).await);
+    assert!(texts(&seen).is_empty());
+    m.trade_closed(t0 + 2_500, &closed_trade());
+    m.flush_due(t0 + 60_000);
+    drop(m);
+    assert!(a.flush(Duration::from_secs(5)).await);
+    let t = texts(&seen);
+    assert_eq!(t.len(), 1, "{t:?}");
+    assert!(
+        t[0].contains("✅ EXIT SHORT xyz:ANT (converged)\n20.56 103.1100"),
+        "{}",
+        t[0]
+    );
+    assert!(
+        t[0].ends_with("\n↩️ exit started 2s before: converged, premium +8.3 bps"),
+        "{}",
+        t[0]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exit_started_without_close_is_flushed_after_the_window_or_on_drop() {
+    use antbot::strategy::signal::ExitReason;
+    let (base, seen) = spawn_mock(vec![]).await;
+    let (a, _) = Alerter::spawn(cfg(&base), settings());
+    let mut m = monitor(&a);
+    let t0 = 1_800_000_000_000;
+    // Outside the window: two messages.
+    m.exit_started(t0, ExitReason::MaxHold, None);
+    m.flush_due(t0 + 10_000);
+    assert!(a.flush(Duration::from_secs(5)).await);
+    m.trade_closed(t0 + 900_000, &closed_trade());
+    assert!(a.flush(Duration::from_secs(5)).await);
+    let t = texts(&seen);
+    assert_eq!(t.len(), 2, "{t:?}");
+    assert!(t[0].ends_with("↩️ exit started xyz:ANT: max_hold\npremium n/a"));
+    assert!(t[1].contains("✅ EXIT SHORT") && !t[1].contains("exit started"));
+    // Held at the end of the run (no close, no flush): queued on drop.
+    m.exit_started(t0 + 1_000_000, ExitReason::Kill, None);
+    drop(m);
+    assert!(a.flush(Duration::from_secs(5)).await);
+    let t = texts(&seen);
+    assert_eq!(t.len(), 3, "{t:?}");
+    assert!(t[2].ends_with("↩️ exit started xyz:ANT: kill\npremium n/a"));
 }

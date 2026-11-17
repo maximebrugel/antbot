@@ -11,12 +11,25 @@
 //!   limit), so bursts (kill + exit + warnings) arrive together. An alert
 //!   that does not fit is never cut: it is carried over and starts the
 //!   next message (only a single alert longer than the limit is
-//!   truncated). A `429` answer honours `retry_after`; transport errors
-//!   and `5xx` are retried with backoff; other errors drop the message
-//!   with a log line, and the next message says how many alerts were not
-//!   delivered. A retry after a transport timeout can post the same
-//!   message twice (Telegram has no idempotency key): duplicates are
-//!   preferred over losses.
+//!   truncated). A `429` answer honours `retry_after` (capped at 60 s);
+//!   transport errors (timeouts included) and `5xx` are retried with a
+//!   capped exponential backoff with jitter (see [`retry_delay`]); other
+//!   `4xx` drop the message at once with a log line. A message still
+//!   failing after `max_attempts` is given up and the next message says
+//!   how many alerts were not delivered. A retry after a transport timeout
+//!   can post the same message twice (Telegram has no idempotency key):
+//!   duplicates are preferred over losses.
+//! * **Worst case per message** (defaults: 25 s HTTP timeout, 6 attempts,
+//!   backoff 2 s doubling, capped at 60 s, +0..25 % jitter): 6 x 25 s of
+//!   timeouts + 2+4+8+16+32 s of backoff (x1.25 at most) = about 228 s
+//!   (~4 min); with `429`s, 6 x 25 s + 5 x 60 s = 450 s at most. Only the
+//!   background worker waits: [`Alerter::send`] stays a `try_send`, alerts
+//!   raised meanwhile wait in the queue (256 slots; overflow is dropped
+//!   and counted, unchanged) and go out merged once Telegram answers. The
+//!   rate limiter (`min_interval`, `max_per_min`) is checked before each
+//!   message, and every attempt counts as a send, so retries cannot make
+//!   the bot exceed Telegram's limits afterwards. Shutdown waits for the
+//!   queue only up to its own flush timeout.
 //! * **Disabled gracefully:** without a token / chat id (or with
 //!   `monitor.telegram_enabled = false`) a single log line says so and
 //!   every call is a no-op.
@@ -56,8 +69,22 @@ pub const DEFAULT_API_BASE: &str = "https://api.telegram.org";
 pub const ENV_BOT_TOKEN: &str = "TELEGRAM_BOT_TOKEN";
 pub const ENV_CHAT_ID: &str = "TELEGRAM_CHAT_ID";
 pub const ENV_API_BASE: &str = "TELEGRAM_API_BASE";
-const SEND_ATTEMPTS: u32 = 3;
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// Default HTTP timeout of one `sendMessage` call
+/// (`[monitor].telegram_http_timeout_secs`).
+pub const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 25;
+/// Default attempts per message, the first one included
+/// (`[monitor].telegram_max_attempts`).
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 6;
+/// Default first retry delay for transport errors / `5xx`, doubled after
+/// each failure (`[monitor].telegram_retry_backoff_secs`).
+pub const DEFAULT_RETRY_BACKOFF_SECS: u64 = 2;
+/// Cap of the exponential retry backoff.
+pub const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+/// Longest `retry_after` honoured on a `429`.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// Random extra delay added to a backoff, as a fraction of it (spreads the
+/// retries of several bots sharing a token / network).
+pub const RETRY_JITTER: f64 = 0.25;
 
 /// Bot credentials and endpoint.
 #[derive(Clone, PartialEq, Eq)]
@@ -135,9 +162,15 @@ pub struct AlertSettings {
     pub queue_capacity: usize,
     pub max_per_min: u32,
     pub min_interval: Duration,
+    /// Timeout of one HTTP call (connect + request + body).
     pub http_timeout: Duration,
-    /// First retry delay for transport errors / 5xx (doubles).
+    /// Attempts per message, the first one included (at least 1).
+    pub max_attempts: u32,
+    /// First retry delay for transport errors / 5xx (doubles, capped at
+    /// `max_retry_backoff`, plus jitter).
     pub retry_backoff: Duration,
+    /// Cap of the exponential backoff (before jitter).
+    pub max_retry_backoff: Duration,
 }
 
 impl Default for AlertSettings {
@@ -147,10 +180,55 @@ impl Default for AlertSettings {
             queue_capacity: 256,
             max_per_min: 20,
             min_interval: Duration::from_millis(1100),
-            http_timeout: Duration::from_secs(10),
-            retry_backoff: Duration::from_secs(1),
+            http_timeout: Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS),
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            retry_backoff: Duration::from_secs(DEFAULT_RETRY_BACKOFF_SECS),
+            max_retry_backoff: MAX_RETRY_BACKOFF,
         }
     }
+}
+
+impl AlertSettings {
+    /// Upper bound of the time one message can keep the worker busy
+    /// (every attempt timing out, maximal backoff and jitter, no `429`).
+    pub fn worst_case_per_message(&self) -> Duration {
+        let attempts = self.max_attempts.max(1);
+        let mut total = self.http_timeout.saturating_mul(attempts);
+        for retry in 1..attempts {
+            total = total.saturating_add(retry_delay(
+                self.retry_backoff,
+                self.max_retry_backoff,
+                retry,
+                1.0,
+            ));
+        }
+        total
+    }
+}
+
+/// Delay before retry number `retry` (1 = first retry) after a transport
+/// error / `5xx`: `base * 2^(retry-1)`, capped at `cap`, plus a jitter of
+/// up to [`RETRY_JITTER`] of it (`rand01` in `[0, 1]`).
+pub fn retry_delay(base: Duration, cap: Duration, retry: u32, rand01: f64) -> Duration {
+    let exp = retry.saturating_sub(1).min(30);
+    let d = base.saturating_mul(1u32 << exp).min(cap);
+    let r = if rand01.is_finite() {
+        rand01.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    d.saturating_add(d.mul_f64(RETRY_JITTER * r))
+}
+
+/// A cheap value in `[0, 1)` for the backoff jitter (no RNG dependency:
+/// the sub-second clock is unpredictable enough to spread retries).
+fn jitter01() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    // Scramble the low bits (they move fastest) over the whole range.
+    let x = (nanos as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 11;
+    x as f64 / (1u64 << 53) as f64
 }
 
 enum Msg {
@@ -214,6 +292,11 @@ impl Alerter {
                     chat_id = %cfg.chat_id,
                     custom_api_base = cfg.api_base != DEFAULT_API_BASE,
                     max_per_min = settings.max_per_min,
+                    http_timeout_secs = settings.http_timeout.as_secs_f64(),
+                    max_attempts = settings.max_attempts,
+                    retry_backoff_secs = settings.retry_backoff.as_secs_f64(),
+                    worst_case_per_message_secs =
+                        settings.worst_case_per_message().as_secs_f64().round(),
                     "telegram alerts enabled"
                 );
                 Self::spawn(cfg, settings).0
@@ -431,23 +514,33 @@ impl Worker {
 
     /// Send one message (with retries). Returns whether it was delivered.
     async fn deliver(&mut self, text: &str) -> bool {
-        let mut backoff = self.settings.retry_backoff;
-        for attempt in 1..=SEND_ATTEMPTS {
+        let attempts = self.settings.max_attempts.max(1);
+        for attempt in 1..=attempts {
             self.sent_at.push_back(Instant::now());
             match self.post(text).await {
                 Ok(()) => {
                     self.stats.sent.fetch_add(1, Ordering::Relaxed);
                     return true;
                 }
-                Err(SendError::Retry(wait, why)) if attempt < SEND_ATTEMPTS => {
-                    let wait = if wait.is_zero() { backoff } else { wait };
-                    tracing::warn!(attempt, retry_in = ?wait, error = %why, "telegram send failed, retrying");
+                Err(SendError::Retry(wait, why)) if attempt < attempts => {
+                    // A 429 `retry_after` is used as is; transport errors
+                    // and 5xx back off exponentially (capped, jittered).
+                    let wait = if wait.is_zero() {
+                        retry_delay(
+                            self.settings.retry_backoff,
+                            self.settings.max_retry_backoff,
+                            attempt,
+                            jitter01(),
+                        )
+                    } else {
+                        wait
+                    };
+                    tracing::warn!(attempt, max_attempts = attempts, retry_in = ?wait, error = %why, "telegram send failed, retrying");
                     tokio::time::sleep(wait).await;
-                    backoff = backoff.saturating_mul(2);
                 }
                 Err(SendError::Retry(_, why)) | Err(SendError::Fatal(why)) => {
                     // warn, not error: errors are alerted, this must not loop.
-                    tracing::warn!(attempt, error = %why, "telegram alert not delivered");
+                    tracing::warn!(attempt, max_attempts = attempts, error = %why, "telegram alert not delivered");
                     self.stats.failed.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
@@ -783,6 +876,43 @@ mod tests {
             AlertSettings::default(),
         );
         assert!(!a.is_enabled());
+    }
+
+    #[test]
+    fn retry_delay_is_exponential_capped_and_jittered() {
+        let s = Duration::from_secs;
+        let cap = s(60);
+        assert_eq!(retry_delay(s(2), cap, 1, 0.0), s(2));
+        assert_eq!(retry_delay(s(2), cap, 2, 0.0), s(4));
+        assert_eq!(retry_delay(s(2), cap, 3, 0.0), s(8));
+        assert_eq!(retry_delay(s(2), cap, 5, 0.0), s(32));
+        assert_eq!(retry_delay(s(2), cap, 6, 0.0), s(60), "capped");
+        assert_eq!(retry_delay(s(2), cap, 1000, 0.0), s(60), "no overflow");
+        // Jitter adds at most RETRY_JITTER of the delay.
+        assert_eq!(retry_delay(s(2), cap, 1, 1.0), Duration::from_millis(2500));
+        assert_eq!(retry_delay(s(2), cap, 6, 1.0), s(75));
+        assert_eq!(retry_delay(s(2), cap, 1, f64::NAN), s(2));
+        assert_eq!(retry_delay(s(2), cap, 1, 7.0), Duration::from_millis(2500));
+        for _ in 0..100 {
+            let j = jitter01();
+            assert!((0.0..1.0).contains(&j), "{j}");
+        }
+    }
+
+    #[test]
+    fn default_settings_and_worst_case() {
+        let d = AlertSettings::default();
+        assert_eq!(d.http_timeout, Duration::from_secs(25));
+        assert_eq!(d.max_attempts, 6);
+        assert_eq!(d.retry_backoff, Duration::from_secs(2));
+        assert_eq!(d.max_retry_backoff, Duration::from_secs(60));
+        // 6 x 25 s + (2+4+8+16+32) x 1.25 s = 150 + 77.5 s.
+        assert_eq!(d.worst_case_per_message(), Duration::from_millis(227_500));
+        let one = AlertSettings {
+            max_attempts: 0, // treated as 1
+            ..AlertSettings::default()
+        };
+        assert_eq!(one.worst_case_per_message(), Duration::from_secs(25));
     }
 
     #[test]

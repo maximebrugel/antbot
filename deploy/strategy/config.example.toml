@@ -52,6 +52,13 @@ data_dir = "/data"
 log_json = false
 log_max_files = 7
 telegram_enabled = true
+# Telegram delivery (defaults shown): HTTP timeout, attempts per message,
+# first retry delay (doubling, capped at 60 s), and how long "exit started"
+# is held to be merged with the trade-closed alert (0 = off).
+# telegram_http_timeout_secs = 25
+# telegram_max_attempts = 6
+# telegram_retry_backoff_secs = 2
+# telegram_exit_coalesce_secs = 10
 # Only one getUpdates poller per bot token: if several strategies share one
 # Telegram bot, enable commands in at most one of them.
 telegram_commands_enabled = true

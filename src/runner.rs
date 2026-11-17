@@ -52,6 +52,7 @@ use crate::hl::assets::{self, AssetSpec, ResolveError};
 use crate::hl::exchange::{build_for_mode, AssetRef};
 use crate::hl::info::InfoClient;
 use crate::hl::market::{now_ms, MarketState};
+use crate::hl::rounding::fmt_size;
 use crate::hl::ws::{FeedConfig, MarketFeed};
 use crate::mode::{identity_line, Authorized, Credentials, MainnetConfirmed};
 use crate::monitor::alerts::{self, DailySummary, DayTracker};
@@ -74,8 +75,9 @@ use crate::strategy::TradingStrategy;
 const MAX_PUMP_ROUNDS: usize = 32;
 /// Position mismatches tolerated (consecutive reconciliations) before halting.
 const MISMATCH_TOLERANCE: u32 = 2;
-/// How long shutdown waits for queued Telegram alerts.
-const ALERT_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long shutdown waits for queued Telegram alerts (well inside the
+/// 45 s container stop grace period, after the orders are handled).
+const ALERT_FLUSH_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long shutdown waits for the Telegram command task.
 const COMMANDS_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long shutdown waits for the health server's accept loop.
@@ -148,6 +150,9 @@ pub async fn run(cfg: Config, auth: Authorized) -> anyhow::Result<()> {
         AlertSettings {
             prefix: msg_prefix(&cfg, mode),
             max_per_min: cfg.monitor.telegram_max_per_min,
+            http_timeout: Duration::from_secs(cfg.monitor.telegram_http_timeout_secs),
+            max_attempts: cfg.monitor.telegram_max_attempts,
+            retry_backoff: Duration::from_secs(cfg.monitor.telegram_retry_backoff_secs),
             ..AlertSettings::default()
         },
     );
@@ -201,7 +206,9 @@ async fn run_inner(
             Journal::open(&data_dir, &mode.to_string()),
             alerter,
             &cfg.market.coin,
-        ),
+        )
+        .with_sz_decimals(spec.sz_decimals)
+        .with_exit_coalesce_ms(cfg.monitor.telegram_exit_coalesce_secs * 1000),
         data_dir,
         sz_decimals: spec.sz_decimals,
         asset_id: spec.asset_id,
@@ -500,14 +507,8 @@ pub fn heal_working<E: Executor, S: TradingStrategy>(
 
 /// Round for log output only (VWAP prices and notionals carry float noise
 /// such as `101.49999999999999`).
-fn round_to(v: f64, decimals: i32) -> f64 {
-    let k = 10f64.powi(decimals);
-    let r = (v * k).round() / k;
-    if r.is_finite() {
-        r
-    } else {
-        v
-    }
+fn round_to(v: f64, decimals: u32) -> f64 {
+    crate::hl::rounding::round_to_decimals(v, decimals)
 }
 
 /// Log the engine's notices, journal closed trades and send the alerts.
@@ -528,7 +529,7 @@ fn log_notices<S: TradingStrategy>(engine: &mut Engine<S>, mon: &mut Monitor) ->
                         side = side.as_str(),
                         premium_bps = round_to(premium_bps, 2),
                         px = round_to(px, 8),
-                        size = round_to(size, 8),
+                        size = round_to(size, mon.sz_decimals),
                         notional_usd = round_to(notional_usd, 2),
                         "entry started (ALO)"
                     );
@@ -543,13 +544,18 @@ fn log_notices<S: TradingStrategy>(engine: &mut Engine<S>, mon: &mut Monitor) ->
                     let premium = engine.strategy.position().and_then(|p| p.entry_premium_bps);
                     tracing::info!(
                         side = side.as_str(),
-                        size = round_to(size, 8),
+                        size = round_to(size, mon.sz_decimals),
                         avg_px = round_to(avg_px, 8),
                         entry_premium_bps = ?premium.map(|p| round_to(p, 2)),
                         "position opened"
                     );
                     mon.notify(alerts::position_opened(
-                        &mon.coin, side, size, avg_px, premium,
+                        &mon.coin,
+                        side,
+                        size,
+                        mon.sz_decimals,
+                        avg_px,
+                        premium,
                     ));
                     persist = true;
                 }
@@ -571,18 +577,19 @@ fn log_notices<S: TradingStrategy>(engine: &mut Engine<S>, mon: &mut Monitor) ->
                         taker_at_ms,
                         "exit started"
                     );
-                    mon.notify(alerts::exit_started(&mon.coin, reason, premium_bps));
+                    // Held briefly to merge with the trade-closed alert.
+                    mon.exit_started(now_ms(), reason, premium_bps);
                 }
                 Event::TakerFallback { remaining } => {
                     tracing::warn!(remaining, "taker fallback (IOC)");
-                    mon.notify(alerts::taker_fallback(&mon.coin, remaining));
+                    mon.taker_fallback(remaining);
                 }
                 Event::OrderRejected { tag, reason } => {
                     tracing::info!(tag, ?reason, "order rejected");
                 }
                 Event::TradeClosed(t) => {
                     mon.trade(&t);
-                    mon.notify(alerts::trade_closed(&mon.coin, &t));
+                    mon.trade_closed(now_ms(), &t);
                     tracing::info!(
                         pnl_usd = t.pnl_usd,
                         pnl_bps = t.pnl_bps,
@@ -590,7 +597,7 @@ fn log_notices<S: TradingStrategy>(engine: &mut Engine<S>, mon: &mut Monitor) ->
                         format_args!(
                         "trade closed: {} {} {:.4} -> {:.4}, pnl {:.2} USD ({:.1} bps), fees {:.4}, funding {:.4}, reason {}, premium {:?} -> {:?} bps",
                         t.side.as_str(),
-                        t.size,
+                        fmt_size(t.size, mon.sz_decimals),
                         t.entry_px,
                         t.exit_px,
                         t.pnl_usd,
@@ -1125,6 +1132,9 @@ async fn main_loop<E: Executor, S: TradingStrategy>(
             publish_status(&ctx, &engine, &exec);
             publish_health(&ctx, &engine, &exec, &feed.snapshot(), mismatches > 0);
         }
+        // A held "exit started" whose close did not come in time (the 1 s
+        // tick bounds the extra delay).
+        ctx.mon.flush_due(now_ms());
     };
 
     tracing::info!(%reason, "shutting down");
@@ -1134,10 +1144,13 @@ async fn main_loop<E: Executor, S: TradingStrategy>(
         h.request_stop();
     }
     ctx.status = None;
+    // A held "exit started" goes out before the shutdown alert.
+    ctx.mon.flush_held_exit();
     ctx.mon.notify(alerts::shutdown(
         reason,
         engine.strategy.phase().kind().as_str(),
         engine.strategy_position(),
+        ctx.sz_decimals,
         engine.ledger.realized_pnl_usd,
         engine.ledger.trades.len(),
     ));

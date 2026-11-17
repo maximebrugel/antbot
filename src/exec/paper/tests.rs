@@ -357,3 +357,22 @@ fn ioc_retry_does_not_reuse_taken_depth() {
     let ev = s.place(T0 + 2, ioc(4, true, 100.2, 1.0, false), &m2);
     assert_eq!(pxsz(&ev), vec![(100.0, 1.0)]);
 }
+
+#[test]
+fn simulated_position_carries_no_float_noise() {
+    // 20.19 + 0.35 + 0.02 = 20.560000000000002 in raw f64.
+    let mut s = PaperSim::new(params());
+    s.place(T0, alo(1, true, 100.0, 20.56), &book(T0));
+    for (i, sz) in [20.19, 0.35, 0.02].into_iter().enumerate() {
+        s.on_trades(&[trade(99.98, sz, false, T0 + 1 + i as u64, 10 + i as u64)]);
+    }
+    assert_eq!(s.account().position_sz, 20.56);
+    assert!(s.open_orders().is_empty(), "entry fully filled");
+    // Closing in another split ends exactly flat.
+    s.place(T0 + 10, alo(2, false, 100.02, 20.56), &book(T0 + 10));
+    for (i, sz) in [0.35, 20.19, 0.02].into_iter().enumerate() {
+        s.on_trades(&[trade(100.04, sz, true, T0 + 11 + i as u64, 20 + i as u64)]);
+    }
+    assert_eq!(s.account().position_sz, 0.0);
+    assert!(s.open_orders().is_empty());
+}
