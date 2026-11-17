@@ -143,6 +143,18 @@ log_max_files = 7                     # daily log files kept (0 = keep all, min 
 # without them alerts are disabled with a log line.
 telegram_enabled = true
 telegram_max_per_min = 20             # rate limit (queued alerts are merged)
+# Delivery: timeouts / transport errors and 5xx are retried with backoff
+# (doubling, capped at 60 s, +0..25 % jitter); 429 honours retry_after;
+# other 4xx are not retried. Worst case with these values: ~4 min per
+# message, in a background task (the trading loop never waits; alerts
+# raised meanwhile are queued and merged).
+telegram_http_timeout_secs = 25       # timeout of one sendMessage call (1-120)
+telegram_max_attempts = 6             # attempts per message, first one included (1-10)
+telegram_retry_backoff_secs = 2       # first retry delay, doubled each time (1-60)
+# Hold "exit started" this long: when the trade closes meanwhile, a single
+# combined exit message is sent. Flushed when the window ends and at
+# shutdown, never dropped. 0 = send it at once.
+telegram_exit_coalesce_secs = 10
 # Read-only commands /pnl, /trades, /help, answered only in the private chat
 # whose id is TELEGRAM_CHAT_ID (your user id; ignored for group ids). Needs
 # telegram_enabled and both env vars. Commands never change state or orders.

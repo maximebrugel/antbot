@@ -66,7 +66,9 @@ use super::sizing::{lot_epsilon, plan_entry};
 use crate::config::HARD_CAP_NOTIONAL_USD;
 use crate::config::{Config, PremiumSource, SizingConfig};
 use crate::hl::market::MarketState;
-use crate::hl::rounding::{round_price, round_size, RoundDir, MIN_ORDER_NOTIONAL_USD};
+use crate::hl::rounding::{
+    round_price, round_size, round_to_decimals, snap_size_noise, RoundDir, MIN_ORDER_NOTIONAL_USD,
+};
 
 const MINUTE_MS: u64 = 60_000;
 const RECENT_DONE_KEEP: usize = 16;
@@ -389,6 +391,18 @@ impl PositionBook {
     pub fn deadline_ms(&self, max_hold_ms: u64) -> u64 {
         self.opened_ms.saturating_add(max_hold_ms)
     }
+
+    /// Remove f64 noise from the accumulated sizes (sums / differences of
+    /// lot-sized fills, e.g. `20.19 + 0.35 + 0.02 = 20.560000000000002`):
+    /// each is snapped to the `szDecimals` grid only when it is within
+    /// noise of it ([`snap_size_noise`]), so the open size, the flat check
+    /// and the close order size never move by a meaningful amount.
+    pub fn normalize_sizes(&mut self, sz_decimals: u32) {
+        self.size = snap_size_noise(self.size, sz_decimals);
+        self.entry_sz = snap_size_noise(self.entry_sz, sz_decimals);
+        self.exit_sz = snap_size_noise(self.exit_sz, sz_decimals);
+        self.exit_taker_sz = snap_size_noise(self.exit_taker_sz, sz_decimals);
+    }
 }
 
 /// A closed round trip.
@@ -691,7 +705,7 @@ impl Strategy {
                     .as_mut()
                     .filter(|w| Some(w.intent.tag) == tag)
                 {
-                    w.filled += sz;
+                    w.filled = snap_size_noise(w.filled + sz, self.p.sz_decimals);
                 }
                 if let Some(t) = tag {
                     let eps = self.eps();
@@ -925,6 +939,7 @@ impl Strategy {
             pos.size += sz;
             pos.entry_sz += sz;
             pos.entry_notional += px * sz;
+            pos.normalize_sizes(self.p.sz_decimals);
         } else {
             let q = sz.min(pos.size);
             if sz > pos.size + eps {
@@ -942,6 +957,7 @@ impl Strategy {
             if crossed {
                 pos.exit_taker_sz += q;
             }
+            pos.normalize_sizes(self.p.sz_decimals);
         }
     }
 
@@ -1113,7 +1129,10 @@ impl Strategy {
         if !done {
             return;
         }
-        let p = self.s.position.take().expect("checked");
+        let mut p = self.s.position.take().expect("checked");
+        // A position restored from an older state file may still carry
+        // float noise in its sizes.
+        p.normalize_sizes(self.p.sz_decimals);
         let entry_px = p.avg_entry_px().unwrap_or(0.0);
         let exit_px = p.avg_exit_px().unwrap_or(0.0);
         let gross = p.side.sign() * (exit_px - entry_px) * p.exit_sz;
@@ -1123,9 +1142,11 @@ impl Strategy {
             Phase::Exiting { reason, .. } => *reason,
             _ => ExitReason::External,
         };
+        let szd = self.p.sz_decimals;
         let rec = TradeRecord {
             side: p.side,
-            size: p.entry_sz,
+            // On the lot grid (journal, alerts, state): no float noise.
+            size: round_to_decimals(p.entry_sz, szd),
             entry_px,
             exit_px,
             signal_ms: p.signal_ms,
@@ -1143,7 +1164,7 @@ impl Strategy {
                 0.0
             },
             exit_reason,
-            exit_taker_sz: p.exit_taker_sz,
+            exit_taker_sz: round_to_decimals(p.exit_taker_sz, szd),
         };
         st.events.push(Event::TradeClosed(rec));
         if self.s.kill_reason.is_some() || matches!(self.s.phase, Phase::Halted { .. }) {

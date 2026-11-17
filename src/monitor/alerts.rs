@@ -4,6 +4,7 @@
 //! `parse_mode`), so nothing needs escaping.
 
 use crate::config::Mode;
+use crate::hl::rounding::fmt_size;
 use crate::monitor::fmt_utc_day;
 use crate::risk::kill::utc_day;
 use crate::strategy::premium::Side;
@@ -99,30 +100,35 @@ pub fn message_prefix(
     }
 }
 
-/// Bot stopping.
+/// Bot stopping. `position` is printed with `sz_decimals` decimals.
 pub fn shutdown(
     reason: &str,
     phase: &str,
     position: f64,
+    sz_decimals: u32,
     realized_usd: f64,
     trades: usize,
 ) -> String {
     format!(
-        "🛑 antbot stopping ({reason})\nstate: {phase}, position {position}\nrealized PnL {realized_usd:+.2} USD over {trades} trades"
+        "🛑 antbot stopping ({reason})\nstate: {phase}, position {}\nrealized PnL {realized_usd:+.2} USD over {trades} trades",
+        fmt_size(position, sz_decimals)
     )
 }
 
-/// Entry filled (position opened).
+/// Entry filled (position opened). `size` is printed with `sz_decimals`
+/// decimals.
 pub fn position_opened(
     coin: &str,
     side: Side,
     size: f64,
+    sz_decimals: u32,
     avg_px: f64,
     premium_bps: Option<f64>,
 ) -> String {
     format!(
-        "🟢 ENTRY {} {coin}\n{size} @ {avg_px:.4} ({:.0} USD)\npremium at signal: {}",
+        "🟢 ENTRY {} {coin}\n{} @ {avg_px:.4} ({:.0} USD)\npremium at signal: {}",
         side_up(side),
+        fmt_size(size, sz_decimals),
         size * avg_px,
         bps(premium_bps)
     )
@@ -137,19 +143,39 @@ pub fn exit_started(coin: &str, reason: ExitReason, premium_bps: Option<f64>) ->
     )
 }
 
-/// Taker fallback (IOC) during an exit.
-pub fn taker_fallback(coin: &str, remaining: f64) -> String {
-    format!("⚠️ taker fallback (IOC) on {coin}: {remaining} left to close")
+/// One message for an exit that started and closed within the coalescing
+/// window ([`crate::monitor::ExitCoalescer`]): the trade-closed text, then
+/// the exit-start information (reason, premium, delay before the close).
+pub fn exit_started_and_closed(
+    closed: &str,
+    reason: ExitReason,
+    premium_bps: Option<f64>,
+    started_secs_before: u64,
+) -> String {
+    format!(
+        "{closed}\n↩️ exit started {started_secs_before}s before: {}, premium {}",
+        reason.as_str(),
+        bps(premium_bps)
+    )
 }
 
-/// Round trip closed.
-pub fn trade_closed(coin: &str, t: &TradeRecord) -> String {
+/// Taker fallback (IOC) during an exit. `remaining` is printed with
+/// `sz_decimals` decimals.
+pub fn taker_fallback(coin: &str, remaining: f64, sz_decimals: u32) -> String {
+    format!(
+        "⚠️ taker fallback (IOC) on {coin}: {} left to close",
+        fmt_size(remaining, sz_decimals)
+    )
+}
+
+/// Round trip closed. The size is printed with `sz_decimals` decimals.
+pub fn trade_closed(coin: &str, t: &TradeRecord, sz_decimals: u32) -> String {
     let icon = if t.pnl_usd >= 0.0 { "✅" } else { "❌" };
     format!(
         "{icon} EXIT {} {coin} ({})\n{} {:.4} -> {:.4}, held {}\nPnL {:+.2} USD ({:+.1} bps), fees {:.4}, funding {:+.4}\npremium {} -> {}",
         side_up(t.side),
         t.exit_reason.as_str(),
-        t.size,
+        fmt_size(t.size, sz_decimals),
         t.entry_px,
         t.exit_px,
         hold(t.hold_secs()),
@@ -445,13 +471,13 @@ mod tests {
     fn trade_closed_text() {
         let t = trade(20_000 * DAY, 11.78, 47.1);
         assert_eq!(
-            trade_closed("xyz:ANT", &t),
+            trade_closed("xyz:ANT", &t, 2),
             "✅ EXIT LONG xyz:ANT (converged)\n24.24 103.1100 -> 103.6000, held 0h45m\nPnL +11.78 USD (+47.1 bps), fees 0.1500, funding +0.0500\npremium -62.3 bps -> -8.0 bps"
         );
         let mut l = t.clone();
         l.pnl_usd = -3.0;
         l.entry_premium_bps = None;
-        let s = trade_closed("xyz:ANT", &l);
+        let s = trade_closed("xyz:ANT", &l, 2);
         assert!(s.starts_with("❌ EXIT LONG"));
         assert!(s.contains("PnL -3.00 USD"));
         assert!(s.contains("premium n/a -> -8.0 bps"));
@@ -460,7 +486,7 @@ mod tests {
     #[test]
     fn entry_kill_and_lifecycle_texts() {
         assert_eq!(
-            position_opened("xyz:ANT", Side::Short, 24.24, 103.11, Some(61.27)),
+            position_opened("xyz:ANT", Side::Short, 24.24, 2, 103.11, Some(61.27)),
             "🟢 ENTRY SHORT xyz:ANT\n24.24 @ 103.1100 (2499 USD)\npremium at signal: +61.3 bps"
         );
         assert_eq!(
@@ -490,7 +516,7 @@ mod tests {
         );
         assert!(!startup("testnet", "xyz:ANT", 1, 1.0, "flat", None, None).contains("MAINNET"));
         assert_eq!(
-            shutdown("SIGTERM", "in_position", -24.24, 12.5, 3),
+            shutdown("SIGTERM", "in_position", -24.24, 2, 12.5, 3),
             "🛑 antbot stopping (SIGTERM)\nstate: in_position, position -24.24\nrealized PnL +12.50 USD over 3 trades"
         );
         assert_eq!(
@@ -504,8 +530,58 @@ mod tests {
             "↩️ exit started xyz:ANT: max_hold\npremium n/a"
         );
         assert_eq!(
-            taker_fallback("xyz:ANT", 3.5),
-            "⚠️ taker fallback (IOC) on xyz:ANT: 3.5 left to close"
+            taker_fallback("xyz:ANT", 3.5, 2),
+            "⚠️ taker fallback (IOC) on xyz:ANT: 3.50 left to close"
+        );
+    }
+
+    #[test]
+    fn sizes_are_printed_with_sz_decimals() {
+        // The 2026-11-17 exit: fills 20.19 + 0.35 + 0.02 summed in f64.
+        let sum = 20.19 + 0.35 + 0.02;
+        assert_eq!(format!("{sum}"), "20.560000000000002");
+        let mut t = trade(20_000 * DAY, 11.78, 47.1);
+        t.size = sum;
+        let s = trade_closed("xyz:ANT", &t, 2);
+        assert!(s.contains("\n20.56 103.1100 -> 103.6000,"), "{s}");
+        assert!(!s.contains("20.560000000000002"), "{s}");
+        let s = position_opened("xyz:ANT", Side::Long, sum, 2, 103.11, None);
+        assert!(s.contains("\n20.56 @ 103.1100 ("), "{s}");
+        let s = shutdown("SIGTERM", "in_position", -sum, 2, 0.0, 0);
+        assert!(s.contains("position -20.56\n"), "{s}");
+        assert_eq!(
+            taker_fallback("xyz:ANT", sum, 2),
+            "⚠️ taker fallback (IOC) on xyz:ANT: 20.56 left to close"
+        );
+        // Trailing zeros to the lot precision; flat prints 0.00.
+        assert!(shutdown("x", "flat", 0.0, 2, 0.0, 0).contains("position 0.00\n"));
+        assert!(shutdown("x", "flat", -0.0, 2, 0.0, 0).contains("position 0.00\n"));
+        t.size = 24.2;
+        assert!(trade_closed("xyz:ANT", &t, 2).contains("\n24.20 103.1100"));
+    }
+
+    #[test]
+    fn sizes_with_sz_decimals_0() {
+        let mut t = trade(20_000 * DAY, 11.78, 47.1);
+        t.size = 20.000000000000004;
+        let s = trade_closed("BTC", &t, 0);
+        assert!(s.contains("\n20 103.1100 -> 103.6000,"), "{s}");
+        assert_eq!(
+            position_opened("BTC", Side::Short, 7.0, 0, 100.0, Some(55.0)),
+            "🟢 ENTRY SHORT BTC\n7 @ 100.0000 (700 USD)\npremium at signal: +55.0 bps"
+        );
+        assert!(
+            shutdown("x", "in_position", -3.0000000000000004, 0, 1.0, 1).contains("position -3\n")
+        );
+    }
+
+    #[test]
+    fn exit_started_and_closed_text() {
+        let t = trade(20_000 * DAY, 11.78, 47.1);
+        let closed = trade_closed("xyz:ANT", &t, 2);
+        assert_eq!(
+            exit_started_and_closed(&closed, ExitReason::Converged, Some(-8.04), 4),
+            format!("{closed}\n↩️ exit started 4s before: converged, premium -8.0 bps")
         );
     }
 

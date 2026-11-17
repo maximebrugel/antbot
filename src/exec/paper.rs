@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 use super::{ExecEvent, Executor, OrderView};
 use crate::config::Config;
 use crate::hl::market::MarketState;
+use crate::hl::rounding::snap_size_noise;
 use crate::hl::types::{Level, WsTrade};
 use crate::hl::ws::UserEvent;
 use crate::strategy::signal::{Command, DoneReason, OrderIntent, OrderKind, OrderUpdate};
@@ -282,6 +283,10 @@ impl PaperSim {
         let fee = px * sz * rate;
         let eps = self.eps();
         self.s.account.apply_fill(is_buy, px, sz, fee, eps);
+        // Noise-only snap of the simulated venue position (heartbeat
+        // `venue_position`, state file), like the strategy's own book.
+        let a = &mut self.s.account;
+        a.position_sz = snap_size_noise(a.position_sz, self.p.sz_decimals);
         ExecEvent::Order(OrderUpdate::Filled {
             tag: Some(tag),
             is_buy,

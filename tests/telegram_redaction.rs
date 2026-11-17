@@ -175,7 +175,10 @@ fn settings() -> AlertSettings {
         max_per_min: 60,
         min_interval: Duration::from_millis(1),
         http_timeout: Duration::from_secs(5),
+        // The historical 3 attempts: the tests count requests.
+        max_attempts: 3,
         retry_backoff: Duration::from_millis(20),
+        max_retry_backoff: Duration::from_secs(1),
     }
 }
 
