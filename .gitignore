@@ -3,6 +3,20 @@
 data/
 .env
 .env.*
+*.env
 !.env.example
 *.log
+*.log.*
 config/local.toml
+
+# Compose secret dir, and runtime state outside data/ (state_<mode>.json).
+secrets/
+state_paper.json
+state_testnet.json
+state_mainnet.json
+risk_state.json
+antbot.lock
+signals.csv
+orders.csv
+trades.csv
+replay-data/

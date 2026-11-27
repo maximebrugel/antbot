@@ -1,3 +1,5 @@
+> Since ANT did its IPO, this strategy is no longer relevant.
+
 # antbot
 
 A premium mean-reversion bot for the HIP-3 perpetual **`xyz:ANT`** on Hyperliquid, written in Rust (tokio).
