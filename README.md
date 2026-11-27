@@ -1,4 +1,4 @@
-The author is no longer running this strategy, since ANT did its IPO. The code is shared as-is for educational purposes and comes with no warranty.
+> Since ANT did its IPO, this strategy is no longer relevant.
 
 # antbot
 
